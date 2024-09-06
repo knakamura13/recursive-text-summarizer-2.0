@@ -3,13 +3,6 @@
 ## Overview
 This project features an AI-powered text summarizer designed to efficiently condense large documents into concise summaries. Utilizing advanced natural language processing techniques, it focuses on extracting key information while maintaining the core essence of the original text.
 
-## Features
-- **Supervised Learning Focused**: Tailored for summarizing texts on classification and regression in supervised learning.
-- **Chunk-Based Summarization**: Breaks down large documents into manageable chunks to ensure detail preservation.
-- **GPT-Powered Summaries**: Leverages OpenAI's GPT models for accurate and coherent summarization.
-- **Customizable Summarization**: Supports various summarization styles, including keyword and concept-focused summaries.
-- **Logging and Archives**: Maintains logs of GPT responses and archives outputs for reference.
-
 ## Requirements
 - Python 3.x
 - An [OpenAI](https://openai.com/) API key

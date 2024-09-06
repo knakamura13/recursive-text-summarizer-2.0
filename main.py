@@ -11,22 +11,32 @@ from dotenv import load_dotenv
 from nltk.tokenize import sent_tokenize
 
 
-DRY_RUN = False  # Set to False to enable actual GPT API calls
-DELIMITER = '\n"""\n'  # Delimiter used to separate text in GPT messages
-MAX_CHUNKS = (
-    -1
-)  # Set the max number of chunks to summarize (recommended: -1 for unlimited)
-CHUNK_SIZE = (
-    1000  # Size of each text chunk for summarization (recommended: 1,000 to 5,000)
-)
-GPT_REQUEST_TIMEOUT = (
-    180  # Timeout for GPT API requests in seconds (recommended: >= 60s)
-)
-GPT_REQUEST_MAX_RETRY = (
-    5  # Maximum number of retries for GPT API requests (recommended: 2 to 5)
-)
-FILE_IN = str(Path.cwd() / "input.txt")  # Input file containing the original text
-FILE_OUT = str(Path.cwd() / "output.txt")  # Output file for the summarized text
+# Set to False to enable actual GPT API calls
+DRY_RUN = False
+
+# Delimiter used to separate text in GPT messages
+DELIMITER = '\n"""\n'
+
+# Set the max number of chunks to summarize (recommended: -1 for unlimited)
+MAX_CHUNKS = -1
+
+# Size of each text chunk for summarization (recommended: 1,000 to 5,000)
+CHUNK_SIZE = 1000
+
+# Timeout for GPT API requests in seconds (recommended: >= 60s)
+GPT_REQUEST_TIMEOUT = 180
+
+# Maximum number of retries for GPT API requests (recommended: 2 to 5)
+GPT_REQUEST_MAX_RETRY = 5
+
+# Input file containing the original text
+FILE_IN = str(Path.cwd() / "input.txt")
+
+# Output file for the summarized text
+FILE_OUT = str(Path.cwd() / "output.txt")
+
+# Load environment variables from `.env`
+load_dotenv()
 
 # Initialize logging
 logging.basicConfig(
@@ -38,7 +48,7 @@ logging.basicConfig(
 # Download the necessary NLTK models for splitting by sentence
 nltk.download("punkt")
 
-load_dotenv()
+# Initialize OpenAI API
 client = OpenAI(api_key=os.getenv("API_KEY"))
 
 
@@ -143,7 +153,7 @@ def summarize_with_gpt(_text: str, _model: str = "gpt-3") -> str:
         str: Summarized text or error message in case of failure.
     """
     if DRY_RUN:
-        # Return the original text to simulate a summary in dry-run mode
+        # Return the original text to simulate a summary when in dry-run mode
         return remove_extra_whitespace(_text)
 
     if not _model or _model == "gpt-3":
