@@ -3,3 +3,6 @@ venv/
 .idea/
 .DS_Store
 gpt_logs/*
+__pycache__/
+*.py[cod]
+.pytest_cache/
