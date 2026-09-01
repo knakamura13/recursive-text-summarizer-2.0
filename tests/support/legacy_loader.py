@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 import runpy
 import sys
 from collections import deque
@@ -18,6 +19,26 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 class FakeRequestException(Exception):
     pass
+
+
+@contextmanager
+def isolated_root_logging() -> Iterator[None]:
+    root_logger = logging.getLogger()
+    original_handlers = list(root_logger.handlers)
+    original_level = root_logger.level
+    try:
+        yield
+    finally:
+        new_handlers = [
+            handler
+            for handler in root_logger.handlers
+            if handler not in original_handlers
+        ]
+        for handler in new_handlers:
+            root_logger.removeHandler(handler)
+            handler.close()
+        root_logger.handlers[:] = original_handlers
+        root_logger.setLevel(original_level)
 
 
 @dataclass

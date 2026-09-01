@@ -6,10 +6,11 @@ from types import ModuleType
 import pytest
 
 from tests.support import legacy_loader
-from tests.support.legacy_loader import FakeHarness, load_legacy_main
-
-
-_root_logging_snapshot: tuple[list[logging.Handler], int] | None = None
+from tests.support.legacy_loader import (
+    FakeHarness,
+    isolated_root_logging,
+    load_legacy_main,
+)
 
 
 def _legacy_module_names() -> set[str]:
@@ -31,27 +32,23 @@ def test_import_uses_test_doubles_without_credentials_or_downloads(
 
 
 def test_import_time_logging_configuration_is_scoped_to_its_test() -> None:
-    global _root_logging_snapshot
-
     root_logger = logging.getLogger()
-    _root_logging_snapshot = (list(root_logger.handlers), root_logger.level)
-    root_logger.handlers.clear()
-    root_logger.setLevel(logging.NOTSET)
+    original_handlers = list(root_logger.handlers)
+    original_level = root_logger.level
 
-    load_legacy_main(FakeHarness())
+    with isolated_root_logging():
+        root_logger.handlers.clear()
+        root_logger.setLevel(logging.NOTSET)
 
-    assert len(root_logger.handlers) == 1
-    assert isinstance(root_logger.handlers[0], logging.FileHandler)
-    assert root_logger.level == logging.INFO
+        load_legacy_main(FakeHarness())
+
+        assert len(root_logger.handlers) == 1
+        assert isinstance(root_logger.handlers[0], logging.FileHandler)
+        assert root_logger.level == logging.INFO
 
 
-def test_root_logging_state_is_restored_after_legacy_import() -> None:
-    assert _root_logging_snapshot is not None
-    handlers, level = _root_logging_snapshot
-    root_logger = logging.getLogger()
-
-    assert root_logger.handlers == handlers
-    assert root_logger.level == level
+    assert root_logger.handlers == original_handlers
+    assert root_logger.level == original_level
 
 
 def test_preexisting_external_modules_are_restored(
