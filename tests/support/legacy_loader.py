@@ -28,6 +28,7 @@ class FakeHarness:
     api_keys: list[str | None] = field(default_factory=list)
     downloads: list[str] = field(default_factory=list)
     dotenv_load_count: int = 0
+    client: SimpleNamespace = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         completions = _FakeCompletions(self)
