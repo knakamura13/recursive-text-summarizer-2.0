@@ -311,9 +311,9 @@ def legacy_module():
 
 def test_open_file_reads_utf8(legacy_module, tmp_path: Path) -> None:
     source = tmp_path / "source.txt"
-    source.write_text("Résumé — 東京", encoding="utf-8")
+    source.write_text("Résumé, 東京", encoding="utf-8")
 
-    assert legacy_module.open_file(str(source)) == "Résumé — 東京"
+    assert legacy_module.open_file(str(source)) == "Résumé, 東京"
 
 
 def test_save_file_creates_parent_directories(

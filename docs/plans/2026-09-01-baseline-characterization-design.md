@@ -1,6 +1,6 @@
 # Baseline Characterization Harness Design
 
-Issue: [#2 — Characterize the existing summarizer and add a baseline test harness](https://github.com/knakamura13/recursive-text-summarizer-2.0/issues/2)
+Issue: [#2: Characterize the existing summarizer and add a baseline test harness](https://github.com/knakamura13/recursive-text-summarizer-2.0/issues/2)
 
 ## Context
 
