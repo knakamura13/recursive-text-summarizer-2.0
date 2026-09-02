@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import re
 
 
 class BoundaryKind(str, Enum):
@@ -75,3 +76,82 @@ class SourceSegment:
             raise ValueError("context range must contain core range")
         if len(self.text) != self.context_end - self.context_start:
             raise ValueError("text length must match context range")
+
+
+_ATX_HEADING = re.compile(r" {0,3}#{1,6}(?:[ \t]+|$)")
+_SETEXT_UNDERLINE = re.compile(r" {0,3}(?:=+|-+)[ \t]*$")
+_LIST_ITEM = re.compile(r" {0,3}(?:[-+*][ \t]+|\d+[.)][ \t]+)")
+
+
+@dataclass(frozen=True)
+class _LineSpan:
+    start: int
+    end: int
+    content: str
+
+
+def _line_spans(text: str) -> list[_LineSpan]:
+    return [
+        _LineSpan(match.start(), match.end(), match.group().removesuffix("\n"))
+        for match in re.finditer(r"[^\n]*(?:\n|$)", text)
+        if match.end() > match.start()
+    ]
+
+
+def _is_setext_heading(lines: list[_LineSpan], index: int) -> bool:
+    return (
+        bool(lines[index].content)
+        and index + 1 < len(lines)
+        and _SETEXT_UNDERLINE.fullmatch(lines[index + 1].content) is not None
+    )
+
+
+def _consume_blank_lines(lines: list[_LineSpan], index: int) -> int:
+    while index < len(lines) and not lines[index].content:
+        index += 1
+    return index
+
+
+def detect_structural_blocks(text: str) -> list[StructuralBlock]:
+    """Return contiguous heading, paragraph, and list ranges."""
+    lines = _line_spans(text)
+    blocks: list[StructuralBlock] = []
+    index = 0
+    while index < len(lines):
+        start_index = index
+        content = lines[index].content
+        if _ATX_HEADING.match(content):
+            kind = BoundaryKind.HEADING
+            index += 1
+        elif _is_setext_heading(lines, index):
+            kind = BoundaryKind.HEADING
+            index += 2
+        elif _LIST_ITEM.match(content):
+            kind = BoundaryKind.LIST
+            index += 1
+            while index < len(lines) and lines[index].content:
+                if _ATX_HEADING.match(lines[index].content) or _is_setext_heading(
+                    lines, index
+                ):
+                    break
+                index += 1
+        else:
+            kind = BoundaryKind.PARAGRAPH
+            index += 1
+            while index < len(lines) and lines[index].content:
+                if (
+                    _ATX_HEADING.match(lines[index].content)
+                    or _LIST_ITEM.match(lines[index].content)
+                    or _is_setext_heading(lines, index)
+                ):
+                    break
+                index += 1
+        index = _consume_blank_lines(lines, index)
+        blocks.append(
+            StructuralBlock(
+                start=lines[start_index].start,
+                end=lines[index - 1].end,
+                boundary_kind=kind,
+            )
+        )
+    return blocks
