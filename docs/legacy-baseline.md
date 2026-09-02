@@ -13,7 +13,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -v
 ```
 
-The suite blocks outbound socket connections. It replaces OpenAI, NLTK, dotenv, tqdm, and requests behavior with deterministic test doubles, so the characterization tests do not need network access, credentials, or downloaded tokenizer data.
+The suite blocks connection attempts through `socket.create_connection` and `socket.socket.connect`. It replaces OpenAI, NLTK, dotenv, tqdm, and requests behavior with deterministic test doubles, so the characterization tests do not need network access, credentials, or downloaded tokenizer data.
 
 ## Compatibility constraints
 
@@ -21,7 +21,7 @@ The executable workflow currently provides these observable guarantees:
 
 - `python main.py` reads UTF-8 text from `input.txt` in the current working directory.
 - A successful run writes UTF-8 text to `output.txt` in the current working directory.
-- The workflow makes one provider call for each source chunk, preserving source order.
+- The workflow performs one summarization operation for each source chunk in source order. A successful first attempt makes one provider call; a failed operation can make up to five provider calls through retries.
 - Provider responses are joined with exactly one newline between adjacent responses.
 
 ## Known legacy limitations
