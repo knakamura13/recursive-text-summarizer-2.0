@@ -31,6 +31,8 @@ def test_parse_args_returns_exact_defaults() -> None:
     assert parsed.app.input_path == Path("input.txt")
     assert parsed.app.output_path == Path("output.txt")
     assert parsed.app.model == "gpt-4o-mini"
+    assert parsed.app.provider == "openai"
+    assert parsed.app.ollama_host == "http://localhost:11434"
     assert parsed.app.timeout_seconds == 180
     assert parsed.retry.max_attempts == 5
     assert parsed.workflow.chunk_size == 1000
@@ -46,7 +48,11 @@ def test_parse_args_supports_all_overrides() -> None:
             "--output",
             "summary.txt",
             "--model",
-            "custom-model",
+            "qwen3.8",
+            "--provider",
+            "ollama",
+            "--ollama-host",
+            "http://ollama.internal:11434",
             "--timeout",
             "42.5",
             "--max-retries",
@@ -61,7 +67,9 @@ def test_parse_args_supports_all_overrides() -> None:
 
     assert parsed.app.input_path == Path("source.txt")
     assert parsed.app.output_path == Path("summary.txt")
-    assert parsed.app.model == "custom-model"
+    assert parsed.app.model == "qwen3.8"
+    assert parsed.app.provider == "ollama"
+    assert parsed.app.ollama_host == "http://ollama.internal:11434"
     assert parsed.app.timeout_seconds == 42.5
     assert parsed.retry.max_attempts == 3
     assert parsed.workflow.chunk_size == 2048

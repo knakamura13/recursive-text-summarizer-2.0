@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
+from typing import Literal
+
+
+ProviderName = Literal["openai", "ollama"]
 
 
 @dataclass(frozen=True)
@@ -10,6 +14,8 @@ class AppConfig:
     input_path: Path = Path("input.txt")
     output_path: Path = Path("output.txt")
     model: str = "gpt-4o-mini"
+    provider: ProviderName = "openai"
+    ollama_host: str = "http://localhost:11434"
     timeout_seconds: float = 180
 
     def __post_init__(self) -> None:
@@ -23,6 +29,10 @@ class AppConfig:
             raise ValueError("output_path must differ from input_path")
         if not self.model.strip():
             raise ValueError("model must not be empty")
+        if self.provider not in ("openai", "ollama"):
+            raise ValueError("provider must be openai or ollama")
+        if not self.ollama_host.strip():
+            raise ValueError("ollama_host must not be empty")
         if not isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 

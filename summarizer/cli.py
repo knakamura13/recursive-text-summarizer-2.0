@@ -36,6 +36,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", type=Path, default=Path("input.txt"))
     parser.add_argument("--output", type=Path, default=Path("output.txt"))
     parser.add_argument("--model", default="gpt-4o-mini")
+    parser.add_argument(
+        "--provider",
+        choices=("openai", "ollama"),
+        default="openai",
+    )
+    parser.add_argument(
+        "--ollama-host",
+        default="http://localhost:11434",
+    )
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--chunk-size", type=int, default=1000)
@@ -53,6 +62,8 @@ def parse_args(argv: list[str] | None = None) -> ParsedConfig:
                 input_path=args.input,
                 output_path=args.output,
                 model=args.model,
+                provider=args.provider,
+                ollama_host=args.ollama_host,
                 timeout_seconds=args.timeout,
             ),
             retry=RetryPolicy(max_attempts=args.max_retries),

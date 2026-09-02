@@ -15,6 +15,8 @@ def test_configuration_defaults_are_legacy_compatible() -> None:
     assert app.input_path == Path("input.txt")
     assert app.output_path == Path("output.txt")
     assert app.model == "gpt-4o-mini"
+    assert app.provider == "openai"
+    assert app.ollama_host == "http://localhost:11434"
     assert app.timeout_seconds == 180
     assert retry.max_attempts == 5
     assert retry.initial_delay_seconds == 1
@@ -44,6 +46,8 @@ def test_configuration_is_immutable(
     ("factory", "field_name"),
     [
         (lambda: AppConfig(model=" "), "model"),
+        (lambda: AppConfig(provider="other"), "provider"),
+        (lambda: AppConfig(ollama_host=" "), "ollama_host"),
         (lambda: AppConfig(input_path=Path("")), "input_path"),
         (lambda: AppConfig(output_path=Path("")), "output_path"),
         (
