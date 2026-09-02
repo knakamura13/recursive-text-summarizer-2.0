@@ -99,7 +99,7 @@ The adapter uses `client.responses.create(...)`, maps the system prompt to `inst
 
 SDK retries are explicitly disabled because retry policy is owned by the provider decorator. SDK exceptions are translated once at the adapter boundary. Empty or malformed successful responses raise an invalid-response exception.
 
-The refactor will not silently change the legacy default model. A focused compatibility test will record the chosen default and any necessary alias resolution. If the legacy preview model is unusable with Responses, the changed default will be documented as an intentional compatibility change.
+The refactor replaces the deprecated legacy `gpt-4-1106-preview` default with `gpt-4o-mini`, an inexpensive general text model supported by the Responses API. A focused compatibility test and operator documentation will make this intentional change explicit. Selecting an empirically optimal model remains deferred to evaluation issue #12.
 
 ## Retry decorator
 
