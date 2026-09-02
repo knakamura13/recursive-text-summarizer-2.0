@@ -1,0 +1,177 @@
+from types import SimpleNamespace
+
+import httpx
+import ollama
+import pytest
+
+from summarizer.providers.base import (
+    GenerationRequest,
+    ProviderConnectionError,
+    ProviderRateLimitError,
+    ProviderRequestError,
+    ProviderResponseError,
+    ProviderServerError,
+    ProviderTimeoutError,
+)
+from summarizer.providers.ollama import OllamaProvider
+
+
+REQUEST = GenerationRequest(
+    model="gemma3:4b",
+    instructions="Summarize accurately.",
+    input_text="Source material",
+    timeout_seconds=42,
+)
+
+
+class FakeClient:
+    def __init__(self, outcome: object) -> None:
+        self.outcome = outcome
+        self.calls: list[dict[str, object]] = []
+
+    def chat(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+def response(**overrides: object) -> SimpleNamespace:
+    values: dict[str, object] = {
+        "message": SimpleNamespace(content=" local\n summary "),
+        "model": "gemma3:4b-q4_K_M",
+        "done": True,
+        "done_reason": "stop",
+        "prompt_eval_count": 42,
+        "eval_count": 11,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_adapts_native_chat_request_and_response_lazily() -> None:
+    client = FakeClient(response())
+    constructions: list[dict[str, object]] = []
+
+    def client_factory(**kwargs: object) -> FakeClient:
+        constructions.append(kwargs)
+        return client
+
+    provider = OllamaProvider(
+        host="http://ollama.internal:11434",
+        client_factory=client_factory,
+    )
+
+    assert constructions == []
+
+    result = provider.generate(REQUEST)
+
+    assert constructions == [
+        {"host": "http://ollama.internal:11434", "timeout": 42}
+    ]
+    assert client.calls == [
+        {
+            "model": "gemma3:4b",
+            "messages": [
+                {"role": "system", "content": "Summarize accurately."},
+                {"role": "user", "content": "Source material"},
+            ],
+            "stream": False,
+            "think": False,
+        }
+    ]
+    assert result.text == "local summary"
+    assert result.provider == "ollama"
+    assert result.model == "gemma3:4b-q4_K_M"
+    assert result.input_tokens == 42
+    assert result.output_tokens == 11
+    assert result.finish_status == "stop"
+    assert result.request_id is None
+
+    provider.generate(REQUEST)
+    assert len(constructions) == 1
+
+
+@pytest.mark.parametrize(
+    "bad_response",
+    [
+        response(message=SimpleNamespace(content=" ")),
+        response(message=None),
+        response(done=False),
+        response(done=None),
+    ],
+)
+def test_rejects_nonterminal_or_missing_content(bad_response: object) -> None:
+    provider = OllamaProvider(
+        client_factory=lambda **_kwargs: FakeClient(bad_response)
+    )
+
+    with pytest.raises(ProviderResponseError):
+        provider.generate(REQUEST)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_type", "message"),
+    [
+        (
+            httpx.ReadTimeout("secret source"),
+            ProviderTimeoutError,
+            "timed out",
+        ),
+        (
+            ConnectionError("secret source"),
+            ProviderConnectionError,
+            "connection failed",
+        ),
+        (
+            ollama.ResponseError("model secret-model not found", 404),
+            ProviderRequestError,
+            "model was not found",
+        ),
+        (
+            ollama.ResponseError("secret source", 429),
+            ProviderRateLimitError,
+            "rate limited",
+        ),
+        (
+            ollama.ResponseError("secret source", 500),
+            ProviderServerError,
+            "server request failed",
+        ),
+        (
+            ollama.ResponseError("secret source", 502),
+            ProviderServerError,
+            "server request failed",
+        ),
+        (
+            ollama.ResponseError("secret source", 400),
+            ProviderRequestError,
+            "rejected",
+        ),
+    ],
+)
+def test_translates_native_errors_without_sensitive_content(
+    error: Exception,
+    expected_type: type[Exception],
+    message: str,
+) -> None:
+    provider = OllamaProvider(
+        client_factory=lambda **_kwargs: FakeClient(error)
+    )
+
+    with pytest.raises(expected_type, match=message) as exc_info:
+        provider.generate(REQUEST)
+
+    assert exc_info.value.__cause__ is error
+    assert "secret" not in str(exc_info.value)
+
+
+def test_rejects_invalid_metadata() -> None:
+    provider = OllamaProvider(
+        client_factory=lambda **_kwargs: FakeClient(
+            response(prompt_eval_count=-1)
+        )
+    )
+
+    with pytest.raises(ProviderResponseError, match="metadata"):
+        provider.generate(REQUEST)
