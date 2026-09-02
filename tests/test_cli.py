@@ -166,3 +166,21 @@ def test_dry_run_does_not_construct_provider(
     assert exit_code == 0
     assert constructions == []
     assert (tmp_path / "output.txt").read_text(encoding="utf-8") == "Source."
+
+
+def test_main_reports_missing_openai_credential_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    (tmp_path / "input.txt").write_text("Source.", encoding="utf-8")
+
+    exit_code = main([], sentence_tokenizer=lambda text: [text])
+
+    stderr = capsys.readouterr().err
+    assert exit_code == 1
+    assert "OPENAI_API_KEY" in stderr
+    assert "Traceback" not in stderr
+    assert not (tmp_path / "output.txt").exists()

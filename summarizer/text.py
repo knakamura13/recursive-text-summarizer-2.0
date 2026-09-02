@@ -21,6 +21,32 @@ USER_PROMPT_PREFIX = (
 )
 DELIMITER = '\n"""\n'
 _SENTENCE_TOKENIZER = PunktSentenceTokenizer()
+# Keep the transitional, resource-free tokenizer useful for common prose. Issue
+# #4 replaces this legacy chunker with the generalized segmentation pipeline.
+_SENTENCE_TOKENIZER._params.abbrev_types.update(
+    {
+        "co",
+        "dept",
+        "dr",
+        "e.g",
+        "etc",
+        "fig",
+        "i.e",
+        "inc",
+        "jr",
+        "ltd",
+        "mr",
+        "mrs",
+        "ms",
+        "no",
+        "prof",
+        "sr",
+        "st",
+        "u.k",
+        "u.s",
+        "vs",
+    }
+)
 
 
 def default_sentence_tokenizer(text: str) -> list[str]:

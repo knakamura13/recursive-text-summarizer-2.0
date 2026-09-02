@@ -43,6 +43,15 @@ def test_default_tokenizer_requires_no_downloaded_nltk_data(
     ]
 
 
+def test_default_tokenizer_keeps_common_abbreviations_with_sentence() -> None:
+    chunks = chunk_text_by_sentences(
+        "Dr. Smith reviewed the U.S. market. It rose.",
+        30,
+    )
+
+    assert chunks == [" Dr. Smith reviewed the U.S. market.", "It rose."]
+
+
 def test_build_generation_request_preserves_characterized_prompt() -> None:
     request = build_generation_request(
         "Source text",

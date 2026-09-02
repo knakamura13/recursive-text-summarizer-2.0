@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 
 
@@ -22,7 +23,7 @@ class AppConfig:
             raise ValueError("output_path must differ from input_path")
         if not self.model.strip():
             raise ValueError("model must not be empty")
-        if self.timeout_seconds <= 0:
+        if not isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 
 
@@ -35,9 +36,15 @@ class RetryPolicy:
     def __post_init__(self) -> None:
         if self.max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
-        if self.initial_delay_seconds <= 0:
+        if (
+            not isfinite(self.initial_delay_seconds)
+            or self.initial_delay_seconds <= 0
+        ):
             raise ValueError("initial_delay_seconds must be positive")
-        if self.backoff_multiplier <= 0:
+        if (
+            not isfinite(self.backoff_multiplier)
+            or self.backoff_multiplier <= 0
+        ):
             raise ValueError("backoff_multiplier must be positive")
 
 

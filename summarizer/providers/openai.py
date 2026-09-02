@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable
 from typing import Any
@@ -20,6 +21,8 @@ from summarizer.providers.base import (
 
 
 def _create_client(**kwargs: object) -> object:
+    if not os.environ.get("OPENAI_API_KEY", "").strip():
+        raise ProviderAuthenticationError("OPENAI_API_KEY is not set")
     return openai.OpenAI(**kwargs)
 
 
@@ -59,6 +62,16 @@ class OpenAIProvider:
             raise ProviderRequestError(
                 f"OpenAI rejected the request{detail}"
             ) from error
+        except openai.OpenAIError as error:
+            raise ProviderRequestError(
+                "OpenAI client or request failed"
+            ) from error
+
+        status = getattr(response, "status", None)
+        if status not in (None, "completed"):
+            raise ProviderResponseError(
+                f"OpenAI response status was {status}"
+            )
 
         output_text = getattr(response, "output_text", None)
         if not isinstance(output_text, str) or not output_text.strip():
@@ -73,7 +86,7 @@ class OpenAIProvider:
             model=getattr(response, "model", None) or request.model,
             input_tokens=getattr(usage, "input_tokens", None),
             output_tokens=getattr(usage, "output_tokens", None),
-            finish_status=getattr(response, "status", None),
+            finish_status=status,
             request_id=getattr(response, "_request_id", None),
         )
 

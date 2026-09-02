@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -53,19 +54,29 @@ def test_configuration_is_immutable(
             "output_path",
         ),
         (lambda: AppConfig(timeout_seconds=0), "timeout_seconds"),
+        (lambda: AppConfig(timeout_seconds=float("nan")), "timeout_seconds"),
+        (lambda: AppConfig(timeout_seconds=float("inf")), "timeout_seconds"),
         (lambda: RetryPolicy(max_attempts=0), "max_attempts"),
         (
             lambda: RetryPolicy(initial_delay_seconds=0),
             "initial_delay_seconds",
         ),
+        (
+            lambda: RetryPolicy(initial_delay_seconds=float("nan")),
+            "initial_delay_seconds",
+        ),
         (lambda: RetryPolicy(backoff_multiplier=0), "backoff_multiplier"),
+        (
+            lambda: RetryPolicy(backoff_multiplier=float("inf")),
+            "backoff_multiplier",
+        ),
         (lambda: LegacyWorkflowConfig(chunk_size=0), "chunk_size"),
         (lambda: LegacyWorkflowConfig(max_chunks=0), "max_chunks"),
         (lambda: LegacyWorkflowConfig(max_chunks=-2), "max_chunks"),
     ],
 )
 def test_configuration_rejects_invalid_values(
-    factory: object,
+    factory: Callable[[], object],
     field_name: str,
 ) -> None:
     with pytest.raises(ValueError, match=field_name):

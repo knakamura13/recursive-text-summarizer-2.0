@@ -113,6 +113,33 @@ def test_allows_absent_optional_response_metadata() -> None:
     assert result.request_id is None
 
 
+def test_missing_environment_credential_is_an_actionable_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    provider = OpenAIProvider()
+
+    with pytest.raises(
+        ProviderAuthenticationError,
+        match="OPENAI_API_KEY",
+    ):
+        provider.generate(REQUEST)
+
+
+@pytest.mark.parametrize("status", ["incomplete", "failed"])
+def test_rejects_nonempty_terminal_partial_responses(status: str) -> None:
+    provider = OpenAIProvider(
+        client_factory=lambda **_kwargs: SimpleNamespace(
+            responses=FakeResponses(
+                SimpleNamespace(output_text="partial summary", status=status)
+            )
+        )
+    )
+
+    with pytest.raises(ProviderResponseError, match=status):
+        provider.generate(REQUEST)
+
+
 def test_import_does_not_construct_an_openai_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
