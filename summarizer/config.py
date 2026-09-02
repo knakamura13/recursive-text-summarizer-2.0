@@ -14,9 +14,9 @@ class AppConfig:
     input_path: Path = Path("input.txt")
     output_path: Path = Path("output.txt")
     model: str = "gpt-4o-mini"
+    timeout_seconds: float = 180
     provider: ProviderName = "openai"
     ollama_host: str = "http://localhost:11434"
-    timeout_seconds: float = 180
 
     def __post_init__(self) -> None:
         if self.input_path == Path("."):
