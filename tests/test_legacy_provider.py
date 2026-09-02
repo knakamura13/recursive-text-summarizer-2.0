@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from tests.support.legacy_loader import FakeHarness, load_legacy_main
+from tests.support.legacy_loader import (
+    FakeHarness,
+    FakeRequestException,
+    load_legacy_main,
+)
 
 
 def test_successful_summary_records_prompt_model_timeout_and_log(
@@ -78,3 +82,37 @@ def test_dry_run_collapses_source_without_calling_provider(
 
     assert module.summarize_with_gpt("  Alpha\n Beta  ") == "Alpha Beta"
     assert harness.calls == []
+
+
+def test_request_failures_retry_with_exponential_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    harness = FakeHarness()
+    harness.queue(*(FakeRequestException("offline") for _ in range(5)))
+    module = load_legacy_main(harness)
+    delays: list[int] = []
+    monkeypatch.setattr(module, "sleep", delays.append)
+
+    result = module.summarize_with_gpt("Source")
+
+    assert result == "GPT error: Unknown error"
+    assert len(harness.calls) == 5
+    assert delays == [1, 2, 4, 8]
+
+
+def test_generic_terminal_failure_raises_unbound_local_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    harness = FakeHarness()
+    harness.queue(*(ValueError("bad response") for _ in range(5)))
+    module = load_legacy_main(harness)
+    monkeypatch.setattr(module, "sleep", lambda _delay: None)
+
+    with pytest.raises(UnboundLocalError):
+        module.summarize_with_gpt("Source")
+
+    assert len(harness.calls) == 5
