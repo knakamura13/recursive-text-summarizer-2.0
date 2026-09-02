@@ -31,6 +31,18 @@ def test_chunk_text_keeps_oversized_first_sentence_unsplit() -> None:
     assert chunks == [" Oversized sentence."]
 
 
+def test_default_tokenizer_requires_no_downloaded_nltk_data(
+    monkeypatch,
+) -> None:
+    import nltk.data
+
+    monkeypatch.setattr(nltk.data, "path", [])
+
+    assert chunk_text_by_sentences("First. Second.", 100) == [
+        " First. Second."
+    ]
+
+
 def test_build_generation_request_preserves_characterized_prompt() -> None:
     request = build_generation_request(
         "Source text",

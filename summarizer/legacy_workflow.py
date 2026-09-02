@@ -3,13 +3,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
-from nltk.tokenize import sent_tokenize
-
 from summarizer.config import AppConfig, LegacyWorkflowConfig
 from summarizer.providers.base import GenerationResult, ModelProvider
 from summarizer.text import (
     build_generation_request,
     chunk_text_by_sentences,
+    default_sentence_tokenizer,
     normalize_whitespace,
 )
 
@@ -26,7 +25,9 @@ class LegacyWorkflow:
         provider: ModelProvider,
         app_config: AppConfig,
         workflow_config: LegacyWorkflowConfig,
-        sentence_tokenizer: Callable[[str], list[str]] = sent_tokenize,
+        sentence_tokenizer: Callable[
+            [str], list[str]
+        ] = default_sentence_tokenizer,
     ) -> None:
         self._provider = provider
         self._app_config = app_config

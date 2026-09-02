@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
-from nltk.tokenize import sent_tokenize
+from nltk.tokenize import PunktSentenceTokenizer
 
 from summarizer.providers.base import GenerationRequest
 
@@ -20,6 +20,11 @@ USER_PROMPT_PREFIX = (
     "correctness. Abbreviate long and repetitive words. "
 )
 DELIMITER = '\n"""\n'
+_SENTENCE_TOKENIZER = PunktSentenceTokenizer()
+
+
+def default_sentence_tokenizer(text: str) -> list[str]:
+    return _SENTENCE_TOKENIZER.tokenize(text)
 
 
 def normalize_whitespace(text: str) -> str:
@@ -29,7 +34,7 @@ def normalize_whitespace(text: str) -> str:
 def chunk_text_by_sentences(
     text: str,
     max_chunk_size: int,
-    sentence_tokenizer: Callable[[str], list[str]] = sent_tokenize,
+    sentence_tokenizer: Callable[[str], list[str]] = default_sentence_tokenizer,
 ) -> list[str]:
     chunks: list[str] = []
     current_chunk = ""
