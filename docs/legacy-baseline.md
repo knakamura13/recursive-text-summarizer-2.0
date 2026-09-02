@@ -59,6 +59,21 @@ The characterization suite preserves evidence for these limitations:
 
 These are findings about legacy behavior, not requirements or target behavior for the new pipeline.
 
+## Issue #3 replacement behavior
+
+Issue #3 replaces the legacy executable seams while retaining the characterized flat workflow for transition. `main.py` becomes an import-safe CLI entry point. Configuration moves to frozen validated values, OpenAI calls use the Responses API behind an injectable provider, and retry behavior moves to a provider-neutral decorator.
+
+The following legacy limitations are intentionally fixed:
+
+- importing application modules no longer downloads NLTK data, constructs an OpenAI client, configures file logging, calls the network, or writes files;
+- credentials are read by the official client from `OPENAI_API_KEY` only when a live provider is first used;
+- provider failures raise typed exceptions and cannot become summary text;
+- exhausted retries preserve the final transient failure as their cause;
+- CLI failures use nonzero exit codes;
+- input, output, model, timeout, retry count, chunk size, maximum chunks, and dry-run behavior are configurable and validated.
+
+Sentence packing, fixed character budgets, independent chunk summaries, and newline concatenation remain transitional compatibility behavior. Later issues replace those policies with token-aware segmentation, hierarchy, grounding, and evaluation.
+
 ## Fixture corpus
 
 The offline corpus supplies five compact, fictional source genres for future evaluation:
