@@ -38,7 +38,7 @@ Provide an executive summary of the following text (delimited by triple quotes).
 """
 ```
 
-Successful response text has whitespace collapsed before it is added to `output.txt`. Every successful provider operation also writes `gpt_logs/<timestamp>_gpt.txt`, where `<timestamp>` is the value returned by `time.time()`. The artifact contains the original chunk under `PROMPT:`, a line of ten equals signs, and the normalized response under `RESPONSE:`. Multi-chunk runs therefore produce one provider artifact per successfully summarized chunk.
+Successful response text has whitespace collapsed before it is added to `output.txt`. Every successful chunk makes one write attempt to `gpt_logs/<timestamp>_gpt.txt`, where `<timestamp>` is the value returned by `time.time()`. The artifact contains the original chunk under `PROMPT:`, a line of ten equals signs, and the normalized response under `RESPONSE:`. If two chunks receive equal timestamp values, the later write uses the same filename and overwrites the earlier artifact, so a multi-chunk run is not guaranteed to retain one distinct artifact per chunk.
 
 At import, `logging.basicConfig` requests an INFO-level file handler at `summarizer.log` in the current working directory. Python only applies that request when the root logger has no handlers already configured. File read and write failures are logged as errors, provider failures are logged for each attempt, exhausted retries are logged as errors, and an executable workflow failure is logged as critical. The executable catches that final exception, so it does not use a nonzero process exit to signal failure.
 

@@ -50,6 +50,8 @@ def _expected_messages(chunk: str) -> list[dict[str, str]]:
 
 
 def _set_max_chunks_at_entry(max_chunks: int) -> Callable:
+    # This temporarily displaces any active debugger or coverage trace. The
+    # caller saves and restores the previous interpreter trace around the run.
     def configure_max_chunks(
         frame: FrameType,
         event: str,
