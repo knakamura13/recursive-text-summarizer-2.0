@@ -12,7 +12,7 @@ Issue #3 establishes reusable application seams without implementing the later g
 - Add validated CLI overrides for foundational and transitional settings.
 - Make `main.py` a thin entry point over import-safe application modules.
 - Make model generation injectable and independent of OpenAI types.
-- Use the current OpenAI Responses API through a narrow adapter.
+- Support OpenAI Responses and native Ollama chat through narrow adapters.
 - Represent failures as actionable application exceptions.
 - Preserve useful legacy behavior through the characterization suite.
 - Capture provider metadata needed to measure future pipeline cost and efficiency.
@@ -53,6 +53,7 @@ summarizer/
   providers/
     __init__.py
     base.py
+    ollama.py
     openai.py
     retrying.py
 main.py
@@ -64,13 +65,17 @@ main.py
 
 Configuration is divided by responsibility instead of accumulated in one mutable object:
 
-- `AppConfig` contains input path, output path, model, and request timeout.
+- `AppConfig` contains input path, output path, provider, model, Ollama host,
+  and request timeout.
 - `RetryPolicy` contains maximum attempts, initial delay, and backoff multiplier.
 - `LegacyWorkflowConfig` contains character chunk size, maximum chunks, and dry-run mode.
 
 All configuration objects are frozen dataclasses and validate themselves at construction. Empty paths or model names are invalid. Input and output paths must differ. Timeout, attempts, chunk size, and backoff values must be positive. Maximum chunks must be `-1` for unlimited processing or a positive integer.
 
-The CLI exposes `--input`, `--output`, `--model`, `--timeout`, `--max-retries`, `--chunk-size`, `--max-chunks`, and `--dry-run`. No arguments retain `input.txt` and `output.txt` in the current working directory.
+The CLI exposes `--input`, `--output`, `--provider`, `--model`,
+`--ollama-host`, `--timeout`, `--max-retries`, `--chunk-size`, `--max-chunks`,
+and `--dry-run`. No arguments retain the OpenAI provider plus `input.txt` and
+`output.txt` in the current working directory.
 
 Chunk size and maximum chunks are intentionally stored in `LegacyWorkflowConfig`. They preserve the existing workflow but are not declared universal properties of the future pipeline.
 
@@ -101,11 +106,27 @@ SDK retries are explicitly disabled because retry policy is owned by the provide
 
 The refactor replaces the deprecated legacy `gpt-4-1106-preview` default with `gpt-4o-mini`, an inexpensive general text model supported by the Responses API. A focused compatibility test and operator documentation will make this intentional change explicit. Selecting an empirically optimal model remains deferred to evaluation issue #12.
 
+## Ollama adapter
+
+`OllamaProvider` constructs the official native client lazily and calls the
+non-streaming chat API with system and user messages. It disables separate
+thinking output for the current plain-text contract, validates terminal
+assistant content, and captures available model, token-count, and completion
+metadata.
+
+The host is configurable and defaults to `http://localhost:11434`. Local Ollama
+requires no API key, and model identifiers remain unrestricted so installed and
+custom tags work without application changes. The adapter reports unavailable
+services, missing models, timeouts, rejected requests, and malformed responses
+through the provider-independent exception hierarchy.
+
 ## Retry decorator
 
 `RetryingProvider` wraps any `ModelProvider`. It retries only typed transient failures, immediately propagates fatal failures, applies the immutable `RetryPolicy`, and preserves the final causal exception when attempts are exhausted. An injected sleeper makes backoff tests deterministic.
 
-Keeping retries outside both the workflow and OpenAI adapter avoids transport policy in hierarchy traversal, prevents SDK and application retry multiplication, and permits later global retry budgets.
+Keeping retries outside the workflow and both adapters avoids transport policy
+in hierarchy traversal, prevents SDK and application retry multiplication, and
+permits later global retry budgets.
 
 ## Transitional workflow
 
@@ -140,8 +161,11 @@ Implementation follows red-green-refactor cycles. Offline tests will cover:
 - import-time absence of client construction, downloads, logging configuration, network access, and file writes;
 - request mapping and structured response metadata extraction;
 - lazy OpenAI client construction and environment-owned credentials;
+- lazy Ollama client construction, native chat mapping, and configurable host;
+- provider selection without provider-specific workflow branches;
 - empty or malformed Responses output;
 - SDK exception translation with sanitized messages;
+- native Ollama exception translation with sanitized messages;
 - transient retry, fatal non-retry, deterministic backoff, and causal exhaustion;
 - proof that SDK and decorator retries do not multiply;
 - dry-run behavior with zero provider calls;
