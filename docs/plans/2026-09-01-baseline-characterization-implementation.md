@@ -285,7 +285,7 @@ Expected: PASS, proving import uses only deterministic doubles.
 
 ```bash
 git add tests/support tests/test_legacy_import.py
-git commit -m "test: add deterministic legacy module loader"
+git commit -m "chore: add deterministic legacy module loader"
 ```
 
 ### Task 3: Characterize file, whitespace, and chunk behavior
@@ -381,7 +381,7 @@ Expected: PASS. If `save_file` raises a platform-specific `OSError` subtype, nar
 
 ```bash
 git add tests/test_legacy_utilities.py
-git commit -m "test: characterize legacy utility behavior"
+git commit -m "chore: characterize legacy utility behavior"
 ```
 
 ### Task 4: Characterize model requests and successful summaries
@@ -451,7 +451,7 @@ Expected: PASS, 3 tests.
 
 ```bash
 git add tests/test_legacy_provider.py
-git commit -m "test: characterize legacy model requests"
+git commit -m "chore: characterize legacy model requests"
 ```
 
 ### Task 5: Characterize retry and terminal failure behavior
@@ -505,7 +505,7 @@ Expected: PASS, including five calls and four recorded delays. The generic-failu
 
 ```bash
 git add tests/test_legacy_provider.py
-git commit -m "test: characterize legacy retry failures"
+git commit -m "chore: characterize legacy retry failures"
 ```
 
 ### Task 6: Characterize the default executable workflow
@@ -566,7 +566,7 @@ Expected: PASS, 2 tests. If pytest's installed logging handler prevents the seco
 
 ```bash
 git add tests/test_legacy_cli.py
-git commit -m "test: characterize default summarizer workflow"
+git commit -m "chore: characterize default summarizer workflow"
 ```
 
 ### Task 7: Add representative long-form fixtures
@@ -635,7 +635,7 @@ Expected: PASS, 5 parameterized cases.
 
 ```bash
 git add tests/fixtures tests/test_fixture_corpus.py
-git commit -m "test: add representative source fixtures"
+git commit -m "chore: add representative source fixtures"
 ```
 
 ### Task 8: Document the observed baseline and verify #2
@@ -711,7 +711,7 @@ Expected: only `docs/legacy-baseline.md` is uncommitted.
 
 ```bash
 git add docs/legacy-baseline.md
-git commit -m "docs: record legacy summarizer baseline"
+git commit -m "chore: record legacy summarizer baseline"
 ```
 
 **Step 5: Re-run acceptance verification**

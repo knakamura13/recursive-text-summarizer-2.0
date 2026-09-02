@@ -21,8 +21,28 @@ The executable workflow currently provides these observable guarantees:
 
 - `python main.py` reads UTF-8 text from `input.txt` in the current working directory.
 - A successful run writes UTF-8 text to `output.txt` in the current working directory.
-- The workflow performs one summarization operation for each source chunk in source order. A successful first attempt makes one provider call; a failed operation can make up to five provider calls through retries.
+- The workflow performs one summarization operation for each source chunk in source order. A positive `MAX_CHUNKS` value keeps only that many chunks from the start of the source, while the default `-1` processes every chunk.
 - Provider responses are joined with exactly one newline between adjacent responses.
+
+## Provider prompt and logging shape
+
+Each executable-path summarization passes the alias `gpt-4`, which resolves to `gpt-4-1106-preview`, and sets a 180-second provider timeout. The request contains exactly two messages in this order:
+
+- The `system` message is `You are a writing assistant, skilled in revising and summarizing complex technical writing with accuracy and precision.`
+- The `user` message is the following fixed text and chunk template. Each delimiter is a newline, three double-quote characters, and another newline (`\n"""\n`).
+
+```text
+Provide an executive summary of the following text (delimited by triple quotes). Present the key ideas and findings directly, without bullet points, as if for a busy professional who needs to grasp the essential points quickly. Ignore complete sentences and grammatical correctness. Abbreviate long and repetitive words.
+"""
+<source chunk>
+"""
+```
+
+Successful response text has whitespace collapsed before it is added to `output.txt`. Every successful provider operation also writes `gpt_logs/<timestamp>_gpt.txt`, where `<timestamp>` is the value returned by `time.time()`. The artifact contains the original chunk under `PROMPT:`, a line of ten equals signs, and the normalized response under `RESPONSE:`. Multi-chunk runs therefore produce one provider artifact per successfully summarized chunk.
+
+At import, `logging.basicConfig` requests an INFO-level file handler at `summarizer.log` in the current working directory. Python only applies that request when the root logger has no handlers already configured. File read and write failures are logged as errors, provider failures are logged for each attempt, exhausted retries are logged as errors, and an executable workflow failure is logged as critical. The executable catches that final exception, so it does not use a nonzero process exit to signal failure.
+
+Provider operations make at most five attempts. A failed attempt waits 1, 2, 4, then 8 seconds before the next attempt. Five `requests.exceptions.RequestException` failures return `GPT error: Unknown error`. Five generic exceptions expose the legacy `UnboundLocalError` defect instead of returning error text. A successful attempt returns immediately and does not perform later retries.
 
 ## Known legacy limitations
 
@@ -33,7 +53,7 @@ The characterization suite preserves evidence for these limitations:
 - Importing `main.py` downloads the NLTK `punkt` resource and constructs an OpenAI client.
 - Prompts and model aliases are fixed in source code.
 - Intermediate summaries are concatenated directly, without recursive synthesis.
-- Provider errors can become output text, while a terminal generic provider failure can raise `UnboundLocalError`.
+- Request-related provider errors can become output text, while a terminal generic provider failure raises `UnboundLocalError`.
 - Fatal executable errors are logged but do not produce a nonzero process exit.
 - Module constants require source edits rather than runtime configuration.
 

@@ -31,7 +31,11 @@ def test_import_uses_test_doubles_without_credentials_or_downloads(
     assert harness.dotenv_load_count == 1
 
 
-def test_import_time_logging_configuration_is_scoped_to_its_test() -> None:
+def test_import_time_logging_configuration_is_scoped_to_its_test(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
     root_logger = logging.getLogger()
     original_handlers = list(root_logger.handlers)
     original_level = root_logger.level
@@ -45,7 +49,6 @@ def test_import_time_logging_configuration_is_scoped_to_its_test() -> None:
         assert len(root_logger.handlers) == 1
         assert isinstance(root_logger.handlers[0], logging.FileHandler)
         assert root_logger.level == logging.INFO
-
 
     assert root_logger.handlers == original_handlers
     assert root_logger.level == original_level
