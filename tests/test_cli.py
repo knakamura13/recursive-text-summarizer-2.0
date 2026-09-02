@@ -3,11 +3,14 @@ from pathlib import Path
 
 import pytest
 
+from summarizer import cli
 from summarizer.cli import main, parse_args
+from summarizer.config import AppConfig
 from summarizer.providers.base import (
     GenerationRequest,
     GenerationResult,
     ModelProvider,
+    ProviderConnectionError,
     ProviderRequestError,
 )
 
@@ -104,7 +107,7 @@ def test_main_runs_default_file_workflow_without_network(
 
     exit_code = main(
         [],
-        provider_factory=lambda: provider,
+        provider_factory=lambda _config: provider,
         sentence_tokenizer=lambda text: [text],
     )
 
@@ -129,7 +132,7 @@ def test_main_reports_provider_failure_and_preserves_output(
 
     exit_code = main(
         [],
-        provider_factory=lambda: provider,
+        provider_factory=lambda _config: provider,
         sentence_tokenizer=lambda text: [text],
     )
 
@@ -146,7 +149,10 @@ def test_main_reports_missing_input_without_creating_output(
 ) -> None:
     monkeypatch.chdir(tmp_path)
 
-    exit_code = main([], provider_factory=RecordingProvider)
+    exit_code = main(
+        [],
+        provider_factory=lambda _config: RecordingProvider(),
+    )
 
     assert exit_code == 1
     assert "input.txt" in capsys.readouterr().err
@@ -161,7 +167,7 @@ def test_dry_run_does_not_construct_provider(
     (tmp_path / "input.txt").write_text("Source.", encoding="utf-8")
     constructions: list[object] = []
 
-    def provider_factory() -> ModelProvider:
+    def provider_factory(_config: AppConfig) -> ModelProvider:
         constructions.append(object())
         raise AssertionError("provider constructed during dry run")
 
@@ -191,4 +197,70 @@ def test_main_reports_missing_openai_credential_without_traceback(
     assert exit_code == 1
     assert "OPENAI_API_KEY" in stderr
     assert "Traceback" not in stderr
+    assert not (tmp_path / "output.txt").exists()
+
+
+def test_build_provider_selects_openai_without_ollama_construction() -> None:
+    constructions: list[tuple[str, object]] = []
+    expected = RecordingProvider()
+
+    provider = cli.build_provider(
+        AppConfig(provider="openai"),
+        openai_factory=lambda: expected,
+        ollama_factory=lambda **kwargs: constructions.append(
+            ("ollama", kwargs)
+        ),
+    )
+
+    assert provider is expected
+    assert constructions == []
+
+
+def test_build_provider_selects_ollama_with_configured_host() -> None:
+    constructions: list[tuple[str, object]] = []
+    expected = RecordingProvider()
+
+    provider = cli.build_provider(
+        AppConfig(
+            provider="ollama",
+            model="qwen3.8",
+            ollama_host="http://ollama.internal:11434",
+        ),
+        openai_factory=lambda: constructions.append(("openai", None)),
+        ollama_factory=lambda **kwargs: (
+            constructions.append(("ollama", kwargs)) or expected
+        ),
+    )
+
+    assert provider is expected
+    assert constructions == [
+        ("ollama", {"host": "http://ollama.internal:11434"})
+    ]
+
+
+def test_main_reports_unavailable_selected_ollama_service(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "input.txt").write_text("Source.", encoding="utf-8")
+    selected: list[AppConfig] = []
+
+    def provider_factory(config: AppConfig) -> ModelProvider:
+        selected.append(config)
+        return RecordingProvider(
+            ProviderConnectionError("Ollama connection failed")
+        )
+
+    exit_code = main(
+        ["--provider", "ollama", "--max-retries", "1"],
+        provider_factory=provider_factory,
+        sentence_tokenizer=lambda text: [text],
+    )
+
+    stderr = capsys.readouterr().err
+    assert exit_code == 1
+    assert "Ollama connection failed" in stderr
+    assert selected[0].provider == "ollama"
     assert not (tmp_path / "output.txt").exists()

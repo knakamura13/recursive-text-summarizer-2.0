@@ -16,6 +16,7 @@ from summarizer.providers.base import (
     ProviderError,
 )
 from summarizer.providers.openai import OpenAIProvider
+from summarizer.providers.ollama import OllamaProvider
 from summarizer.providers.retrying import RetryingProvider
 
 
@@ -29,6 +30,17 @@ class ParsedConfig:
 class _UnavailableProvider:
     def generate(self, request: GenerationRequest) -> GenerationResult:
         raise AssertionError("provider called during dry run")
+
+
+def build_provider(
+    config: AppConfig,
+    *,
+    openai_factory: Callable[..., ModelProvider] = OpenAIProvider,
+    ollama_factory: Callable[..., ModelProvider] = OllamaProvider,
+) -> ModelProvider:
+    if config.provider == "ollama":
+        return ollama_factory(host=config.ollama_host)
+    return openai_factory()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -80,7 +92,7 @@ def parse_args(argv: list[str] | None = None) -> ParsedConfig:
 def main(
     argv: list[str] | None = None,
     *,
-    provider_factory: Callable[[], ModelProvider] = OpenAIProvider,
+    provider_factory: Callable[[AppConfig], ModelProvider] = build_provider,
     sentence_tokenizer: Callable[[str], list[str]] | None = None,
 ) -> int:
     config = parse_args(argv)
@@ -93,7 +105,7 @@ def main(
     if config.workflow.dry_run:
         provider = _UnavailableProvider()
     else:
-        provider = RetryingProvider(provider_factory(), config.retry)
+        provider = RetryingProvider(provider_factory(config.app), config.retry)
 
     workflow_kwargs: dict[str, object] = {}
     if sentence_tokenizer is not None:

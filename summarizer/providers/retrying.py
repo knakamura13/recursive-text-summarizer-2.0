@@ -31,7 +31,10 @@ class RetryingProvider:
                 return self._provider.generate(request)
             except TransientProviderError as error:
                 if attempt == self._policy.max_attempts:
-                    raise ProviderRetriesExhaustedError(attempt) from error
+                    raise ProviderRetriesExhaustedError(
+                        attempt,
+                        str(error),
+                    ) from error
                 self._sleeper(delay)
                 delay *= self._policy.backoff_multiplier
         raise AssertionError("retry loop completed without a result")

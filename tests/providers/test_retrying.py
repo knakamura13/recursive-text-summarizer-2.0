@@ -87,6 +87,7 @@ def test_exhaustion_preserves_last_failure_as_cause() -> None:
     except ProviderRetriesExhaustedError as caught:
         assert caught.attempts == 2
         assert caught.__cause__ is last
+        assert "last" in str(caught)
     else:
         raise AssertionError("retry exhaustion was not raised")
 

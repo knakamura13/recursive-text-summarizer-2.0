@@ -82,6 +82,9 @@ class ProviderResponseError(ProviderError):
 
 
 class ProviderRetriesExhaustedError(ProviderError):
-    def __init__(self, attempts: int) -> None:
+    def __init__(self, attempts: int, detail: str | None = None) -> None:
         self.attempts = attempts
-        super().__init__(f"Provider request failed after {attempts} attempts")
+        message = f"Provider request failed after {attempts} attempts"
+        if detail:
+            message = f"{message}: {detail}"
+        super().__init__(message)
