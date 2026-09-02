@@ -39,6 +39,7 @@ def test_readme_documents_current_cli_and_credentials() -> None:
     assert "--ollama-host" in readme
     assert "qwen3.8" in readme
     assert "gemma3:4b" in readme
+    assert "ollama serve" in readme
     assert "does not require an API key" in readme
     assert "python main.py --input source.txt --output summary.txt" in readme
     assert "python main.py --dry-run" in readme

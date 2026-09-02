@@ -1,8 +1,10 @@
+import json
 from types import SimpleNamespace
 
 import httpx
 import ollama
 import pytest
+from pydantic import ValidationError
 
 from summarizer.providers.base import (
     GenerationRequest,
@@ -92,6 +94,32 @@ def test_adapts_native_chat_request_and_response_lazily() -> None:
     assert len(constructions) == 1
 
 
+def test_uses_a_client_with_each_distinct_request_timeout() -> None:
+    constructions: list[dict[str, object]] = []
+
+    def client_factory(**kwargs: object) -> FakeClient:
+        constructions.append(kwargs)
+        return FakeClient(response())
+
+    provider = OllamaProvider(client_factory=client_factory)
+
+    provider.generate(REQUEST)
+    provider.generate(
+        GenerationRequest(
+            model=REQUEST.model,
+            instructions=REQUEST.instructions,
+            input_text=REQUEST.input_text,
+            timeout_seconds=90,
+        )
+    )
+    provider.generate(REQUEST)
+
+    assert constructions == [
+        {"host": "http://localhost:11434", "timeout": 42},
+        {"host": "http://localhost:11434", "timeout": 90},
+    ]
+
+
 @pytest.mark.parametrize(
     "bad_response",
     [
@@ -175,3 +203,33 @@ def test_rejects_invalid_metadata() -> None:
 
     with pytest.raises(ProviderResponseError, match="metadata"):
         provider.generate(REQUEST)
+
+
+def test_rejects_non_string_model_metadata() -> None:
+    provider = OllamaProvider(
+        client_factory=lambda **_kwargs: FakeClient(response(model=123))
+    )
+
+    with pytest.raises(ProviderResponseError, match="metadata"):
+        provider.generate(REQUEST)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        json.JSONDecodeError("secret response body", "secret response body", 0),
+        ValidationError.from_exception_data("secret schema", []),
+    ],
+)
+def test_translates_malformed_successful_response_without_leaking_body(
+    error: Exception,
+) -> None:
+    provider = OllamaProvider(
+        client_factory=lambda **_kwargs: FakeClient(error)
+    )
+
+    with pytest.raises(ProviderResponseError, match="malformed") as exc_info:
+        provider.generate(REQUEST)
+
+    assert exc_info.value.__cause__ is error
+    assert "secret" not in str(exc_info.value)

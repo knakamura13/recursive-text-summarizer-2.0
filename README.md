@@ -28,6 +28,14 @@ For local generation, install [Ollama](https://ollama.com/download), start its
 service, and pull a model. A local Ollama service does not require an API key:
 
 ```sh
+ollama serve
+```
+
+The Ollama desktop application normally starts the service itself. Run
+`ollama serve` in a separate terminal when operating Ollama without the desktop
+application. After the service is available, pull the model you want to use:
+
+```sh
 ollama pull gemma3:4b
 ```
 

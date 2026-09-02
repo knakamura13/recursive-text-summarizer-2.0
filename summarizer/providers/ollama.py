@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from typing import Any
 
 import httpx
 import ollama
+from pydantic import ValidationError
 
 from summarizer.providers.base import (
     GenerationRequest,
@@ -31,7 +33,7 @@ class OllamaProvider:
     ) -> None:
         self._host = host
         self._client_factory = client_factory
-        self._client: Any | None = None
+        self._clients: dict[float, Any] = {}
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         try:
@@ -74,6 +76,10 @@ class OllamaProvider:
             raise ProviderRequestError(
                 "Ollama request was invalid"
             ) from error
+        except (json.JSONDecodeError, ValidationError) as error:
+            raise ProviderResponseError(
+                "Ollama returned a malformed response"
+            ) from error
 
         if getattr(response, "done", None) is not True:
             raise ProviderResponseError(
@@ -86,11 +92,17 @@ class OllamaProvider:
                 "Ollama response did not contain valid text"
             )
 
+        model = getattr(response, "model", None) or request.model
+        if not isinstance(model, str) or not model.strip():
+            raise ProviderResponseError(
+                "Ollama response contained invalid metadata"
+            )
+
         try:
             return GenerationResult(
                 text=re.sub(r"\s+", " ", output_text.strip()).strip(),
                 provider="ollama",
-                model=getattr(response, "model", None) or request.model,
+                model=model,
                 input_tokens=getattr(response, "prompt_eval_count", None),
                 output_tokens=getattr(response, "eval_count", None),
                 finish_status=getattr(response, "done_reason", None),
@@ -102,9 +114,9 @@ class OllamaProvider:
             ) from error
 
     def _get_client(self, timeout_seconds: float) -> Any:
-        if self._client is None:
-            self._client = self._client_factory(
+        if timeout_seconds not in self._clients:
+            self._clients[timeout_seconds] = self._client_factory(
                 host=self._host,
                 timeout=timeout_seconds,
             )
-        return self._client
+        return self._clients[timeout_seconds]
