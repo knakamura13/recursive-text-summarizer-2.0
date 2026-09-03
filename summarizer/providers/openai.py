@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 from collections.abc import Callable
 from typing import Any
 
@@ -17,6 +16,7 @@ from summarizer.providers.base import (
     ProviderResponseError,
     ProviderServerError,
     ProviderTimeoutError,
+    normalize_output_text,
 )
 
 
@@ -35,13 +35,24 @@ class OpenAIProvider:
         self._client: Any | None = None
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
+        arguments: dict[str, Any] = {
+            "model": request.model,
+            "instructions": request.instructions,
+            "input": request.input_text,
+            "timeout": request.timeout_seconds,
+        }
+        if request.response_schema is not None:
+            arguments["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": request.schema_name,
+                    "schema": request.response_schema,
+                    "strict": True,
+                }
+            }
+
         try:
-            response = self._get_client().responses.create(
-                model=request.model,
-                instructions=request.instructions,
-                input=request.input_text,
-                timeout=request.timeout_seconds,
-            )
+            response = self._get_client().responses.create(**arguments)
         except openai.APITimeoutError as error:
             raise ProviderTimeoutError("OpenAI request timed out") from error
         except openai.RateLimitError as error:
@@ -81,7 +92,7 @@ class OpenAIProvider:
 
         usage = getattr(response, "usage", None)
         return GenerationResult(
-            text=re.sub(r"\s+", " ", output_text.strip()).strip(),
+            text=normalize_output_text(output_text, request),
             provider="openai",
             model=getattr(response, "model", None) or request.model,
             input_tokens=getattr(usage, "input_tokens", None),

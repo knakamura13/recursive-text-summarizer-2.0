@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable
 from typing import Any
 
@@ -18,6 +17,7 @@ from summarizer.providers.base import (
     ProviderResponseError,
     ProviderServerError,
     ProviderTimeoutError,
+    normalize_output_text,
 )
 
 
@@ -36,19 +36,26 @@ class OllamaProvider:
         self._clients: dict[float, Any] = {}
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
+        arguments: dict[str, Any] = {
+            "model": request.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": request.instructions,
+                },
+                {"role": "user", "content": request.input_text},
+            ],
+            "stream": False,
+            "think": False,
+        }
+        if request.response_schema is not None:
+            # The native client takes a JSON Schema directly. It constrains
+            # decoding on a best-effort basis rather than guaranteeing it, so
+            # callers still parse defensively.
+            arguments["format"] = request.response_schema
+
         try:
-            response = self._get_client(request.timeout_seconds).chat(
-                model=request.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": request.instructions,
-                    },
-                    {"role": "user", "content": request.input_text},
-                ],
-                stream=False,
-                think=False,
-            )
+            response = self._get_client(request.timeout_seconds).chat(**arguments)
         except httpx.TimeoutException as error:
             raise ProviderTimeoutError("Ollama request timed out") from error
         except (ConnectionError, httpx.TransportError) as error:
@@ -100,7 +107,7 @@ class OllamaProvider:
 
         try:
             return GenerationResult(
-                text=re.sub(r"\s+", " ", output_text.strip()).strip(),
+                text=normalize_output_text(output_text, request),
                 provider="ollama",
                 model=model,
                 input_tokens=getattr(response, "prompt_eval_count", None),

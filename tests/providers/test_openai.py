@@ -212,3 +212,69 @@ def test_translates_sdk_errors_without_sensitive_content(
     assert "Sensitive source" not in message
     assert "sentinel credential" not in message
     assert exc_info.value.__cause__ is sdk_error
+
+
+SCHEMA_REQUEST = GenerationRequest(
+    model="gpt-4o-mini",
+    instructions="Summarize accurately.",
+    input_text="Source material",
+    timeout_seconds=30,
+    response_schema={"type": "object", "properties": {}},
+    schema_name="leaf_summary",
+)
+
+
+def _provider_for(responses: FakeResponses) -> OpenAIProvider:
+    return OpenAIProvider(
+        client_factory=lambda **kwargs: SimpleNamespace(responses=responses)
+    )
+
+
+def test_omits_response_format_when_no_schema_is_requested() -> None:
+    responses = FakeResponses(
+        SimpleNamespace(output_text="summary", model="gpt-4o-mini", status="completed")
+    )
+
+    _provider_for(responses).generate(REQUEST)
+
+    assert "text" not in responses.calls[0]
+
+
+def test_passes_a_requested_schema_as_a_strict_json_schema_format() -> None:
+    responses = FakeResponses(
+        SimpleNamespace(output_text="{}", model="gpt-4o-mini", status="completed")
+    )
+
+    _provider_for(responses).generate(SCHEMA_REQUEST)
+
+    assert responses.calls[0]["text"] == {
+        "format": {
+            "type": "json_schema",
+            "name": "leaf_summary",
+            "schema": {"type": "object", "properties": {}},
+            "strict": True,
+        }
+    }
+
+
+def test_preserves_response_whitespace_only_for_structured_requests() -> None:
+    payload = '{\n  "summary": "a  b",\n  "quote": "line\\nbreak"\n}'
+    responses = FakeResponses(
+        SimpleNamespace(output_text=payload, model="gpt-4o-mini", status="completed")
+    )
+
+    structured = _provider_for(responses).generate(SCHEMA_REQUEST)
+
+    # A quotation copied verbatim out of the source keeps its whitespace, so it
+    # can still be located in the segment it came from.
+    assert structured.text == payload
+
+    responses = FakeResponses(
+        SimpleNamespace(
+            output_text="  concise\nsummary  ", model="gpt-4o-mini", status="completed"
+        )
+    )
+
+    prose = _provider_for(responses).generate(REQUEST)
+
+    assert prose.text == "concise summary"

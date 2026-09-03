@@ -233,3 +233,47 @@ def test_translates_malformed_successful_response_without_leaking_body(
 
     assert exc_info.value.__cause__ is error
     assert "secret" not in str(exc_info.value)
+
+
+SCHEMA_REQUEST = GenerationRequest(
+    model="gemma3:4b",
+    instructions="Summarize accurately.",
+    input_text="Source material",
+    timeout_seconds=42,
+    response_schema={"type": "object", "properties": {}},
+    schema_name="leaf_summary",
+)
+
+
+def _provider_for(client: FakeClient) -> OllamaProvider:
+    return OllamaProvider(client_factory=lambda **kwargs: client)
+
+
+def test_omits_format_when_no_schema_is_requested() -> None:
+    client = FakeClient(response())
+
+    _provider_for(client).generate(REQUEST)
+
+    assert "format" not in client.calls[0]
+
+
+def test_passes_a_requested_schema_as_the_native_format_argument() -> None:
+    client = FakeClient(response(message=SimpleNamespace(content="{}")))
+
+    _provider_for(client).generate(SCHEMA_REQUEST)
+
+    assert client.calls[0]["format"] == {"type": "object", "properties": {}}
+
+
+def test_preserves_response_whitespace_only_for_structured_requests() -> None:
+    payload = '{\n  "summary": "a  b",\n  "quote": "line\\nbreak"\n}'
+    client = FakeClient(response(message=SimpleNamespace(content=payload)))
+
+    structured = _provider_for(client).generate(SCHEMA_REQUEST)
+
+    assert structured.text == payload
+
+    client = FakeClient(response())
+    prose = _provider_for(client).generate(REQUEST)
+
+    assert prose.text == "local summary"
