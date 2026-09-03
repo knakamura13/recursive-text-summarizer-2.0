@@ -81,10 +81,10 @@ def test_overhead_with_a_real_encoding_matches_the_measured_scale() -> None:
     # prompt or the record changing, which is the thing worth noticing.
     assert (overhead.instructions, overhead.schema, overhead.fencing) == (
         251,
-        521,
+        610,
         26,
     )
-    assert overhead.total == 798
+    assert overhead.total == 887
 
 
 def test_safety_margin_takes_the_larger_term() -> None:
