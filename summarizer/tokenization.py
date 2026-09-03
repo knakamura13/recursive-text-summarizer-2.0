@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import tiktoken
 from tiktoken.core import Encoding
@@ -22,7 +22,42 @@ class TokenCounter(Protocol):
     @property
     def exact(self) -> bool: ...
 
+    @property
+    def monotonic(self) -> bool: ...
+
     def count(self, text: str) -> int: ...
+
+
+@runtime_checkable
+class PrefixTokenCounter(Protocol):
+    def fitting_prefix(
+        self,
+        text: str,
+        start: int,
+        end: int,
+        max_tokens: int,
+    ) -> int: ...
+
+
+@runtime_checkable
+class SuffixTokenCounter(Protocol):
+    def fitting_suffix(
+        self,
+        text: str,
+        floor: int,
+        end: int,
+        max_tokens: int,
+    ) -> int: ...
+
+
+# Width of the window searched exactly at the end of a boundary search. BPE
+# token counts are not monotonic in text length, and the instability is *not*
+# bounded by any single token's byte length: with cl100k_base, "a" * 3000 at a
+# 12-token budget fits through 96 characters even though 93 characters already
+# exceeds it. No window makes a coarse search exact, so this is a packing
+# density knob only. Every returned boundary is verified by an exact recount,
+# and callers must not assume a returned boundary is the largest one possible.
+_UNSTABLE_TOKEN_WINDOW_CHARS = 16
 
 
 @dataclass(frozen=True)
@@ -34,21 +69,23 @@ class TiktokenCounter:
     @classmethod
     def for_model(cls, model: str) -> TiktokenCounter:
         try:
-            return cls(tiktoken.encoding_for_model(model))
+            encoding = tiktoken.encoding_for_model(model)
         except KeyError as error:
             raise TokenAccountingError(
                 f"no tiktoken encoding is registered for model {model!r}; "
                 "provide encoding_name explicitly"
             ) from error
+        return cls(encoding)
 
     @classmethod
     def for_encoding(cls, encoding_name: str) -> TiktokenCounter:
         try:
-            return cls(tiktoken.get_encoding(encoding_name))
+            encoding = tiktoken.get_encoding(encoding_name)
         except ValueError as error:
             raise TokenAccountingError(
                 f"unknown tiktoken encoding {encoding_name!r}"
             ) from error
+        return cls(encoding)
 
     @property
     def identity(self) -> str:
@@ -58,8 +95,73 @@ class TiktokenCounter:
     def exact(self) -> bool:
         return True
 
+    @property
+    def monotonic(self) -> bool:
+        return False
+
     def count(self, text: str) -> int:
-        return len(self.encoding.encode(text))
+        return len(self.encoding.encode_ordinary(text))
+
+    def fitting_prefix(
+        self,
+        text: str,
+        start: int,
+        end: int,
+        max_tokens: int,
+    ) -> int:
+        """Return an end offset whose prefix is verified to fit `max_tokens`.
+
+        The result is exact for its own slice but is not guaranteed to be the
+        largest fitting offset: a coarse search cannot be exact against a
+        non-monotonic encoding. Under-packing is safe; callers must never treat
+        the result as maximal, nor assume a smaller offset also fits.
+        """
+        if self.count(text[start:end]) <= max_tokens:
+            return end
+
+        low, high = start, end
+        while high - low > _UNSTABLE_TOKEN_WINDOW_CHARS:
+            mid = (low + high) // 2
+            if self.count(text[start:mid]) <= max_tokens:
+                low = mid
+            else:
+                high = mid
+
+        best = low
+        for candidate in range(low + 1, high + 1):
+            if self.count(text[start:candidate]) <= max_tokens:
+                best = candidate
+        return best
+
+    def fitting_suffix(
+        self,
+        text: str,
+        floor: int,
+        end: int,
+        max_tokens: int,
+    ) -> int:
+        """Return a start offset whose suffix is verified to fit `max_tokens`.
+
+        The backward mirror of `fitting_prefix`, carrying the same contract: the
+        returned slice is verified, but is not guaranteed to be the longest
+        fitting suffix.
+        """
+        if self.count(text[floor:end]) <= max_tokens:
+            return floor
+
+        low, high = floor, end
+        while high - low > _UNSTABLE_TOKEN_WINDOW_CHARS:
+            mid = (low + high) // 2
+            if self.count(text[mid:end]) <= max_tokens:
+                high = mid
+            else:
+                low = mid
+
+        best = high
+        for candidate in range(high - 1, low - 1, -1):
+            if self.count(text[candidate:end]) <= max_tokens:
+                best = candidate
+        return best
 
 
 @dataclass(frozen=True)
@@ -68,9 +170,38 @@ class ConservativeUtf8TokenCounter:
 
     identity: str = "estimate:utf8-bytes"
     exact: bool = False
+    monotonic: bool = True
 
     def count(self, text: str) -> int:
         return len(text.encode("utf-8"))
+
+    def fitting_prefix(
+        self,
+        text: str,
+        start: int,
+        end: int,
+        max_tokens: int,
+    ) -> int:
+        byte_count = 0
+        for index in range(start, end):
+            byte_count += len(text[index].encode("utf-8"))
+            if byte_count > max_tokens:
+                return index
+        return end
+
+    def fitting_suffix(
+        self,
+        text: str,
+        floor: int,
+        end: int,
+        max_tokens: int,
+    ) -> int:
+        byte_count = 0
+        for index in range(end - 1, floor - 1, -1):
+            byte_count += len(text[index].encode("utf-8"))
+            if byte_count > max_tokens:
+                return index + 1
+        return floor
 
 
 def resolve_token_counter(
