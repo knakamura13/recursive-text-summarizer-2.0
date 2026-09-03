@@ -1,0 +1,145 @@
+import pytest
+from pydantic import ValidationError
+
+from summarizer.summaries import (
+    LEAF_SCHEMA_VERSION,
+    ContentKind,
+    ContentUnit,
+    EvidenceItem,
+    SummaryNode,
+    leaf_summary_schema,
+)
+
+
+def evidence(segment_id: str = "S000001", quote: str | None = None) -> EvidenceItem:
+    return EvidenceItem(segment_id=segment_id, quote=quote)
+
+
+def content_unit(text: str = "The archive was moved in March.") -> ContentUnit:
+    return ContentUnit(
+        text=text,
+        kind=ContentKind.FACT,
+        evidence=(evidence(),),
+        qualification=None,
+        uncertain=False,
+    )
+
+
+def summary_node(**overrides: object) -> SummaryNode:
+    fields: dict[str, object] = {
+        "summary": "The archive moved and the index was rebuilt.",
+        "content_units": (content_unit(),),
+        "entities": ("archive",),
+        "qualifications": (),
+        "contradictions": (),
+        "quotations": (),
+        "provenance": ("S000001",),
+        "level": 0,
+    }
+    fields.update(overrides)
+    return SummaryNode(**fields)  # type: ignore[arg-type]
+
+
+def test_accepts_a_minimal_valid_leaf_node() -> None:
+    node = summary_node()
+
+    assert node.level == 0
+    assert node.content_units[0].kind is ContentKind.FACT
+    assert node.content_units[0].evidence[0].segment_id == "S000001"
+
+
+def test_leaf_records_are_immutable() -> None:
+    node = summary_node()
+
+    with pytest.raises(ValidationError):
+        node.summary = "rewritten"  # type: ignore[misc]
+
+
+def test_rejects_blank_required_text() -> None:
+    with pytest.raises(ValidationError):
+        summary_node(summary="   ")
+
+    with pytest.raises(ValidationError):
+        EvidenceItem(segment_id="", quote=None)
+
+    with pytest.raises(ValidationError):
+        ContentUnit(
+            text="",
+            kind=ContentKind.CLAIM,
+            evidence=(),
+            qualification=None,
+            uncertain=False,
+        )
+
+
+def test_rejects_unknown_fields() -> None:
+    with pytest.raises(ValidationError):
+        summary_node(recommended_action="delete the archive")
+
+
+def test_rejects_a_negative_level() -> None:
+    with pytest.raises(ValidationError):
+        summary_node(level=-1)
+
+
+def test_contradictions_and_quotations_may_be_empty() -> None:
+    node = summary_node(contradictions=(), quotations=())
+
+    assert node.contradictions == ()
+    assert node.quotations == ()
+
+
+def test_null_collections_are_accepted_as_empty() -> None:
+    """Only the strict OpenAI path guarantees a present key.
+
+    Ollama's format argument is best effort and a model may emit null for a
+    field it has nothing to say about, so null and empty must mean the same
+    thing rather than failing validation.
+    """
+    node = summary_node(contradictions=None, quotations=None, entities=None)
+
+    assert node.contradictions == ()
+    assert node.quotations == ()
+    assert node.entities == ()
+
+
+def test_uncertainty_and_qualification_are_representable() -> None:
+    unit = ContentUnit(
+        text="The index may have been rebuilt twice.",
+        kind=ContentKind.CLAIM,
+        evidence=(evidence(quote="rebuilt twice"),),
+        qualification="The source hedges this.",
+        uncertain=True,
+    )
+
+    assert unit.uncertain is True
+    assert unit.qualification == "The source hedges this."
+
+
+def test_schema_is_strict_at_every_level() -> None:
+    """The schema is sent to the provider, so strictness is a wire contract.
+
+    OpenAI's strict mode requires every property to be required and every
+    object to forbid additional properties, including nested definitions.
+    """
+    schema = leaf_summary_schema()
+
+    def assert_strict(definition: dict[str, object], label: str) -> None:
+        assert definition.get("additionalProperties") is False, label
+        properties = definition.get("properties", {})
+        assert isinstance(properties, dict)
+        assert set(definition.get("required", [])) == set(properties), label
+
+    assert_strict(schema, "root")
+    definitions = schema.get("$defs", {})
+    assert isinstance(definitions, dict)
+    assert definitions, "nested records should appear as definitions"
+    for name, definition in definitions.items():
+        if definition.get("type") == "object":
+            assert_strict(definition, name)
+
+
+def test_schema_version_is_present_and_stable() -> None:
+    assert LEAF_SCHEMA_VERSION
+    assert isinstance(LEAF_SCHEMA_VERSION, str)
+    assert leaf_summary_schema() == leaf_summary_schema()
