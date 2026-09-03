@@ -131,6 +131,12 @@ This issue delivers the tree, grouping, the merge stage and prompt, the generali
 7. **The children-per-merge ceiling defaults to unset**, so measurement governs and the quality question stays open.
 8. **Parent-to-child edges are stored** despite not being required here.
 
+## Measured on completion
+
+Verified end to end against an injected counter and a ceiling of three children per merge: **20 leaves reduce to one root through 3 levels in 11 provider calls**, with per-level counts 20 → 7 → 3 → 1. The root's provenance equals the ordered union of all twenty segment identifiers, and parent-to-child edges are present on all 31 stored nodes.
+
+The `require_provenance` flag on the validator was not in the design. It emerged from implementing it: the anti-vacuity rule added for leaves demands non-empty provenance, but a merged node's provenance is derived, so requiring a model to restate a value that is then discarded is ceremony and its absence proves nothing either way. The flag defaults to True, so leaf behaviour is untouched.
+
 ## Open decisions
 
 1. **Whether a wide merge should be capped by default.** A 136-way merge must express itself within the same output reserve as a 2-way one, which is a functional argument for a default ceiling and not only a quality one. Left unset for consistency with the direct cap, and because no measurement in this repository bears on the quality question.
