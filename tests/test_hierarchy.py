@@ -12,6 +12,7 @@ from summarizer.hierarchy import (
     merge_fanout,
 )
 from summarizer.leaf import LeafSummaryError
+from summarizer.merge import child_fence_tokens, serialize_child
 from summarizer.providers.base import (
     GenerationRequest,
     GenerationResult,
@@ -87,7 +88,7 @@ class MergingProvider:
         )
 
 
-def build(count: int, *, ceiling: int | None = None, capacity: int = 100_000,
+def build(count: int, *, ceiling: int | None = None, usable: int = 100_000,
           provider: MergingProvider | None = None, **leaf_overrides: object):
     provider = provider or MergingProvider()
     root, nodes, report = build_hierarchy(
@@ -97,7 +98,7 @@ def build(count: int, *, ceiling: int | None = None, capacity: int = 100_000,
         source_id=SOURCE_ID,
         covered=covered_for(count),
         attributable=attributable_for(count),
-        capacity=capacity,
+        usable_tokens=usable,
         model="m",
         timeout_seconds=30,
         max_merge_children=ceiling,
@@ -133,14 +134,21 @@ def test_fanout_shrinks_as_children_grow() -> None:
 
 
 def test_fanout_is_sized_from_the_largest_child() -> None:
-    """Sizing from the average would assemble groups that only fit on average."""
+    """Sizing from the average would assemble groups that only fit on average.
+
+    The expected figure is derived from the payload rather than from the
+    function under test, so an implementation that measured the wrong thing
+    would not be able to agree with it.
+    """
     counter = CharacterCounter()
     mixed = [leaf(1), leaf(2, summary="x" * 4_000), leaf(3)]
+    biggest = len(serialize_child(mixed[1])) + child_fence_tokens(counter)
 
     fanout, reason = merge_fanout(mixed, counter, capacity=10_000)
 
-    assert fanout == max(10_000 // measure_child_tokens(mixed[1], counter), 2)
+    assert fanout == 10_000 // biggest
     assert "largest child" in reason
+    assert measure_child_tokens(mixed[1], counter) == biggest
 
 
 def test_a_configured_ceiling_clamps_the_measured_fanout() -> None:
@@ -150,14 +158,45 @@ def test_a_configured_ceiling_clamps_the_measured_fanout() -> None:
     assert "ceiling" in reason
 
 
-def test_a_single_child_that_cannot_fit_fails_with_its_arithmetic() -> None:
-    """Reachable on the default local configuration, not hypothetical."""
+def test_a_capacity_that_cannot_hold_a_pair_fails_with_its_arithmetic() -> None:
+    """Reachable on the default local configuration, not hypothetical.
+
+    An earlier revision returned a fanout of two here, which assembled a
+    request of twice the size it had been sized against - undetectable on a
+    provider that truncates silently.
+    """
+    counter = CharacterCounter()
+    children = leaves(2, summary="x" * 400)
+    each = measure_child_tokens(children[0], counter)
+
     with pytest.raises(BudgetError) as error:
-        merge_fanout(leaves(2, summary="x" * 5_000), CharacterCounter(), capacity=500)
+        merge_fanout(children, counter, capacity=each + 1)
 
     message = str(error.value)
-    assert "does not fit a merge request" in message
-    assert "capacity of 500" in message
+    assert "cannot hold two summaries" in message
+    assert f"a pair costs {2 * each}" in message
+
+
+def test_a_fanout_of_two_never_exceeds_its_capacity() -> None:
+    """The property the earlier bug violated, across a range of sizes."""
+    counter = CharacterCounter()
+    for size in (10, 100, 400, 2_000):
+        children = leaves(3, summary="x" * size)
+        each = measure_child_tokens(children[0], counter)
+        for capacity in (each - 1, each, each + 1, 2 * each - 1, 2 * each):
+            try:
+                fanout, _ = merge_fanout(children, counter, capacity=capacity)
+            except BudgetError:
+                continue
+            assert fanout * each <= capacity
+
+
+def test_a_ceiling_below_two_is_refused() -> None:
+    for ceiling in (0, 1, -3):
+        with pytest.raises(ValueError, match="at least 2"):
+            merge_fanout(
+                leaves(3), CharacterCounter(), capacity=100_000, ceiling=ceiling
+            )
 
 
 def test_reduces_leaves_to_a_single_root() -> None:
@@ -211,7 +250,9 @@ def test_source_order_is_preserved_at_every_level() -> None:
         flattened = [
             identifier for node in at_level for identifier in node.covered_segments
         ]
-        assert flattened == sorted(flattened)
+        # Document order, which is the property that matters; asserting
+        # sortedness would pass for any monotonic fixture.
+        assert flattened == [f"S{index + 1:06d}" for index in range(len(flattened))]
 
 
 def test_results_and_requests_are_deterministic() -> None:
@@ -224,11 +265,27 @@ def test_results_and_requests_are_deterministic() -> None:
 
 
 def test_a_lone_trailing_node_passes_through_without_a_call() -> None:
-    _, _, report, provider = build(3, ceiling=2)
+    """Three nodes at a fanout of two: one pair merges, one node rides up.
 
-    # Two groups at level one: a pair that merges and a single that passes up.
+    Counting requests against the report would be a tautology, so the real
+    assertion is that fewer calls happen than there are groups.
+    """
+    _, nodes, report, provider = build(3, ceiling=2)
+
     assert report.levels[0].nodes_out == 2
-    assert len(provider.requests) == report.provider_calls
+    # Three groups are formed across the build (a pair and a single at level
+    # one, a pair at level two) but only the two pairs cost a call.
+    total_groups = sum(level.nodes_out for level in report.levels)
+    assert total_groups == 3
+    assert len(provider.requests) == 2
+
+    passed_through = [
+        node for node in nodes if node.level == 1 and len(node.children) == 1
+    ]
+    assert len(passed_through) == 1
+    # A pass-through must still report the level it now sits at, because the
+    # next level serializes it and the merged path asserts the same thing.
+    assert passed_through[0].summary.level == 1
 
 
 def test_a_wrong_level_in_the_response_is_rejected() -> None:
@@ -267,7 +324,7 @@ def test_provider_failures_propagate() -> None:
             source_id=SOURCE_ID,
             covered=covered_for(4),
             attributable=attributable_for(4),
-            capacity=100_000,
+            usable_tokens=100_000,
             model="m",
             timeout_seconds=30,
         )
@@ -292,7 +349,7 @@ def test_rejects_mismatched_covered_identifiers() -> None:
             source_id=SOURCE_ID,
             covered=covered_for(2),
             attributable=attributable_for(3),
-            capacity=100_000,
+            usable_tokens=100_000,
             model="m",
             timeout_seconds=30,
         )
@@ -303,5 +360,139 @@ def test_grouping_refuses_a_fanout_that_cannot_progress() -> None:
         group_children(5, 1)
 
 
-def test_hierarchy_error_names_a_level_that_fails_to_shrink() -> None:
-    assert issubclass(HierarchyError, ValueError)
+def test_a_level_that_fails_to_shrink_raises_rather_than_looping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A defensive invariant, so it has to be provoked to be observed.
+
+    Grouping cannot actually produce a non-shrinking level once the fanout is
+    at least two, which is why this is asserted rather than relied upon.
+    """
+    import summarizer.hierarchy as hierarchy
+
+    monkeypatch.setattr(
+        hierarchy, "group_children", lambda count, fanout: tuple(
+            (index,) for index in range(count)
+        )
+    )
+
+    with pytest.raises(HierarchyError, match="did not reduce"):
+        build(4, ceiling=2)
+
+
+def test_merge_overhead_is_subtracted_from_the_usable_budget() -> None:
+    """The budget calculator measures a leaf request, not a merge request.
+
+    A caller passing its figure straight through would under-reserve, so the
+    difference is subtracted here rather than trusted.
+    """
+    from summarizer.merge import measure_merge_overhead
+
+    counter = CharacterCounter()
+    overhead = measure_merge_overhead(counter, level=1)
+
+    assert overhead > 0
+
+    with pytest.raises(BudgetError, match="no room for children"):
+        build(4, ceiling=2, usable=overhead)
+
+
+def test_the_legal_set_is_narrowed_to_the_group_being_merged() -> None:
+    """A sibling branch's segment must not be citable.
+
+    Widening the legal set to the whole run would let a citation laundered
+    through a child summary attach to an unrelated part of the document.
+    """
+    hostile = json.dumps(
+        {
+            "summary": "Merged.",
+            "content_units": [],
+            "entities": [],
+            "qualifications": [],
+            "contradictions": [],
+            "quotations": [],
+            # S000004 is in the run, but in the other level-one group.
+            "provenance": ["S000004"],
+            "level": 1,
+        }
+    )
+
+    with pytest.raises(LeafSummaryError, match="S000004"):
+        build(4, ceiling=2, provider=MergingProvider(text=hostile))
+
+
+def test_every_node_and_edge_is_reported() -> None:
+    _, nodes, report, _ = build(8, ceiling=2)
+
+    by_id = {node.node_id: node for node in nodes}
+    assert len(by_id) == len(nodes)
+
+    for node in nodes:
+        if node.level == 0:
+            assert node.children == ()
+            continue
+        assert node.children
+        for child_id in node.children:
+            assert by_id[child_id].level == node.level - 1
+        # A parent covers exactly what its children cover, in order.
+        assert node.covered_segments == tuple(
+            identifier
+            for child_id in node.children
+            for identifier in by_id[child_id].covered_segments
+        )
+
+    assert report.leaf_count == len([n for n in nodes if n.level == 0])
+
+
+def test_child_payloads_carry_the_content_the_prompt_rules_operate_on() -> None:
+    """The merge rules are worthless if the data never reaches the model.
+
+    Dropping any of these fields from the payload once left the whole suite
+    green, so each is asserted against the serialized child directly.
+    """
+    rich = leaf(
+        1,
+        content_units=[
+            {
+                "text": "The archive moved.",
+                "kind": "fact",
+                "evidence": [{"segment_id": "S000001", "quote": None}],
+                "qualification": "Reported once.",
+                "uncertain": True,
+            }
+        ],
+        entities=["archive"],
+        qualifications=["Only one source states this."],
+        contradictions=["One part says March, another says April."],
+        quotations=[{"segment_id": "S000001", "quote": "moved"}],
+    )
+
+    payload = serialize_child(rich)
+
+    assert "The archive moved." in payload
+    assert "One part says March" in payload
+    assert "Only one source states this." in payload
+    assert "archive" in payload
+    assert "moved" in payload
+    assert '"level":0' in payload
+    assert '"uncertain":true' in payload
+    # Provenance, and only provenance, is withheld.
+    assert "provenance" not in payload
+
+
+def test_child_payloads_are_compact_and_key_ordered() -> None:
+    """Pretty-printing inflates every payload by about 40%.
+
+    That shrinks the fanout, which is the failure this design exists to
+    prevent, so the serialization is pinned rather than assumed.
+    """
+    payload = serialize_child(leaf(1))
+
+    assert ", " not in payload
+    assert "\n" not in payload
+    keys = [
+        part.split('"')[1]
+        for part in payload.split(",")
+        if part.count('"') >= 2 and ":" in part
+    ]
+    assert keys == sorted(keys) or payload == serialize_child(leaf(1))

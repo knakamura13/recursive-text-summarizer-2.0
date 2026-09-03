@@ -15,6 +15,7 @@ from summarizer.leaf import (
 )
 from summarizer.providers.base import GenerationRequest
 from summarizer.summaries import SummaryNode, leaf_summary_schema
+from summarizer.tokenization import TokenCounter
 
 # A distinct cache-key input from the leaf prompt. Bump it whenever a change
 # could alter a model's output for identical children.
@@ -91,6 +92,41 @@ def serialize_child(node: SummaryNode) -> str:
     payload = node.model_dump(mode="json")
     payload.pop("provenance", None)
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def measure_merge_overhead(counter: TokenCounter, *, level: int = 1) -> int:
+    """Measure what a merge request costs before any child is added.
+
+    The budget calculator measures a *leaf* request, and a merge request is
+    not the same shape: its instructions are longer and it carries an extra
+    outer delimiter pair. Sizing children against the leaf figure would
+    under-reserve, so this is measured rather than inherited.
+
+    The level is interpolated into the instructions, which moves the count by
+    a few tokens across plausible levels; the safety margin absorbs that.
+    """
+    probe = _MERGE_INSTRUCTIONS.format(
+        level=level, begin=_fence("0" * 64, level, "BEGIN"), end=_fence("0" * 64, level, "END")
+    )
+    outer = counter.count(
+        "{}\n\n{}".format(
+            _fence("0" * 64, level, "BEGIN"), _fence("0" * 64, level, "END")
+        )
+    )
+    schema = counter.count(
+        json.dumps(leaf_summary_schema(), separators=(",", ":"), sort_keys=True)
+    )
+    return counter.count(probe) + outer + schema
+
+
+def child_fence_tokens(counter: TokenCounter, *, level: int = 1) -> int:
+    """Measure the delimiter pair wrapping one child."""
+    return counter.count(
+        "{}\n\n{}".format(
+            _fence("0" * 64, level, "SUMMARY-BEGIN", 0),
+            _fence("0" * 64, level, "SUMMARY-END", 0),
+        )
+    )
 
 
 def build_merge_request(
