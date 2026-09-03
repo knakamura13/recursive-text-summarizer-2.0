@@ -4,11 +4,15 @@ from dataclasses import dataclass, field
 from collections.abc import Mapping, Sequence
 
 from summarizer.budget import BudgetError
+from summarizer.grounding import GroundingPolicy, select_source_passages
+from summarizer.leaf import derive_provenance, validate_provenance
 from summarizer.merge import (
     build_merge_request,
     child_fence_tokens,
     measure_merge_overhead,
+    measure_merge_request_tokens,
     parse_merged_summary,
+    serialize_source_passage_block,
     serialize_child,
 )
 from summarizer.providers.base import ModelProvider
@@ -19,6 +23,9 @@ from summarizer.tokenization import TokenCounter
 
 class HierarchyError(ValueError):
     """The summary tree could not be reduced to a single root."""
+
+
+DEFAULT_GROUNDING_POLICY = GroundingPolicy(max_tokens=1_024)
 
 
 @dataclass(frozen=True)
@@ -162,6 +169,7 @@ def build_hierarchy(
     model: str,
     timeout_seconds: float,
     max_merge_children: int | None = None,
+    grounding_policy: GroundingPolicy | None = None,
 ) -> tuple[TreeNode, tuple[TreeNode, ...], HierarchyReport]:
     """Reduce ordered leaves to a single root through as many levels as needed.
 
@@ -185,6 +193,28 @@ def build_hierarchy(
     if len(covered) != len(leaves):
         raise ValueError("each leaf needs its covered segment identifiers")
 
+    policy = grounding_policy or DEFAULT_GROUNDING_POLICY
+    prepared_leaves: list[SummaryNode] = []
+    prepared_covered: list[tuple[str, ...]] = []
+    for index, (leaf, identifiers) in enumerate(zip(leaves, covered), start=1):
+        local_covered = tuple(identifiers)
+        missing = [
+            identifier for identifier in local_covered if identifier not in attributable
+        ]
+        if missing:
+            raise ValueError(
+                "attributable text is missing for segments " + ", ".join(missing)
+            )
+        legal = {identifier: attributable[identifier] for identifier in local_covered}
+        subject = f"L0N{index:04d}"
+        validate_provenance(leaf, legal=legal, subject=subject)
+        prepared_leaves.append(
+            leaf.model_copy(
+                update={"provenance": derive_provenance(leaf, source_order=local_covered)}
+            )
+        )
+        prepared_covered.append(local_covered)
+
     all_nodes: list[TreeNode] = []
     current = [
         TreeNode(
@@ -195,7 +225,9 @@ def build_hierarchy(
             children=(),
             covered_segments=tuple(segments),
         )
-        for index, (leaf, segments) in enumerate(zip(leaves, covered))
+        for index, (leaf, segments) in enumerate(
+            zip(prepared_leaves, prepared_covered)
+        )
     ]
     all_nodes.extend(current)
 
@@ -206,12 +238,13 @@ def build_hierarchy(
     while len(current) > 1:
         level += 1
         overhead = measure_merge_overhead(counter, level=level)
-        child_capacity = usable_tokens - overhead
+        child_capacity = usable_tokens - overhead - policy.max_tokens
         if child_capacity <= 0:
             raise BudgetError(
-                f"no room for children in a merge request at level {level}: "
-                f"{usable_tokens} usable tokens are consumed by {overhead} "
-                f"tokens of instructions, schema, and delimiters"
+                f"no room for generated children in a grounded merge request at "
+                f"level {level}: {usable_tokens} usable tokens leave no room after "
+                f"{overhead} tokens of merge overhead and {policy.max_tokens} "
+                "tokens reserved for source grounding"
             )
         fanout, reason = merge_fanout(
             [node.summary for node in current],
@@ -253,6 +286,9 @@ def build_hierarchy(
                 source_id=source_id,
                 model=model,
                 timeout_seconds=timeout_seconds,
+                counter=counter,
+                usable_tokens=usable_tokens,
+                grounding_policy=policy,
             )
             provider_calls += 1
             produced.append(node)
@@ -294,6 +330,9 @@ def _merge_group(
     source_id: str,
     model: str,
     timeout_seconds: float,
+    counter: TokenCounter,
+    usable_tokens: int,
+    grounding_policy: GroundingPolicy,
 ) -> TreeNode:
     node_id = f"L{level}N{order + 1:04d}"
     # A union in document order: deduplicated, first occurrence wins. Three
@@ -316,20 +355,44 @@ def _merge_group(
         )
     legal = {identifier: attributable[identifier] for identifier in covered}
 
+    selection = select_source_passages(
+        [member.summary for member in members],
+        source=legal,
+        counter=counter,
+        policy=grounding_policy,
+        selection_cost=lambda passages: counter.count(
+            "\n".join(
+                serialize_source_passage_block(
+                    passage,
+                    source_id=source_id,
+                    level=level,
+                    ordinal=ordinal,
+                )
+                for ordinal, passage in enumerate(passages)
+            )
+        ),
+    )
+    grounded = {passage.segment_id: passage.text for passage in selection.passages}
     request = build_merge_request(
         [member.summary for member in members],
+        passages=selection.passages,
         level=level,
         source_id=source_id,
         model=model,
         timeout_seconds=timeout_seconds,
     )
+    request_tokens = measure_merge_request_tokens(request, counter)
+    if request_tokens > usable_tokens:
+        raise BudgetError(
+            f"grounded merge request at {node_id} costs {request_tokens} tokens "
+            f"against a usable capacity of {usable_tokens}"
+        )
     result = provider.generate(request)
     summary = parse_merged_summary(
         result.text,
-        legal=legal,
+        legal=grounded,
         subject=node_id,
         level=level,
-        provenance=covered,
     )
     return TreeNode(
         node_id=node_id,

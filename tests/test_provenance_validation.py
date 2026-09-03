@@ -106,6 +106,62 @@ def test_checks_evidence_on_content_units_too() -> None:
         )
 
 
+def test_rejects_an_evidence_free_content_unit() -> None:
+    with pytest.raises(LeafSummaryError, match="content unit"):
+        validate_provenance(
+            node(
+                content_units=[
+                    {
+                        "text": "The archive moved.",
+                        "kind": "fact",
+                        "evidence": [],
+                        "qualification": None,
+                        "uncertain": False,
+                    }
+                ]
+            ),
+            legal=LEGAL,
+            subject="L1N001",
+        )
+
+
+def test_checks_evidence_on_grounded_annotations_too() -> None:
+    with pytest.raises(LeafSummaryError, match="S999999"):
+        validate_provenance(
+            node(
+                contradictions=[
+                    {
+                        "text": "Another source disagrees.",
+                        "evidence": [{"segment_id": "S999999", "quote": None}],
+                    }
+                ]
+            ),
+            legal=LEGAL,
+            subject="L1N001",
+        )
+
+
+@pytest.mark.parametrize("field", ("qualifications", "contradictions"))
+def test_rejects_an_annotation_quote_absent_from_its_cited_source(field: str) -> None:
+    with pytest.raises(LeafSummaryError, match="quotation"):
+        validate_provenance(
+            node(
+                **{
+                    field: [
+                        {
+                            "text": "The record is qualified.",
+                            "evidence": [
+                                {"segment_id": "S000001", "quote": "invented"}
+                            ],
+                        }
+                    ]
+                }
+            ),
+            legal=LEGAL,
+            subject="L1N001",
+        )
+
+
 def test_failures_name_the_subject_and_bound_payload_text() -> None:
     hostile = "S9\nINJECTED: " + "x" * 400
 

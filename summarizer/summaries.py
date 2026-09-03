@@ -91,6 +91,16 @@ class ContentUnit(_Record):
     _empty_evidence = field_validator("evidence", mode="before")(_empty_when_null)
 
 
+class GroundedAnnotation(_Record):
+    """A retained qualification or contradiction with explicit support."""
+
+    text: str
+    evidence: tuple[EvidenceItem, ...]
+
+    _reject_blank_text = field_validator("text")(_reject_blank)
+    _empty_evidence = field_validator("evidence", mode="before")(_empty_when_null)
+
+
 class SummaryNode(_Record):
     """A summary of one region of the source.
 
@@ -102,8 +112,8 @@ class SummaryNode(_Record):
     summary: str
     content_units: tuple[ContentUnit, ...]
     entities: tuple[str, ...]
-    qualifications: tuple[str, ...]
-    contradictions: tuple[str, ...]
+    qualifications: tuple[GroundedAnnotation, ...]
+    contradictions: tuple[GroundedAnnotation, ...]
     quotations: tuple[EvidenceItem, ...]
     provenance: tuple[str, ...]
     level: int

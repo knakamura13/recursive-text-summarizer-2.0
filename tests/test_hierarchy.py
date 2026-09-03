@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import pytest
 
 from summarizer.budget import BudgetError
+from summarizer.grounding import GroundingPolicy
 from summarizer.hierarchy import (
     HierarchyError,
     build_hierarchy,
@@ -12,7 +13,11 @@ from summarizer.hierarchy import (
     merge_fanout,
 )
 from summarizer.leaf import LeafSummaryError
-from summarizer.merge import child_fence_tokens, serialize_child
+from summarizer.merge import (
+    child_fence_tokens,
+    measure_merge_request_tokens,
+    serialize_child,
+)
 from summarizer.providers.base import (
     GenerationRequest,
     GenerationResult,
@@ -73,6 +78,14 @@ class MergingProvider:
         if self.text is not None:
             return GenerationResult(text=self.text, provider="fake", model=request.model)
         level = int((request.operation_id or "merge-L1").rsplit("L", 1)[1])
+        source_id = next(
+            (
+                identifier
+                for identifier in attributable_for(99)
+                if f'"segment_id":"{identifier}"' in request.input_text
+            ),
+            None,
+        )
         body = {
             "summary": f"Merged at level {level}.",
             "content_units": [],
@@ -80,7 +93,7 @@ class MergingProvider:
             "qualifications": [],
             "contradictions": [],
             "quotations": [],
-            "provenance": [],
+            "provenance": [source_id] if source_id else [],
             "level": self.level_override if self.level_override is not None else level,
         }
         return GenerationResult(
@@ -89,7 +102,8 @@ class MergingProvider:
 
 
 def build(count: int, *, ceiling: int | None = None, usable: int = 100_000,
-          provider: MergingProvider | None = None, **leaf_overrides: object):
+          grounding_tokens: int = 1_000, provider: MergingProvider | None = None,
+          **leaf_overrides: object):
     provider = provider or MergingProvider()
     root, nodes, report = build_hierarchy(
         leaves(count, **leaf_overrides),
@@ -102,6 +116,7 @@ def build(count: int, *, ceiling: int | None = None, usable: int = 100_000,
         model="m",
         timeout_seconds=30,
         max_merge_children=ceiling,
+        grounding_policy=GroundingPolicy(max_tokens=grounding_tokens),
     )
     return root, nodes, report, provider
 
@@ -224,19 +239,81 @@ def test_every_level_strictly_reduces_the_node_count() -> None:
         assert level.nodes_out < level.nodes_in
 
 
-def test_provenance_is_the_union_of_covered_segments() -> None:
+def test_tree_coverage_remains_complete_while_merge_provenance_narrows() -> None:
     root, _, _, _ = build(6, ceiling=2)
 
     assert root.covered_segments == tuple(f"S{index + 1:06d}" for index in range(6))
-    assert root.summary.provenance == root.covered_segments
+    assert root.summary.provenance == ("S000001",)
 
 
-def test_the_models_own_provenance_is_discarded() -> None:
-    """The provider answers with empty provenance; the union must still hold."""
+def test_the_models_own_provenance_is_canonicalized_to_selected_source_order() -> None:
     root, _, _, _ = build(4, ceiling=2)
 
-    assert root.summary.provenance != ()
-    assert set(root.summary.provenance) == set(attributable_for(4))
+    assert root.summary.provenance == ("S000001",)
+
+
+def test_every_grounded_merge_request_fits_the_usable_budget() -> None:
+    _, _, _, provider = build(4, ceiling=2, usable=10_000, grounding_tokens=1_000)
+
+    for request in provider.requests:
+        assert measure_merge_request_tokens(request, CharacterCounter()) <= 10_000
+
+
+def test_authoritative_source_can_correct_a_misleading_child_summary() -> None:
+    class CorrectingProvider:
+        def __init__(self) -> None:
+            self.requests: list[GenerationRequest] = []
+
+        def generate(self, request: GenerationRequest) -> GenerationResult:
+            self.requests.append(request)
+            assert "The archive did not move." in request.input_text
+            return GenerationResult(
+                text=json.dumps(
+                    {
+                        "summary": "The archive did not move.",
+                        "content_units": [
+                            {
+                                "text": "The archive did not move.",
+                                "kind": "fact",
+                                "evidence": [
+                                    {"segment_id": "S000002", "quote": "did not move"}
+                                ],
+                                "qualification": None,
+                                "uncertain": False,
+                            }
+                        ],
+                        "entities": ["archive"],
+                        "qualifications": [],
+                        "contradictions": [],
+                        "quotations": [],
+                        "provenance": ["S000002"],
+                        "level": 1,
+                    }
+                ),
+                provider="fake",
+                model=request.model,
+            )
+
+    provider = CorrectingProvider()
+    root, _, _ = build_hierarchy(
+        leaves(2, summary="The archive moved."),
+        provider,
+        CharacterCounter(),
+        source_id=SOURCE_ID,
+        covered=covered_for(2),
+        attributable={
+            "S000001": "The archive moved.",
+            "S000002": "The archive did not move.",
+        },
+        usable_tokens=10_000,
+        model="m",
+        timeout_seconds=30,
+        grounding_policy=GroundingPolicy(max_tokens=1_000),
+    )
+
+    assert root.summary.summary == "The archive did not move."
+    assert root.summary.provenance == ("S000002",)
+    assert root.covered_segments == ("S000001", "S000002")
 
 
 def test_source_order_is_preserved_at_every_level() -> None:
@@ -393,7 +470,7 @@ def test_merge_overhead_is_subtracted_from_the_usable_budget() -> None:
 
     assert overhead > 0
 
-    with pytest.raises(BudgetError, match="no room for children"):
+    with pytest.raises(BudgetError, match="no room for generated children"):
         build(4, ceiling=2, usable=overhead)
 
 
@@ -462,8 +539,18 @@ def test_child_payloads_carry_the_content_the_prompt_rules_operate_on() -> None:
             }
         ],
         entities=["archive"],
-        qualifications=["Only one source states this."],
-        contradictions=["One part says March, another says April."],
+        qualifications=[
+            {
+                "text": "Only one source states this.",
+                "evidence": [{"segment_id": "S000001", "quote": None}],
+            }
+        ],
+        contradictions=[
+            {
+                "text": "One part says March, another says April.",
+                "evidence": [{"segment_id": "S000001", "quote": None}],
+            }
+        ],
         quotations=[{"segment_id": "S000001", "quote": "moved"}],
     )
 

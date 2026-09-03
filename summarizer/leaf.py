@@ -307,7 +307,17 @@ def validate_provenance(
     """
     referenced = set(node.provenance)
     for unit in node.content_units:
+        if not unit.evidence:
+            raise LeafSummaryError(
+                f"{subject}: a content unit must record supporting evidence"
+            )
         referenced.update(item.segment_id for item in unit.evidence)
+    for annotation in (*node.qualifications, *node.contradictions):
+        if not annotation.evidence:
+            raise LeafSummaryError(
+                f"{subject}: a grounded annotation must record supporting evidence"
+            )
+        referenced.update(item.segment_id for item in annotation.evidence)
     referenced.update(item.segment_id for item in node.quotations)
 
     unknown = sorted(referenced - set(legal))
@@ -333,11 +343,28 @@ def validate_provenance(
         for item in unit.evidence
         if item.quote is not None
     )
+    cited_quotes.extend(
+        (item.segment_id, item.quote)
+        for annotation in (*node.qualifications, *node.contradictions)
+        for item in annotation.evidence
+        if item.quote is not None
+    )
     for segment_id, quote in cited_quotes:
         if quote not in legal[segment_id]:
             raise LeafSummaryError(
                 f"{subject}: a quotation does not occur in the segment it cites"
             )
+
+
+def derive_provenance(node: SummaryNode, *, source_order: Sequence[str]) -> tuple[str, ...]:
+    """Canonicalize direct declared and structured support to source order."""
+    referenced = set(node.provenance)
+    for unit in node.content_units:
+        referenced.update(item.segment_id for item in unit.evidence)
+    for annotation in (*node.qualifications, *node.contradictions):
+        referenced.update(item.segment_id for item in annotation.evidence)
+    referenced.update(item.segment_id for item in node.quotations)
+    return tuple(identifier for identifier in source_order if identifier in referenced)
 
 
 def summarize_segments(

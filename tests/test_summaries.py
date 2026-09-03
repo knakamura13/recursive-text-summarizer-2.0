@@ -6,6 +6,7 @@ from summarizer.summaries import (
     ContentKind,
     ContentUnit,
     EvidenceItem,
+    GroundedAnnotation,
     SummaryNode,
     leaf_summary_schema,
 )
@@ -87,6 +88,23 @@ def test_contradictions_and_quotations_may_be_empty() -> None:
 
     assert node.contradictions == ()
     assert node.quotations == ()
+
+
+def test_qualifications_and_contradictions_retain_evidence() -> None:
+    qualification = GroundedAnnotation(
+        text="The source only reports this once.", evidence=(evidence(),)
+    )
+    contradiction = GroundedAnnotation(
+        text="Another passage gives a different date.",
+        evidence=(evidence("S000002"),),
+    )
+
+    node = summary_node(
+        qualifications=(qualification,), contradictions=(contradiction,)
+    )
+
+    assert node.qualifications[0].evidence[0].segment_id == "S000001"
+    assert node.contradictions[0].evidence[0].segment_id == "S000002"
 
 
 def test_null_collections_are_accepted_as_empty() -> None:

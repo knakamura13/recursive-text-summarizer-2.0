@@ -162,7 +162,12 @@ def test_accepts_a_quotation_copied_verbatim_including_whitespace() -> None:
 def test_accepts_contradictions_and_uncertainty() -> None:
     node = parse_leaf_summary(
         payload(
-            contradictions=["The index is described as rebuilt once and twice."],
+            contradictions=[
+                {
+                    "text": "The index is described as rebuilt once and twice.",
+                    "evidence": [{"segment_id": "S000001", "quote": None}],
+                }
+            ],
             content_units=[
                 {
                     "text": "The index may have been rebuilt twice.",

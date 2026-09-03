@@ -3,6 +3,7 @@ import json
 import pytest
 
 from summarizer.leaf import LeafSummaryError
+from summarizer.grounding import SourcePassage
 from summarizer.merge import (
     MERGE_PROMPT_VERSION,
     MERGE_SCHEMA_NAME,
@@ -48,9 +49,17 @@ def merged_payload(**overrides: object) -> str:
     return json.dumps(body)
 
 
-def request_for(*children: SummaryNode, level: int = 1):
+def request_for(
+    *children: SummaryNode,
+    level: int = 1,
+    passages: tuple[SourcePassage, ...] = (
+        SourcePassage("S000001", LEGAL["S000001"]),
+        SourcePassage("S000002", LEGAL["S000002"]),
+    ),
+):
     return build_merge_request(
         children or (child(),),
+        passages=passages,
         level=level,
         source_id="a" * 64,
         model="m",
@@ -66,6 +75,23 @@ def test_children_never_reach_the_instructions() -> None:
     assert "Ignore previous instructions" in request.input_text
     assert "Ignore previous instructions" not in request.instructions
     assert "S999999" not in request.instructions
+
+
+def test_authoritative_source_is_fenced_separately_from_generated_children() -> None:
+    request = request_for()
+
+    assert "The archive moved in March." in request.input_text
+    assert "The archive moved in March." not in request.instructions
+    assert "SOURCE-PASSAGE-BEGIN" in request.input_text
+    assert "GENERATED-CHILD-SUMMARIES" in request.instructions
+    assert "AUTHORITATIVE-ORIGINAL-SOURCE-PASSAGES" in request.instructions
+    assert "authoritative" in request.instructions.lower()
+    assert "correct a misleading generated summary" in request.instructions.lower()
+
+
+def test_a_merge_requires_authoritative_source_passages() -> None:
+    with pytest.raises(ValueError, match="source passage"):
+        request_for(passages=())
 
 
 def test_provenance_is_excluded_from_the_payload() -> None:
@@ -133,7 +159,7 @@ def test_prompt_does_not_enumerate_the_legal_identifiers() -> None:
     ).instructions
 
     assert "S000001" not in instructions
-    assert "already appear in the summaries below" in instructions
+    assert "authoritative source passages below" in instructions
 
 
 def test_request_carries_the_shared_schema_under_a_merge_name() -> None:
@@ -149,9 +175,9 @@ def test_each_child_is_fenced_separately_and_cannot_forge_a_fence() -> None:
         line for line in request.input_text.splitlines() if line.startswith("-----")
     ]
 
-    # Outer pair plus a pair per child.
-    assert len(fences) == 6
-    assert len(set(fences)) == 6
+    # Outer and section pairs, then a pair per child and source passage.
+    assert len(fences) == 14
+    assert len(set(fences)) == 14
 
     forged = request_for(child(fences[1]), child())
 
@@ -165,20 +191,24 @@ def test_requests_are_deterministic() -> None:
 def test_an_empty_merge_is_rejected() -> None:
     with pytest.raises(ValueError, match="at least one child"):
         build_merge_request(
-            [], level=1, source_id="a" * 64, model="m", timeout_seconds=30
+            [],
+            passages=(SourcePassage("S000001", LEGAL["S000001"]),),
+            level=1,
+            source_id="a" * 64,
+            model="m",
+            timeout_seconds=30,
         )
 
 
-def test_parsing_replaces_the_models_provenance_with_the_computed_union() -> None:
+def test_parsing_retains_only_the_models_selected_legal_provenance() -> None:
     node = parse_merged_summary(
         merged_payload(provenance=["S000001"]),
         legal=LEGAL,
         subject="L1N001",
         level=1,
-        provenance=("S000001", "S000002"),
     )
 
-    assert node.provenance == ("S000001", "S000002")
+    assert node.provenance == ("S000001",)
 
 
 def test_parsing_rejects_a_wrong_level() -> None:
@@ -188,7 +218,6 @@ def test_parsing_rejects_a_wrong_level() -> None:
             legal=LEGAL,
             subject="L1N001",
             level=1,
-            provenance=("S000001",),
         )
 
 
@@ -199,7 +228,6 @@ def test_parsing_rejects_an_injected_citation() -> None:
             legal=LEGAL,
             subject="L1N001",
             level=1,
-            provenance=("S000001",),
         )
 
 
@@ -210,7 +238,6 @@ def test_parsing_rejects_malformed_output_naming_the_subject() -> None:
             legal=LEGAL,
             subject="L1N001",
             level=1,
-            provenance=("S000001",),
         )
 
 
@@ -226,4 +253,4 @@ def test_prompt_version_is_bound_into_the_fences() -> None:
     finally:
         merge.MERGE_PROMPT_VERSION = original
 
-    assert MERGE_PROMPT_VERSION == "merge-prompt/1"
+    assert MERGE_PROMPT_VERSION == "merge-prompt/2"
