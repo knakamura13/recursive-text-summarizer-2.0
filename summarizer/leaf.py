@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 
 from pydantic import ValidationError
 
-from summarizer.providers.base import GenerationRequest
+from summarizer.providers.base import GenerationRequest, ModelProvider
 from summarizer.segmentation import SourceSegment
 from summarizer.summaries import SummaryNode, leaf_summary_schema
 
@@ -243,3 +244,37 @@ def _validate_provenance(node: SummaryNode, *, segment: SourceSegment) -> None:
             raise LeafSummaryError(
                 f"{segment.segment_id}: a quotation does not occur in the segment"
             )
+
+
+def summarize_segments(
+    segments: Sequence[SourceSegment],
+    provider: ModelProvider,
+    *,
+    model: str,
+    timeout_seconds: float,
+) -> tuple[SummaryNode, ...]:
+    """Summarize every segment into a validated leaf record, in source order.
+
+    Fails on the first segment whose response cannot be validated. Nothing here
+    requires surviving a bad segment, provider failures are never converted
+    into output, and a half-populated hierarchy reaching the merge stage is
+    worse than a clear failure.
+
+    A schema violation is not retried. `ProviderResponseError` is deliberately
+    not transient, so the retry decorator will not re-ask, and a bounded
+    re-ask would be new machinery.
+
+    Returns an immutable sequence rather than a mapping, so per-segment
+    outcomes can be added later without changing the success path.
+    """
+    if not segments:
+        raise ValueError("summarization requires at least one segment")
+
+    nodes = []
+    for segment in sorted(segments, key=lambda candidate: candidate.order):
+        request = build_leaf_request(
+            segment, model=model, timeout_seconds=timeout_seconds
+        )
+        result = provider.generate(request)
+        nodes.append(parse_leaf_summary(result.text, segment=segment))
+    return tuple(nodes)
