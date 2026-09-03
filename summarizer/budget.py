@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from summarizer.config import StrategyConfig
+from summarizer.config import StrategyConfig, StrategyName
+from summarizer.ingestion import SourceDocument
 from summarizer.leaf import build_leaf_request
 from summarizer.segmentation import BoundaryKind, SourceSegment
 from summarizer.tokenization import TokenCounter
@@ -216,3 +217,126 @@ def usable_input_capacity(
             f"{config.max_output_tokens}, and a safety margin of {margin}"
         )
     return capacity
+
+
+@dataclass(frozen=True)
+class BudgetReport:
+    """Everything a strategy decision saw, and why it decided.
+
+    Returned to callers as run metadata, and safe to hash for later cache keys
+    because identical inputs produce an identical report.
+    """
+
+    strategy: StrategyName
+    reason: str
+    context_window_tokens: int
+    context_window_assumed: bool
+    counter_identity: str
+    counter_exact: bool
+    overhead: OverheadMeasurement
+    reserved_output_tokens: int
+    safety_margin_tokens: int
+    usable_input_capacity: int
+    document_tokens: int
+    fits: bool
+
+
+def select_strategy(
+    document: SourceDocument,
+    counter: TokenCounter,
+    *,
+    provider: str,
+    model: str,
+    config: StrategyConfig,
+) -> BudgetReport:
+    """Choose an execution path from a measured budget.
+
+    The document is measured with `counter.count(document.text)` - exactly the
+    text a direct request sends - rather than by summing segment counts, which
+    differs under a byte-pair encoder and diverges further under overlap.
+    """
+    window = resolve_context_window(
+        provider=provider, model=model, explicit=config.context_window
+    )
+    overhead = measure_overhead(counter, with_overlap=False)
+    margin = safety_margin(window.tokens, config)
+    capacity = usable_input_capacity(
+        window=window, overhead=overhead, config=config
+    )
+    document_tokens = counter.count(document.text)
+    fits = document_tokens <= capacity
+
+    capped = (
+        config.max_direct_tokens is not None
+        and document_tokens > config.max_direct_tokens
+    )
+
+    if config.strategy == "direct" and not fits:
+        raise BudgetError(
+            f"direct summarization was requested but the document does not fit: "
+            f"{document_tokens} tokens against a usable input capacity of "
+            f"{capacity} (context window {window.tokens}, overhead "
+            f"{overhead.total}, reserved output {config.max_output_tokens}, "
+            f"safety margin {margin})"
+        )
+
+    strategy, reason = _decide(
+        config=config,
+        fits=fits,
+        capped=capped,
+        assumed=window.assumed,
+        document_tokens=document_tokens,
+        capacity=capacity,
+    )
+
+    return BudgetReport(
+        strategy=strategy,
+        reason=reason,
+        context_window_tokens=window.tokens,
+        context_window_assumed=window.assumed,
+        counter_identity=counter.identity,
+        counter_exact=counter.exact,
+        overhead=overhead,
+        reserved_output_tokens=config.max_output_tokens,
+        safety_margin_tokens=margin,
+        usable_input_capacity=capacity,
+        document_tokens=document_tokens,
+        fits=fits,
+    )
+
+
+def _decide(
+    *,
+    config: StrategyConfig,
+    fits: bool,
+    capped: bool,
+    assumed: bool,
+    document_tokens: int,
+    capacity: int,
+) -> tuple[StrategyName, str]:
+    if config.strategy == "direct":
+        return "direct", (
+            f"direct was requested and {document_tokens} tokens fit a capacity "
+            f"of {capacity}"
+        )
+    if config.strategy == "hierarchical":
+        return "hierarchical", "hierarchical was requested explicitly"
+
+    if not fits:
+        return "hierarchical", (
+            f"{document_tokens} tokens exceed a usable input capacity of "
+            f"{capacity}"
+        )
+    if assumed:
+        return "hierarchical", (
+            "the context window is assumed rather than known, so a direct "
+            "request cannot be shown to fit"
+        )
+    if capped:
+        return "hierarchical", (
+            f"{document_tokens} tokens exceed the configured direct cap of "
+            f"{config.max_direct_tokens}"
+        )
+    return "direct", (
+        f"{document_tokens} tokens fit a usable input capacity of {capacity}"
+    )
