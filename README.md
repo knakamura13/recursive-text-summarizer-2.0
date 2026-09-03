@@ -2,9 +2,9 @@
 
 This project is being rebuilt as a generalized, source-grounded hierarchical summarization pipeline for extremely long artifacts. The current application provides a provider-neutral foundation while preserving the legacy flat, sentence-chunked workflow.
 
-Canonical ingestion, token-aware segmentation, structured leaf summarization, token-budget arithmetic, and whole-document direct summarization are now available as library components in `summarizer.ingestion`, `summarizer.tokenization`, `summarizer.segmentation`, `summarizer.summaries`, `summarizer.leaf`, `summarizer.budget`, and `summarizer.direct`. The command-line workflow still runs the legacy flat, sentence-chunked path and does not consume them yet.
+Canonical ingestion, token-aware segmentation, structured leaf summarization, token-budget arithmetic, whole-document direct summarization, and multi-level hierarchical merging are now available as library components in `summarizer.ingestion`, `summarizer.tokenization`, `summarizer.segmentation`, `summarizer.summaries`, `summarizer.leaf`, `summarizer.budget`, `summarizer.direct`, `summarizer.merge`, and `summarizer.hierarchy`. The command-line workflow still runs the legacy flat, sentence-chunked path and does not consume them yet.
 
-Hierarchical merging, source grounding across merge levels, concurrency, and quality evaluation are not implemented yet.
+Source grounding across merge levels, final editorial synthesis, claim verification, concurrency, and quality evaluation are not implemented yet.
 
 ## Requirements
 
@@ -146,6 +146,22 @@ Context windows come from a hand-maintained table, because there is no offline s
 Two provider behaviours are worth knowing, because they differ in a way that matters. OpenAI rejects an oversized request outright. Ollama silently truncates the prompt and returns a plausible answer, so on the local path the budget arithmetic is the only thing standing between a too-large document and a confidently ungrounded summary.
 
 The reserved output size is accounted for when sizing a request but not yet enforced on the provider, and the command line accepts strategy configuration without yet running the new pipeline — it still executes the legacy workflow.
+
+## Hierarchical merging
+
+`summarizer.hierarchy` reduces ordered leaf summaries to a single root, through as many merge levels as the budget requires. `summarizer.merge` owns the prompt that combines several children into one node.
+
+Group sizes are measured rather than fixed. Each child is serialized, its delimiters are added, and the number that fits a merge request is derived from the largest child in that level — sized from the largest rather than the average, so a group is never assembled that only fits on average. Groups are then *balanced* instead of greedily packed, because a ragged final group would compress the end of a document less than the beginning.
+
+Two guarantees make the recursion terminate. Every level must strictly reduce the node count, which is asserted rather than assumed. And a single child that cannot fit its own merge request fails with the arithmetic — the capacity, the child's cost, and which child. That is the default local configuration's behaviour rather than a hypothetical: with an assumed context window and the conservative estimator, one richly populated child exceeds a merge request on its own.
+
+**Provenance is computed, never taken from the response, and is excluded from merge payloads.** This is the decision the whole design rests on. Provenance costs about four tokens per identifier and unions upward, so carrying it inside the serialized children shrinks the branching factor level by level until no group of two fits — the recursion would stall on the provenance field alone, several levels before content became the constraint. Each node's provenance is therefore the union of its children's coverage, derived locally; the model still emits the field because the schema requires it, and that value is validated against the legal set and then discarded. Nothing is lost for tracing, and the rule that provenance never comes from the payload gets stronger rather than weaker.
+
+The merge prompt requires deduplication that keeps every supporting reference, preserves qualifications and uncertainty, and records disagreements rather than reconciling them. It also states that the children arrive in document order and that order alone is not evidence one caused or preceded another — a model will otherwise read adjacency as causation. Children are themselves model-written text that may carry an instruction laundered out of the source, so each is fenced separately with a derived delimiter and the same precedence rule applies to them as to source.
+
+Legal identifiers are not enumerated in the prompt. At the second level a legal set can run to thousands of identifiers and would spend a third of the request on a list, so the prompt refers to what the children carry and the validator enforces the real set.
+
+Three merge levels are not reachable from document size alone at a hosted model's capacity — it would take roughly twenty million source tokens — so multi-level behaviour is exercised by configuring a narrower ceiling on children per merge. That ceiling is unset by default, leaving measurement in charge.
 
 Historical scripts under `omscs-ml-lectures/` remain available but are not part of the modern application entry point.
 
