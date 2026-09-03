@@ -31,7 +31,7 @@ This is the selected approach. It preserves a provider-neutral segmentation pipe
 
 - `text`: UTF-8 text with line endings normalized to `\n`.
 - `source_id`: a stable digest of the canonical text.
-- `encoding`: the explicit source encoding used during ingestion.
+- `path`: the originating file, or `None` for text ingested directly. The source encoding is an argument to `read_source` rather than a field, because the canonical text is already decoded and the digest is taken over its UTF-8 bytes.
 
 Normalization is deliberately narrow. It removes a leading UTF-8 BOM, converts CRLF and CR line endings to LF, removes trailing spaces and tabs from lines, and trims only outer blank lines. It preserves headings, indentation, paragraph breaks, list markers, and internal blank lines. Empty or whitespace-only input raises an actionable `EmptySourceError`.
 
@@ -77,13 +77,26 @@ The segmenter scans canonical text into contiguous structural blocks without rew
 3. Sentence boundaries inside an oversized block.
 4. A token-safe fallback split inside an oversized sentence or indivisible block.
 
-Packing is greedy and stable. It adds the next complete unit while the counter remains within the budget. If a unit does not fit, the segmenter recursively tries the next weaker boundary. The final fallback uses a monotonic binary search over character offsets, then backs up to a Unicode-safe whitespace boundary when possible. Every emitted segment is recounted and must be within budget.
+Packing is greedy and stable. It adds the next complete unit while the counter remains within the budget. If a unit does not fit, the segmenter recursively tries the next weaker boundary. The final fallback searches character offsets, then backs up to a Unicode-safe whitespace boundary when possible. Every emitted segment is recounted and must be within budget.
+
+### Non-monotonic counters
+
+A byte-pair encoder is not monotonic in text length: appending a character can *reduce* the token count, because it can change how the surrounding run merges. With `cl100k_base`, a 12-token budget over a long run of `a` characters is exceeded at 93 characters and satisfied again at 96. The instability is not bounded by the longest single token either, so no window makes a coarse search exact.
+
+Two rules follow, and the implementation depends on both:
+
+1. **Verify, never infer.** Every boundary a search returns is recounted against the budget before use, and so is any boundary later snapped to a structural or unit edge. A slice that fits is not evidence that a shorter slice of it fits.
+2. **Under-packing is acceptable; over-packing is not.** A search returns a boundary that provably fits, not necessarily the largest one that would have. Segments may come in slightly under budget.
+
+Counters that *are* monotonic — including the conservative UTF-8 estimator — can be searched with a plain binary search. Counters that are not must supply their own boundary searches, `fitting_prefix` and `fitting_suffix`, since only the counter knows its tokenizer; segmentation refuses a non-monotonic counter that supplies neither rather than guessing. Deriving anything from a tokenizer's vocabulary must use its public interface and tolerate reserved identifiers that have no byte mapping, which real encodings contain.
 
 The algorithm never drops source text. Separators remain attached to one adjacent core range, so concatenating core slices in order reconstructs the canonical document except for outer whitespace removed by ingestion.
 
 ## Overlap
 
-Overlap is configured in tokens and defaults to zero. When enabled, each segment after the first expands its context start backward from its core start up to the overlap budget. Expansion prefers sentence and paragraph boundaries and falls back to a token-safe character boundary.
+Overlap is configured in tokens and defaults to zero. When enabled, each segment after the first expands its context start backward from its core start up to the overlap budget, and each segment before the last expands its context end forward the same way. Expansion prefers sentence and paragraph boundaries and falls back to a token-safe character boundary. Neither direction reaches past the immediately adjacent core, so overlap never pulls in text from two segments away.
+
+Leading context is resolved first, and trailing context receives only the room left over, so look-back continuity wins when a core leaves too little for both.
 
 The combined context must still fit the segment budget. If the core alone consumes the budget, overlap is reduced to zero. Metadata records the resulting overlap rather than only the requested value.
 
