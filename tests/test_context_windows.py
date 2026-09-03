@@ -24,13 +24,17 @@ def test_resolves_a_known_model_family_by_prefix() -> None:
 
 
 def test_prefers_the_longest_matching_prefix() -> None:
-    """A more specific family must win over a shorter one that also matches."""
-    windows = {
-        resolve_context_window(provider="openai", model=name).tokens
-        for name in ("gpt-4-turbo", "gpt-4")
-    }
+    """A more specific family must win over a shorter one that also matches.
 
-    assert len(windows) == 2
+    `o1-mini` matches both `o1` and `o1-mini`, and the two carry different
+    windows - which is what makes the longest-prefix rule observable rather
+    than incidental.
+    """
+    broad = resolve_context_window(provider="openai", model="o1-preview")
+    specific = resolve_context_window(provider="openai", model="o1-mini-2024")
+
+    assert broad.tokens == 200_000
+    assert specific.tokens == 128_000
 
 
 def test_an_explicit_window_overrides_the_table() -> None:
@@ -71,7 +75,9 @@ def test_an_explicit_window_rescues_an_unknown_model() -> None:
 
 def test_rejects_a_non_positive_explicit_window() -> None:
     for value in (0, -1):
-        with pytest.raises(ValueError, match="positive"):
+        # Matched on the resolver's own wording, so it cannot be satisfied by
+        # ContextWindow's near-identical message from a layer further in.
+        with pytest.raises(ValueError, match="^context window must be positive$"):
             resolve_context_window(
                 provider="openai", model="gpt-4o-mini", explicit=value
             )

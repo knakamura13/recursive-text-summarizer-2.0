@@ -135,7 +135,7 @@ The command line does not consume leaf records yet.
 usable input = context window − prompt and schema overhead − reserved output − safety margin
 ```
 
-Every term is measured or configured, not guessed. Overhead is measured by building a real request and counting it, because a hard-coded figure would rot the moment the prompt or the record changed — it is 794 tokens for `gpt-4o-mini`, of which the schema alone is 521, and it rises to 918 when overlap is configured. The safety margin is the larger of a fixed floor and a fraction of the window, so a small window keeps a usable floor while a very large one is not charged thousands of tokens for nothing.
+Every term is measured or configured, not guessed. Overhead is measured by building a real request and counting it, because a hard-coded figure would rot the moment the prompt or the record changed — it is 798 tokens for `gpt-4o-mini`, of which the schema alone is 521, and it rises to 918 when overlap is configured. The safety margin is the larger of a fixed floor and a fraction of the window, so a small window keeps a usable floor while a very large one is not charged thousands of tokens for nothing.
 
 A configuration that leaves no usable capacity raises an error naming every term, rather than returning a meaningless number. That case is reachable rather than theoretical: the conservative estimator charges roughly four times a real tokenizer on this project's own prompt text, which exhausts a small window on its own.
 

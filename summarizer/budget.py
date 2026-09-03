@@ -32,6 +32,9 @@ _MODEL_PREFIX_CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-4.1": 1_047_576,
     "gpt-5": 400_000,
     "o1": 200_000,
+    # Nested under "o1" with a different window, which is what makes the
+    # longest-prefix rule observable rather than incidental.
+    "o1-mini": 128_000,
     "o3": 200_000,
     "o4": 200_000,
 }
@@ -124,6 +127,8 @@ def measure_overhead(
     a provider's tokenizer sees; an indented form would overstate it by about
     two thirds. Approximating downward is why a safety margin exists.
     """
+    # The probe uses a region framing, which is the longer of the two by three
+    # tokens, so the measurement covers a whole-document request as well.
     probe = _overhead_probe_segment(with_overlap=with_overlap)
     request = build_leaf_request(probe, model="probe", timeout_seconds=1)
 
@@ -258,6 +263,9 @@ def select_strategy(
     window = resolve_context_window(
         provider=provider, model=model, explicit=config.context_window
     )
+    # A direct request carries no overlap. A stage that sends overlap-carrying
+    # requests must measure its own overhead: the overlap variant is about 120
+    # tokens larger, and sizing against this figure would under-reserve.
     overhead = measure_overhead(counter, with_overlap=False)
     margin = safety_margin(window.tokens, config)
     capacity = usable_input_capacity(
@@ -270,6 +278,15 @@ def select_strategy(
         config.max_direct_tokens is not None
         and document_tokens > config.max_direct_tokens
     )
+
+    if config.strategy == "direct" and window.assumed:
+        raise BudgetError(
+            f"direct summarization was requested but the context window for "
+            f"model {model!r} is not known, so a fit cannot be established; "
+            f"pass an explicit context window to proceed. This matters most "
+            f"on a provider that truncates an oversized prompt silently "
+            f"rather than rejecting it."
+        )
 
     if config.strategy == "direct" and not fits:
         raise BudgetError(

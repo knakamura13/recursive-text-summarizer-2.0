@@ -16,13 +16,13 @@ The boundaries against neighbouring issues are narrow and worth stating, because
 
 The design is driven by measurements against the pinned dependencies rather than estimates, because two of them are counter-intuitive.
 
-**The schema dominates the fixed overhead.** `leaf_summary_schema()` is sent on every request. Serialized compactly and counted with `o200k_base` it is **521 tokens**, against **253** for the instructions and **27** for the fencing — so the schema is 65% of an 801-token fixed cost. Of those 521, **113 are pydantic docstrings** rendered into JSON Schema `description` keys and 84 are auto-generated `title` keys, so 38% of the dominant term is documentation shipped to the model on every call.
+**The schema dominates the fixed overhead.** `leaf_summary_schema()` is sent on every request. Serialized compactly and counted with `o200k_base` it is **521 tokens**, against **251** for the instructions and **26** for the fencing — so the schema is 65% of a 798-token fixed cost. The compact serialization is itself optimistic: the OpenAI SDK's default `json.dumps` of the same object is 648 tokens, so the real wire cost is roughly 127 tokens higher than measured, which the safety margin absorbs. Of those 521, **113 are pydantic docstrings** rendered into JSON Schema `description` keys and 84 are auto-generated `title` keys, so 38% of the dominant term is documentation shipped to the model on every call.
 
-**Overhead is not one constant.** When a segment carries overlap, the prompt gains a second instruction block and two more fences: overhead rises to roughly **930 tokens**. A calculator that assumes 801 under-reserves by ~130 tokens whenever overlap is configured.
+**Overhead is not one constant.** When a segment carries overlap, the prompt gains a second instruction block and two more fences: overhead rises to **918 tokens**. A calculator that assumes 798 under-reserves by 120 tokens per request whenever overlap is configured — which is a trap for issue #7, since `select_strategy` deliberately measures the no-overlap figure that a direct request actually incurs.
 
 **The conservative counter makes small windows unusable.** `ConservativeUtf8TokenCounter` — what `resolve_token_counter` returns for every Ollama tag — costs **4.2×** on the schema and **4.8×** on the instructions relative to a real tokenizer, because it charges one token per UTF-8 byte. At a 4,096-token window with a 1,024-token output reserve, usable input capacity computes to **−674**. Non-positive capacity is reachable on default local configuration and must therefore be a named error, not an arithmetic underflow.
 
-**Direct is the common case, not the exotic one.** At a 128,000-token window the usable input capacity is 119,775 tokens, which is roughly 514 KB of prose. The entire 30-file corpus in this repository is 84,948 tokens and fits in a single request; `input.txt` is 307 tokens. On the project's own defaults, a window-only `auto` selects `direct` for every input this repository has ever handled, and the hierarchy #7 builds would be unreachable without configuration. That is a product consequence, not a bug, and it is addressed under strategy selection below.
+**Direct is the common case, not the exotic one.** At a 128,000-token window the usable input capacity is 123,618 tokens, which is roughly 514 KB of prose. The entire 30-file corpus in this repository is 84,948 tokens and fits in a single request; `input.txt` is 307 tokens. On the project's own defaults, a window-only `auto` selects `direct` for every input this repository has ever handled, and the hierarchy #7 builds would be unreachable without configuration. That is a product consequence, not a bug, and it is addressed under strategy selection below.
 
 **The two providers fail differently, and one of them does not fail at all.** OpenAI's Responses API defaults `truncation` to `disabled`, so oversized input is a 400 that the adapter already maps to `ProviderRequestError`. Ollama silently truncates: a ~1,700-token prompt sent with `num_ctx=512` returned `prompt_eval_count=258` and `done_reason="length"` with **no error and plausible-looking output**. On the local path, budget arithmetic is the only defence against a confidently ungrounded summary, because the response status does not reveal the loss.
 
@@ -49,7 +49,8 @@ This is the selected approach. It reuses the request construction, the tolerant 
 It requires two small, honest additions rather than workarounds:
 
 - **`BoundaryKind.DOCUMENT`.** The existing kinds all describe a boundary *within* a document. A unit that is the entire document has no such boundary, and forcing `HARD` or `PARAGRAPH` would misreport provenance. Naming the case is cheaper than lying about it.
-- **A prompt that does not claim to be a fragment.** The leaf instructions open "You extract structured information from one region of a longer document." For a direct run there is no longer document, and telling a model it is reading a fragment invites it to hedge about missing context — the opposite of the cohesive result the acceptance criteria ask for. The framing sentence is therefore selected by whether the unit is the whole document, and `LEAF_PROMPT_VERSION` is bumped because output can change for identical input.
+- **A distinct identifier, `D000001`.** Segmentation numbers its segments `S000001` upward, so reusing that would give a direct run and a hierarchical run the same identifier for different extents. Provenance is a bare tuple of identifiers carrying no boundary kind, so the two meanings would be unrecoverable exactly where issues #8 and #9 need to trace a root back to source.
+- **A prompt that does not claim to be a fragment.** The leaf instructions describe their input as "one region of a longer document", and five further rules call it "the region". For a direct run there is no longer document, and telling a model it holds a fragment invites it to hedge about missing context — the opposite of the cohesive result the acceptance criteria ask for. The noun is therefore substituted throughout the instructions rather than in the opening sentence alone; changing only the opening would leave the rules contradicting it, which an earlier revision of this branch did. `LEAF_PROMPT_VERSION` is bumped because output can change for identical input.
 
 ## Budget arithmetic
 
@@ -131,23 +132,23 @@ This issue delivers the budget calculator, the context table, strategy selection
 2. **`LEAF_PROMPT_VERSION` is bumped** because the framing sentence now varies. Nothing caches on it yet, so this is free today and would not be later.
 3. **Overhead is measured at runtime** and pinned by a test, rather than hard-coded.
 4. **The safety margin is `max(fixed, fraction × window)`**, defaulting to 256 tokens and 2%.
-5. **An unknown model routes `auto` to hierarchical** instead of failing or guessing that a default window is knowledge.
+5. **An unknown model routes `auto` to hierarchical** instead of failing or guessing that a default window is knowledge, and explicit `direct` against an unknown window is refused outright rather than checked against the guess. That combination is the dangerous one: the local provider truncates silently, so a fit established against an assumed window yields a confidently ungrounded summary.
 6. **The direct cap defaults to unset**, so behaviour matches the acceptance criterion while leaving the quality question configurable.
 7. **Budget settings live in `StrategyConfig`**, not `AppConfig`, to avoid the positional-construction hazard.
 8. **The output reserve is accounted for but not enforced.** Enforcing it means adding an output cap to `GenerationRequest` and mapping it in both adapters, which re-opens the provider contract for a criterion that only requires the reservation be *accounted* for.
 
 ## Measured on completion
 
-The implementation's own numbers, for comparison against the estimates above:
+The implementation's own numbers, for comparison against the estimates above. Note that `measure_overhead` reads `LEAF_PROMPT_VERSION` through the fence digest, so bumping that string moves the budget by a few tokens — an earlier draft of this table was measured against `leaf-prompt/1` and reported 794 and 123,622.
 
 | counter | overlap | instructions | schema | fencing | total |
 |---|---|---|---|---|---|
-| `tiktoken:o200k_base` | no | 249 | 521 | 24 | **794** |
+| `tiktoken:o200k_base` | no | 251 | 521 | 26 | **798** |
 | `tiktoken:o200k_base` | yes | 343 | 521 | 54 | **918** |
 | `estimate:utf8-bytes` | no | 1,216 | 2,196 | 64 | **3,476** |
 | `estimate:utf8-bytes` | yes | 1,631 | 2,196 | 138 | **3,965** |
 
-Usable input capacity for `gpt-4o-mini` on defaults is **123,622 tokens**. The estimator's 3,476-token overhead exceeds a 2,048-token window on its own, which is what makes the underflow error load-bearing rather than defensive.
+Usable input capacity for `gpt-4o-mini` on defaults is **123,618 tokens**. The estimator's 3,476-token overhead exceeds a 2,048-token window on its own, which is what makes the underflow error load-bearing rather than defensive.
 
 ## Open decisions
 

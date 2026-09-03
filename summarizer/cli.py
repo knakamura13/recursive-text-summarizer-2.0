@@ -112,8 +112,8 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "refuse direct above this document size even when it fits, to "
-            "force hierarchical execution"
+            "with --strategy auto, refuse direct above this document size "
+            "even when it fits, to force hierarchical execution"
         ),
     )
     return parser

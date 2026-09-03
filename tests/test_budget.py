@@ -77,9 +77,14 @@ def test_overhead_with_a_real_encoding_matches_the_measured_scale() -> None:
         TiktokenCounter.for_model("gpt-4o-mini"), with_overlap=False
     )
 
-    # Measured at 801 tokens when this was written; the schema dominates.
-    assert 600 < overhead.total < 1_100
-    assert overhead.schema > overhead.instructions
+    # Pinned exactly rather than banded: a band this wide would not notice the
+    # prompt or the record changing, which is the thing worth noticing.
+    assert (overhead.instructions, overhead.schema, overhead.fencing) == (
+        251,
+        521,
+        26,
+    )
+    assert overhead.total == 798
 
 
 def test_safety_margin_takes_the_larger_term() -> None:
@@ -124,8 +129,48 @@ def test_non_positive_capacity_reports_every_term() -> None:
         )
 
     message = str(error.value)
-    for term in ("1024", "overhead", "output", "margin"):
-        assert term in message
+    # Each term's own value, not just its label: "1024" alone would match the
+    # window as well as the reserve.
+    assert f"overhead of {overhead.total}" in message
+    assert f"instructions {overhead.instructions}" in message
+    assert f"schema {overhead.schema}" in message
+    assert "reserved output of 1024" in message
+    # The fixed floor dominates at this window: max(256, 0.05 * 1024) == 256.
+    assert "safety margin of 256" in message
+
+
+def test_capacity_of_exactly_zero_is_refused() -> None:
+    """The boundary itself, not merely a deeply negative case."""
+    config = StrategyConfig(
+        max_output_tokens=1, safety_margin_tokens=0, safety_margin_fraction=0
+    )
+    overhead = measure_overhead(CharacterCounter(), with_overlap=False)
+
+    with pytest.raises(BudgetError, match="leaves 0"):
+        usable_input_capacity(
+            window=ContextWindow(tokens=overhead.total + 1, assumed=False),
+            overhead=overhead,
+            config=config,
+        )
+
+
+def test_fencing_excludes_the_probe_text_it_measured_with() -> None:
+    """The fencing term is defined by that subtraction, so pin it.
+
+    Without this, dropping the subtraction leaves every assertion satisfied
+    while the fencing figure silently absorbs the probe's own text.
+    """
+    counter = CharacterCounter()
+    overhead = measure_overhead(counter, with_overlap=False)
+
+    from summarizer.budget import _overhead_probe_segment
+    from summarizer.leaf import build_leaf_request
+
+    probe = _overhead_probe_segment(with_overlap=False)
+    request = build_leaf_request(probe, model="probe", timeout_seconds=1)
+
+    assert overhead.fencing == len(request.input_text) - len(probe.text)
+    assert "probe" not in str(overhead.fencing)
 
 
 def test_capacity_is_deterministic() -> None:

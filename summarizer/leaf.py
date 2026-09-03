@@ -21,38 +21,38 @@ LEAF_PROMPT_VERSION = "leaf-prompt/2"
 
 LEAF_SCHEMA_NAME = "leaf_summary"
 
-_REGION_FRAMING = (
-    "You extract structured information from one region of a longer document."
-)
-
 # A direct run holds everything there is. Telling a model it is reading a
 # fragment invites it to hedge about context it supposedly lacks, which is the
 # opposite of the cohesive result a whole-document summary is meant to give.
-_DOCUMENT_FRAMING = (
-    "You extract structured information from an entire document."
-)
+# The noun is therefore substituted throughout the instructions rather than in
+# the opening sentence alone: changing the framing while the rules still say
+# "region" five more times would not deliver the property.
+_REGION_FRAMING = "one region of a longer document"
+_DOCUMENT_FRAMING = "an entire document"
+_REGION_NOUN = "region"
+_DOCUMENT_NOUN = "document"
 
 _BASE_INSTRUCTIONS = """\
-{framing}
+You extract structured information from {framing}.
 
 Return one JSON object conforming to the supplied schema, and nothing else. Do \
 not write commentary before or after it.
 
 Follow these rules:
 
-- Summarize only what the region states. Do not add outside knowledge and do \
+- Summarize only what the {noun} states. Do not add outside knowledge and do \
 not infer beyond it.
 - Record each substantive point as a content unit, together with the evidence \
 supporting it.
 - Cite evidence with the identifier {segment_id} and no other value. It is the \
 only identifier valid for this request.
-- Copy a quotation character for character from the region. Leave quotations \
+- Copy a quotation character for character from the {noun}. Leave quotations \
 empty rather than paraphrasing into them.
 - Record qualifications, and mark a content unit uncertain, wherever the \
-region hedges. Leave contradictions empty when the region states none.
+{noun} hedges. Leave contradictions empty when the {noun} states none.
 - Use a level of 0.
 
-The region is delimited by these markers:
+The {noun} is delimited by these markers:
 
   begin: {begin}
   end: {end}
@@ -130,13 +130,10 @@ def build_leaf_request(
     begin = _fence(segment, "BEGIN")
     end = _fence(segment, "END")
 
-    framing = (
-        _DOCUMENT_FRAMING
-        if segment.boundary_kind is BoundaryKind.DOCUMENT
-        else _REGION_FRAMING
-    )
+    whole_document = segment.boundary_kind is BoundaryKind.DOCUMENT
     instructions = _BASE_INSTRUCTIONS.format(
-        framing=framing,
+        framing=_DOCUMENT_FRAMING if whole_document else _REGION_FRAMING,
+        noun=_DOCUMENT_NOUN if whole_document else _REGION_NOUN,
         segment_id=segment.segment_id,
         begin=begin,
         end=end,

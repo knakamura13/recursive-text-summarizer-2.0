@@ -7,10 +7,13 @@ from summarizer.segmentation import BoundaryKind, SourceSegment
 from summarizer.summaries import SummaryNode
 from summarizer.tokenization import TokenCounter
 
-# The identifier a whole-document summary cites. It matches the first segment
-# identifier segmentation would assign, so a later stage reading provenance
-# does not need to know which path produced the record.
-DOCUMENT_SEGMENT_ID = "S000001"
+# Deliberately distinct from segmentation's identifiers, which are
+# f"S{order+1:06d}". Reusing "S000001" would collide with the first segment of
+# a hierarchical run while covering a different extent, and provenance is a
+# bare tuple of identifiers with no boundary kind attached - so the two
+# meanings would be unrecoverable downstream, exactly where later stages need
+# to trace a root back to source.
+DOCUMENT_SEGMENT_ID = "D000001"
 
 
 def whole_document_segment(

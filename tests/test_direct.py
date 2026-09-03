@@ -3,7 +3,11 @@ from dataclasses import dataclass
 
 import pytest
 
-from summarizer.direct import summarize_direct, whole_document_segment
+from summarizer.direct import (
+    DOCUMENT_SEGMENT_ID,
+    summarize_direct,
+    whole_document_segment,
+)
 from summarizer.ingestion import ingest_text
 from summarizer.leaf import LeafSummaryError, build_leaf_request
 from summarizer.providers.base import (
@@ -38,7 +42,7 @@ def payload(**overrides: object) -> str:
         "qualifications": [],
         "contradictions": [],
         "quotations": [],
-        "provenance": ["S000001"],
+        "provenance": [DOCUMENT_SEGMENT_ID],
         "level": 0,
     }
     body.update(overrides)
@@ -65,7 +69,7 @@ def test_whole_document_segment_spans_the_canonical_text() -> None:
     assert (segment.context_start, segment.context_end) == (0, len(document.text))
     assert segment.leading_overlap_tokens == 0
     assert segment.trailing_overlap_tokens == 0
-    assert segment.segment_id == "S000001"
+    assert segment.segment_id == DOCUMENT_SEGMENT_ID
     assert segment.source_id == document.source_id
 
 
@@ -92,8 +96,10 @@ def test_the_prompt_does_not_describe_a_whole_document_as_a_fragment() -> None:
         timeout_seconds=30,
     )
 
-    assert "one region of a longer document" not in whole.instructions
-    assert "entire document" in whole.instructions
+    # Assert the property, not just the sentence that was edited: the rules
+    # below the framing must not keep calling the input a region either.
+    assert "region" not in whole.instructions
+    assert "an entire document" in whole.instructions
 
 
 def test_a_leaf_request_still_describes_a_region() -> None:
@@ -105,6 +111,7 @@ def test_a_leaf_request_still_describes_a_region() -> None:
     leaf = build_leaf_request(segments[0], model="m", timeout_seconds=30)
 
     assert "one region of a longer document" in leaf.instructions
+    assert "the region states" in leaf.instructions
 
 
 def test_summarizes_a_whole_document_in_one_call() -> None:
@@ -116,7 +123,7 @@ def test_summarizes_a_whole_document_in_one_call() -> None:
     )
 
     assert node.level == 0
-    assert node.provenance == ("S000001",)
+    assert node.provenance == (DOCUMENT_SEGMENT_ID,)
     assert len(provider.requests) == 1
     assert document.text in provider.requests[0].input_text
 
@@ -127,7 +134,7 @@ def test_a_quotation_from_anywhere_in_the_document_validates() -> None:
     provider = RecordingProvider(
         payload(
             quotations=[
-                {"segment_id": "S000001", "quote": "Staffing was unchanged."}
+                {"segment_id": DOCUMENT_SEGMENT_ID, "quote": "Staffing was unchanged."}
             ]
         )
     )
@@ -142,7 +149,7 @@ def test_a_quotation_from_anywhere_in_the_document_validates() -> None:
 def test_rejects_a_fabricated_quotation() -> None:
     provider = RecordingProvider(
         payload(
-            quotations=[{"segment_id": "S000001", "quote": "the archive burned"}]
+            quotations=[{"segment_id": DOCUMENT_SEGMENT_ID, "quote": "the archive burned"}]
         )
     )
 
@@ -159,7 +166,7 @@ def test_rejects_a_fabricated_quotation() -> None:
 def test_malformed_output_fails_naming_the_document_identifier() -> None:
     provider = RecordingProvider("I would rather not.")
 
-    with pytest.raises(LeafSummaryError, match="S000001"):
+    with pytest.raises(LeafSummaryError, match=DOCUMENT_SEGMENT_ID):
         summarize_direct(
             ingest_text(DOCUMENT),
             provider,
@@ -197,3 +204,32 @@ def test_direct_requests_are_deterministic() -> None:
 
     assert node_one == node_two
     assert first.requests == second.requests
+
+
+def test_document_segment_records_its_measured_token_counts() -> None:
+    document = ingest_text(DOCUMENT)
+
+    segment = whole_document_segment(document, CharacterCounter())
+
+    assert segment.core_token_count == len(document.text)
+    assert segment.token_count == len(document.text)
+
+
+def test_explicit_direct_refuses_an_assumed_context_window() -> None:
+    """A guessed window cannot establish a fit.
+
+    This is the dangerous combination rather than a pedantic one: the local
+    provider truncates an oversized prompt silently instead of rejecting it,
+    so a fit checked against a guess yields a confidently ungrounded summary.
+    """
+    from summarizer.budget import BudgetError, select_strategy
+    from summarizer.config import StrategyConfig
+
+    with pytest.raises(BudgetError, match="not known"):
+        select_strategy(
+            ingest_text(DOCUMENT),
+            CharacterCounter(),
+            provider="ollama",
+            model="qwen3.8",
+            config=StrategyConfig(strategy="direct", context_window=None),
+        )
