@@ -27,6 +27,12 @@ def test_help_lists_every_documented_flag() -> None:
         "--chunk-size",
         "--max-chunks",
         "--dry-run",
+        "--strategy",
+        "--context-window",
+        "--max-output-tokens",
+        "--safety-margin-tokens",
+        "--safety-margin-fraction",
+        "--max-direct-tokens",
     ):
         assert flag in result.stdout
 
