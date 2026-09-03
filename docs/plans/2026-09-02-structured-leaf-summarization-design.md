@@ -56,7 +56,9 @@ A leaf's legal reference set is computed by the caller from the segments it was 
 
 Evidence is restricted to the leaf's own `segment_id`. Issue #4's design states that later stages should attribute evidence to core ranges and treat overlap as context only, so text that arrives through a segment's overlap is available as context but is not attributable. The prompt says so explicitly.
 
-Quotations are stored verbatim and located in the segment text by matching, not by character offsets supplied by the model — a model asked to count characters will get it wrong, whereas a quote it copied can be checked. Offsets, when wanted, are derived by the validator from that match.
+Quotations are stored verbatim and located by matching, not by character offsets supplied by the model — a model asked to count characters will get it wrong, whereas a quote it copied can be checked. The match runs against the segment's **core** range rather than its context range: a segment's text spans its whole context, so matching against that would let a leaf claim a neighbouring segment's core through the overlap window and produce two attributions for one sentence. No offsets are stored; a later stage that wants them can recover them from the core range and the quotation.
+
+A leaf must also record provenance for itself. Checking only that no *unknown* identifier appears would let a leaf with no references at all pass, satisfying the requirement for resolvable evidence vacuously.
 
 ### A conflict to resolve first
 

@@ -219,3 +219,18 @@ def test_stage_handles_every_genre_in_the_corpus(name: str) -> None:
     assert all(
         "not attributable" in request.instructions for request in overlapping
     )
+
+
+def test_preserves_source_order_for_unordered_input() -> None:
+    """Order comes from the segment's own `order`, not from arrival sequence."""
+    all_segments = segments()
+    shuffled = tuple(reversed(all_segments))
+    provider = RecordingProvider()
+
+    nodes = summarize_segments(
+        shuffled, provider, model="m", timeout_seconds=30
+    )
+
+    assert [node.provenance[0] for node in nodes] == [
+        segment.segment_id for segment in all_segments
+    ]

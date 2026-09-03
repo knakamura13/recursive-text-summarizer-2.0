@@ -116,9 +116,22 @@ def test_overlap_is_described_as_context_only() -> None:
     )
 
     assert "not attributable" in with_overlap.instructions
-    # The core has to be locatable inside the surrounding context, or the
-    # instruction to summarize only the core is unactionable.
-    assert "The archive moved" in with_overlap.input_text
+
+    # Both core boundaries must land exactly, or the model is told to
+    # summarize a region that is off by a character at one end.
+    source = segment(
+        "Earlier text. The archive moved. Later text.",
+        leading=4,
+        core_offset=14,
+        core_length=18,
+    )
+    body = with_overlap.input_text
+    core_begin = next(
+        line for line in body.splitlines() if "CORE-BEGIN" in line
+    )
+    core_end = next(line for line in body.splitlines() if "CORE-END" in line)
+    marked = body.split(core_begin)[1].split(core_end)[0]
+    assert marked.strip("\n") == source.text[14:32]
 
     without_overlap = build_leaf_request(
         segment(), model="m", timeout_seconds=30

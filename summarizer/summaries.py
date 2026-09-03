@@ -64,6 +64,19 @@ class EvidenceItem(_Record):
 
     _reject_blank_segment_id = field_validator("segment_id")(_reject_blank)
 
+    @field_validator("quote")
+    @classmethod
+    def _reject_blank_quote(cls, value: str | None) -> str | None:
+        """Absent means null, not empty.
+
+        A blank quote would otherwise pass a verbatim check trivially, since
+        every string contains the empty string, and code reading `quote is not
+        None` as "has a quotation" would get nothing.
+        """
+        if value is not None and not value.strip():
+            raise ValueError("quote must be null rather than blank")
+        return value
+
 
 class ContentUnit(_Record):
     """One assertion carried forward for later merging."""
