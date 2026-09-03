@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from pydantic import ValidationError
 
@@ -271,52 +271,65 @@ def parse_leaf_summary(text: str, *, segment: SourceSegment) -> SummaryNode:
             f"{segment.segment_id}: response failed validation ({_describe(error)})"
         ) from error
 
-    _validate_provenance(node, segment=segment)
+    validate_provenance(
+        node,
+        legal={segment.segment_id: core_text(segment)},
+        subject=segment.segment_id,
+    )
     return node
 
 
-def _validate_provenance(node: SummaryNode, *, segment: SourceSegment) -> None:
-    """Check every reference against the identifier the caller supplied.
+def validate_provenance(
+    node: SummaryNode,
+    *,
+    legal: Mapping[str, str],
+    subject: str,
+) -> None:
+    """Check every reference against the identifiers the caller supplied.
 
-    The legal set never comes from the payload, which is what makes a citation
-    injected through the source a validation failure rather than a dangling
-    reference carried into the hierarchy. Overlap text is context and is not
-    attributable, so a leaf may only cite itself.
+    `legal` maps each citable identifier to the text a quotation from it may
+    be drawn from. The mapping never comes from the payload, which is what
+    makes a citation injected through the source - or laundered through a
+    child summary - a validation failure rather than a dangling reference
+    carried up the hierarchy.
+
+    A quotation is checked against the text of the segment it cites, never
+    against a concatenation of all of them: a concatenation would let a quote
+    straddle two segments, or be attributed to a neighbour that did not
+    contain it.
     """
-    legal = {segment.segment_id}
-
     referenced = set(node.provenance)
     for unit in node.content_units:
         referenced.update(item.segment_id for item in unit.evidence)
     referenced.update(item.segment_id for item in node.quotations)
 
-    unknown = sorted(referenced - legal)
+    unknown = sorted(referenced - set(legal))
     if unknown:
         raise LeafSummaryError(
-            f"{segment.segment_id}: response cited unknown segments "
+            f"{subject}: response cited unknown segments "
             f"{', '.join(_sanitize(value) for value in unknown)}"
         )
 
-    if segment.segment_id not in node.provenance:
+    if not node.provenance:
         raise LeafSummaryError(
-            f"{segment.segment_id}: response recorded no provenance for the segment"
+            f"{subject}: response recorded no provenance"
         )
 
-    # Quotations are checked against the core alone. A segment's text spans its
-    # whole context range, so matching against that would attribute a
-    # neighbouring segment's core to this leaf through the overlap window.
-    attributable = core_text(segment)
-    quotes = [item.quote for item in node.quotations if item.quote is not None]
-    quotes.extend(
-        item.quote
+    cited_quotes = [
+        (item.segment_id, item.quote)
+        for item in node.quotations
+        if item.quote is not None
+    ]
+    cited_quotes.extend(
+        (item.segment_id, item.quote)
         for unit in node.content_units
         for item in unit.evidence
         if item.quote is not None
     )
-    for quote in quotes:
-        if quote not in attributable:
+    for segment_id, quote in cited_quotes:
+        if quote not in legal[segment_id]:
             raise LeafSummaryError(
-                f"{segment.segment_id}: a quotation does not occur in the segment"
+                f"{subject}: a quotation does not occur in the segment it cites"
             )
 
 
