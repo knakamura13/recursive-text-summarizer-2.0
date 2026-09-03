@@ -4,7 +4,10 @@ This project is being rebuilt as a generalized, source-grounded hierarchical sum
 
 Canonical ingestion, token-aware segmentation, structured leaf summarization, token-budget arithmetic, whole-document direct summarization, and multi-level hierarchical merging are now available as library components in `summarizer.ingestion`, `summarizer.tokenization`, `summarizer.segmentation`, `summarizer.summaries`, `summarizer.leaf`, `summarizer.budget`, `summarizer.direct`, `summarizer.merge`, and `summarizer.hierarchy`. The command-line workflow still runs the legacy flat, sentence-chunked path and does not consume them yet.
 
-Source grounding across merge levels, final editorial synthesis, claim verification, concurrency, and quality evaluation are not implemented yet.
+Source grounding across merge levels and the library-level final editorial,
+citation, and audit stages are available. Claim verification, concurrency,
+quality evaluation, and command-line integration of the new pipeline remain
+future work.
 
 ## Requirements
 
@@ -166,6 +169,27 @@ The merge prompt requires deduplication that keeps every supporting reference, p
 Legal identifiers are not enumerated in the prompt. At the second level a legal set can run to thousands of identifiers and would spend a third of the request on a list, so the prompt refers to the authoritative source passages it received and the validator enforces the real set.
 
 Three merge levels are not reachable from document size alone at a hosted model's capacity — it would take roughly twenty million source tokens — so multi-level behaviour is exercised by configuring a narrower ceiling on children per merge. That ceiling is unset by default, leaving measurement in charge.
+
+## Final editorial output and audit artifacts
+
+`summarizer.pipeline` is the library-level path from a canonical document to a
+direct or grounded hierarchical root and then one dedicated final editorial
+call. The editor consumes the root's structured record, preserves material
+qualifications and contradictions, and returns readable plain text by default.
+It deliberately is not connected to the legacy command line yet; that remains
+the later end-to-end integration work.
+
+Callers may opt into a compact source list. Those citations are not generated
+by the final writer: they are a deterministic, source-ordered rendering of the
+root's already validated provenance, and each identifier resolves to recorded
+segment metadata. The default output has neither citations nor audit data.
+
+An optional `audit/1` artifact records safe run configuration, strategy,
+source-segment metadata, tree/evidence links, warnings or failures, available
+usage metadata, and citation mappings. It does not copy raw source text,
+generated prose, quotations, provider request IDs, or provider authentication
+data. Values matching common credential forms are redacted; JSON is canonical,
+validated after serialization, and atomically written only after validation.
 
 Historical scripts under `omscs-ml-lectures/` remain available but are not part of the modern application entry point.
 
