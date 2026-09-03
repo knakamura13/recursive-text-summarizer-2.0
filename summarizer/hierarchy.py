@@ -4,15 +4,17 @@ from dataclasses import dataclass, field
 from collections.abc import Mapping, Sequence
 
 from summarizer.budget import BudgetError
-from summarizer.merge import build_merge_request, parse_merged_summary, serialize_child
+from summarizer.merge import (
+    build_merge_request,
+    child_fence_tokens,
+    measure_merge_overhead,
+    parse_merged_summary,
+    serialize_child,
+)
 from summarizer.providers.base import ModelProvider
 from summarizer.summaries import SummaryNode
 from summarizer.tokenization import TokenCounter
 
-# Cost of the two markers wrapping each child in a merge request. Measured
-# rather than guessed, and deliberately generous: a 16-hex-character digest
-# tokenizes poorly, so a marker pair runs to roughly this much.
-_CHILD_FENCE_TOKENS = 48
 
 
 class HierarchyError(ValueError):
@@ -68,8 +70,8 @@ class HierarchyReport:
 
 
 def measure_child_tokens(node: SummaryNode, counter: TokenCounter) -> int:
-    """Measure what one child costs inside a merge request."""
-    return counter.count(serialize_child(node)) + _CHILD_FENCE_TOKENS
+    """Measure what one child costs inside a merge request, delimiters included."""
+    return counter.count(serialize_child(node)) + child_fence_tokens(counter)
 
 
 def merge_fanout(
@@ -81,31 +83,45 @@ def merge_fanout(
 ) -> tuple[int, str]:
     """Derive how many children fit one merge request, and say why.
 
-    Sized from the largest child rather than the average, so that a group is
-    never assembled that only fits on average. Raises when a single child
-    cannot fit at all, which is reachable on the default local configuration
-    rather than hypothetical.
+    Sized from the largest child rather than the average, so a group is never
+    assembled that only fits on average.
+
+    Raises `BudgetError` when the capacity cannot hold a *pair*, rather than
+    returning two anyway: a merge of one is not a merge, and reporting two
+    would assemble a request of twice the size it was sized against. That is
+    reachable on the default local configuration, and on a provider that
+    truncates an oversized prompt silently it would be undetectable content
+    loss rather than an error.
     """
     if not children:
         raise ValueError("fanout requires at least one child")
 
+    if ceiling is not None and ceiling < 2:
+        raise ValueError("max_merge_children must be at least 2 to make progress")
+
     costs = [measure_child_tokens(child, counter) for child in children]
     largest = max(costs)
-    if largest > capacity:
+    measured = capacity // largest if largest else len(children)
+
+    # A merge level cannot be narrower than a pair, so a capacity that admits
+    # only one child admits no merge at all. Reporting a fanout of 2 here -
+    # which an earlier revision did - assembles a request of twice the size it
+    # was sized against, and on a provider that truncates silently that is
+    # undetectable content loss rather than an error.
+    if measured < 2:
         worst = costs.index(largest)
         raise BudgetError(
-            f"a single summary does not fit a merge request: child {worst} "
-            f"costs {largest} tokens against a capacity of {capacity}, "
-            f"including {_CHILD_FENCE_TOKENS} tokens of delimiters"
+            f"a merge request cannot hold two summaries: child {worst} costs "
+            f"{largest} tokens and a pair costs {2 * largest} against a "
+            f"capacity of {capacity}"
         )
 
-    measured = capacity // largest
     if ceiling is not None and ceiling < measured:
-        return max(ceiling, 2), (
+        return ceiling, (
             f"the configured ceiling of {ceiling} is below the measured "
             f"fanout of {measured}"
         )
-    return max(measured, 2), (
+    return measured, (
         f"a largest child of {largest} tokens fits {measured} times in a "
         f"capacity of {capacity}"
     )
@@ -142,7 +158,7 @@ def build_hierarchy(
     source_id: str,
     covered: Sequence[Sequence[str]],
     attributable: Mapping[str, str],
-    capacity: int,
+    usable_tokens: int,
     model: str,
     timeout_seconds: float,
     max_merge_children: int | None = None,
@@ -152,9 +168,17 @@ def build_hierarchy(
     `covered` gives the segment identifiers each leaf covers, in the same
     order as `leaves`, and `attributable` maps each identifier to the text a
     quotation from it may be drawn from - injected rather than held in module
-    state, so a run carries its own material and nothing leaks between runs. Every level must strictly reduce the node count, which
-    is the only property that makes termination provable rather than hoped
-    for.
+    state, so a run carries its own material and nothing leaks between runs.
+
+    `usable_tokens` is the whole input budget for a request. The merge
+    instructions, schema, and outer delimiters are subtracted here rather than
+    by the caller, because the budget calculator measures a *leaf* request and
+    a caller passing that figure straight through would under-reserve.
+
+    Termination rests on a fanout of at least two, which `merge_fanout`
+    guarantees by refusing a capacity that cannot hold a pair. The node count
+    is additionally asserted to fall at each level, as a defensive invariant
+    rather than the proof.
     """
     if not leaves:
         raise ValueError("a hierarchy requires at least one leaf")
@@ -181,10 +205,18 @@ def build_hierarchy(
 
     while len(current) > 1:
         level += 1
+        overhead = measure_merge_overhead(counter, level=level)
+        child_capacity = usable_tokens - overhead
+        if child_capacity <= 0:
+            raise BudgetError(
+                f"no room for children in a merge request at level {level}: "
+                f"{usable_tokens} usable tokens are consumed by {overhead} "
+                f"tokens of instructions, schema, and delimiters"
+            )
         fanout, reason = merge_fanout(
             [node.summary for node in current],
             counter,
-            capacity=capacity,
+            capacity=child_capacity,
             ceiling=max_merge_children,
         )
         groups = group_children(len(current), fanout)
@@ -201,7 +233,11 @@ def build_hierarchy(
                         node_id=f"L{level}N{order + 1:04d}",
                         level=level,
                         order=order,
-                        summary=only.summary,
+                        # Restamped: the merged path asserts that a node's
+                        # summary reports its own level, and this path is fed
+                        # into the next level's payload, so a stale value
+                        # would show the model children at mixed levels.
+                        summary=only.summary.model_copy(update={"level": level}),
                         children=(only.node_id,),
                         covered_segments=only.covered_segments,
                     )
@@ -260,16 +296,25 @@ def _merge_group(
     timeout_seconds: float,
 ) -> TreeNode:
     node_id = f"L{level}N{order + 1:04d}"
+    # A union in document order: deduplicated, first occurrence wins. Three
+    # documents call this a union, and a caller supplying overlapping coverage
+    # would otherwise store duplicates for issue #8 to narrow.
     covered = tuple(
-        identifier
-        for member in members
-        for identifier in member.covered_segments
+        dict.fromkeys(
+            identifier
+            for member in members
+            for identifier in member.covered_segments
+        )
     )
-    legal = {
-        identifier: attributable.get(identifier, "")
-        for member in members
-        for identifier in member.covered_segments
-    }
+    missing = sorted(
+        identifier for identifier in covered if identifier not in attributable
+    )
+    if missing:
+        raise ValueError(
+            "attributable text is missing for segments "
+            f"{', '.join(missing)}"
+        )
+    legal = {identifier: attributable[identifier] for identifier in covered}
 
     request = build_merge_request(
         [member.summary for member in members],
