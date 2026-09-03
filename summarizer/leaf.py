@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pydantic import ValidationError
 
 from summarizer.providers.base import GenerationRequest, ModelProvider
-from summarizer.segmentation import SourceSegment
+from summarizer.segmentation import BoundaryKind, SourceSegment
 from summarizer.summaries import SummaryNode, leaf_summary_schema
 
 
@@ -17,12 +17,23 @@ class LeafSummaryError(ValueError):
 
 # Identifies the prompt wording for cache keys and audit artifacts. Bump it
 # whenever a change could alter a model's output for identical input.
-LEAF_PROMPT_VERSION = "leaf-prompt/1"
+LEAF_PROMPT_VERSION = "leaf-prompt/2"
 
 LEAF_SCHEMA_NAME = "leaf_summary"
 
+_REGION_FRAMING = (
+    "You extract structured information from one region of a longer document."
+)
+
+# A direct run holds everything there is. Telling a model it is reading a
+# fragment invites it to hedge about context it supposedly lacks, which is the
+# opposite of the cohesive result a whole-document summary is meant to give.
+_DOCUMENT_FRAMING = (
+    "You extract structured information from an entire document."
+)
+
 _BASE_INSTRUCTIONS = """\
-You extract structured information from one region of a longer document.
+{framing}
 
 Return one JSON object conforming to the supplied schema, and nothing else. Do \
 not write commentary before or after it.
@@ -119,7 +130,13 @@ def build_leaf_request(
     begin = _fence(segment, "BEGIN")
     end = _fence(segment, "END")
 
+    framing = (
+        _DOCUMENT_FRAMING
+        if segment.boundary_kind is BoundaryKind.DOCUMENT
+        else _REGION_FRAMING
+    )
     instructions = _BASE_INSTRUCTIONS.format(
+        framing=framing,
         segment_id=segment.segment_id,
         begin=begin,
         end=end,

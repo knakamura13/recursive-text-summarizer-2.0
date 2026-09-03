@@ -23,6 +23,10 @@ class BoundaryKind(str, Enum):
     LIST = "list"
     SENTENCE = "sentence"
     HARD = "hard"
+    # A unit that is the entire document has no boundary *within* a document.
+    # Segmentation never produces this kind; the direct path does, and it tells
+    # a later stage that provenance covers everything rather than a region.
+    DOCUMENT = "document"
 
 
 class SegmentationError(ValueError):

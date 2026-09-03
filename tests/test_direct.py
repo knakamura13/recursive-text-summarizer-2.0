@@ -1,0 +1,199 @@
+import json
+from dataclasses import dataclass
+
+import pytest
+
+from summarizer.direct import summarize_direct, whole_document_segment
+from summarizer.ingestion import ingest_text
+from summarizer.leaf import LeafSummaryError, build_leaf_request
+from summarizer.providers.base import (
+    GenerationRequest,
+    GenerationResult,
+    ProviderConnectionError,
+)
+from summarizer.segmentation import BoundaryKind
+
+DOCUMENT = (
+    "# Archive migration\n\n"
+    "The archive moved in March. The index was rebuilt afterwards.\n\n"
+    "Staffing was unchanged."
+)
+
+
+@dataclass(frozen=True)
+class CharacterCounter:
+    identity: str = "test:characters"
+    exact: bool = True
+    monotonic: bool = True
+
+    def count(self, text: str) -> int:
+        return len(text)
+
+
+def payload(**overrides: object) -> str:
+    body: dict[str, object] = {
+        "summary": "The archive moved and the index was rebuilt.",
+        "content_units": [],
+        "entities": [],
+        "qualifications": [],
+        "contradictions": [],
+        "quotations": [],
+        "provenance": ["S000001"],
+        "level": 0,
+    }
+    body.update(overrides)
+    return json.dumps(body)
+
+
+class RecordingProvider:
+    def __init__(self, text: str | None = None) -> None:
+        self.requests: list[GenerationRequest] = []
+        self.text = text if text is not None else payload()
+
+    def generate(self, request: GenerationRequest) -> GenerationResult:
+        self.requests.append(request)
+        return GenerationResult(text=self.text, provider="fake", model=request.model)
+
+
+def test_whole_document_segment_spans_the_canonical_text() -> None:
+    document = ingest_text(DOCUMENT)
+
+    segment = whole_document_segment(document, CharacterCounter())
+
+    assert segment.text == document.text
+    assert (segment.core_start, segment.core_end) == (0, len(document.text))
+    assert (segment.context_start, segment.context_end) == (0, len(document.text))
+    assert segment.leading_overlap_tokens == 0
+    assert segment.trailing_overlap_tokens == 0
+    assert segment.segment_id == "S000001"
+    assert segment.source_id == document.source_id
+
+
+def test_whole_document_segment_is_labelled_as_a_whole_document() -> None:
+    """No boundary kind describing a break *within* a document would be true.
+
+    Segmentation never produces this kind, so it also tells a later stage that
+    provenance covers everything rather than a region.
+    """
+    segment = whole_document_segment(ingest_text(DOCUMENT), CharacterCounter())
+
+    assert segment.boundary_kind is BoundaryKind.DOCUMENT
+
+
+def test_the_prompt_does_not_describe_a_whole_document_as_a_fragment() -> None:
+    """Telling a model it holds a fragment invites it to hedge about context.
+
+    That is the opposite of the cohesive result a direct run is meant to give.
+    """
+    document = ingest_text(DOCUMENT)
+    whole = build_leaf_request(
+        whole_document_segment(document, CharacterCounter()),
+        model="m",
+        timeout_seconds=30,
+    )
+
+    assert "one region of a longer document" not in whole.instructions
+    assert "entire document" in whole.instructions
+
+
+def test_a_leaf_request_still_describes_a_region() -> None:
+    from summarizer.segmentation import SegmentationConfig, segment_document
+
+    segments = segment_document(
+        ingest_text(DOCUMENT), CharacterCounter(), SegmentationConfig(max_tokens=40)
+    )
+    leaf = build_leaf_request(segments[0], model="m", timeout_seconds=30)
+
+    assert "one region of a longer document" in leaf.instructions
+
+
+def test_summarizes_a_whole_document_in_one_call() -> None:
+    document = ingest_text(DOCUMENT)
+    provider = RecordingProvider()
+
+    node = summarize_direct(
+        document, provider, CharacterCounter(), model="m", timeout_seconds=30
+    )
+
+    assert node.level == 0
+    assert node.provenance == ("S000001",)
+    assert len(provider.requests) == 1
+    assert document.text in provider.requests[0].input_text
+
+
+def test_a_quotation_from_anywhere_in_the_document_validates() -> None:
+    """The whole document is attributable, unlike a segment's overlap context."""
+    document = ingest_text(DOCUMENT)
+    provider = RecordingProvider(
+        payload(
+            quotations=[
+                {"segment_id": "S000001", "quote": "Staffing was unchanged."}
+            ]
+        )
+    )
+
+    node = summarize_direct(
+        document, provider, CharacterCounter(), model="m", timeout_seconds=30
+    )
+
+    assert node.quotations[0].quote == "Staffing was unchanged."
+
+
+def test_rejects_a_fabricated_quotation() -> None:
+    provider = RecordingProvider(
+        payload(
+            quotations=[{"segment_id": "S000001", "quote": "the archive burned"}]
+        )
+    )
+
+    with pytest.raises(LeafSummaryError, match="quotation"):
+        summarize_direct(
+            ingest_text(DOCUMENT),
+            provider,
+            CharacterCounter(),
+            model="m",
+            timeout_seconds=30,
+        )
+
+
+def test_malformed_output_fails_naming_the_document_identifier() -> None:
+    provider = RecordingProvider("I would rather not.")
+
+    with pytest.raises(LeafSummaryError, match="S000001"):
+        summarize_direct(
+            ingest_text(DOCUMENT),
+            provider,
+            CharacterCounter(),
+            model="m",
+            timeout_seconds=30,
+        )
+
+
+def test_provider_failures_propagate_unchanged() -> None:
+    class FailingProvider:
+        def generate(self, request: GenerationRequest) -> GenerationResult:
+            raise ProviderConnectionError("service is unreachable")
+
+    with pytest.raises(ProviderConnectionError):
+        summarize_direct(
+            ingest_text(DOCUMENT),
+            FailingProvider(),
+            CharacterCounter(),
+            model="m",
+            timeout_seconds=30,
+        )
+
+
+def test_direct_requests_are_deterministic() -> None:
+    document = ingest_text(DOCUMENT)
+    first, second = RecordingProvider(), RecordingProvider()
+
+    node_one = summarize_direct(
+        document, first, CharacterCounter(), model="m", timeout_seconds=30
+    )
+    node_two = summarize_direct(
+        document, second, CharacterCounter(), model="m", timeout_seconds=30
+    )
+
+    assert node_one == node_two
+    assert first.requests == second.requests
