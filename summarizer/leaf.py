@@ -284,6 +284,7 @@ def validate_provenance(
     *,
     legal: Mapping[str, str],
     subject: str,
+    require_provenance: bool = True,
 ) -> None:
     """Check every reference against the identifiers the caller supplied.
 
@@ -297,6 +298,12 @@ def validate_provenance(
     against a concatenation of all of them: a concatenation would let a quote
     straddle two segments, or be attributed to a neighbour that did not
     contain it.
+
+    `require_provenance` guards against a record satisfying "evidence
+    resolves" by citing nothing at all. A caller that derives provenance
+    itself, rather than reading it from the response, sets it False: requiring
+    a model to restate a value that is then discarded is ceremony, and its
+    absence proves nothing either way.
     """
     referenced = set(node.provenance)
     for unit in node.content_units:
@@ -310,7 +317,7 @@ def validate_provenance(
             f"{', '.join(_sanitize(value) for value in unknown)}"
         )
 
-    if not node.provenance:
+    if require_provenance and not node.provenance:
         raise LeafSummaryError(
             f"{subject}: response recorded no provenance"
         )

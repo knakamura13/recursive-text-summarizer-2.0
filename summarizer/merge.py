@@ -164,5 +164,9 @@ def parse_merged_summary(
             f"{subject}: response reported level {node.level} rather than {level}"
         )
 
-    validate_provenance(node, legal=legal, subject=subject)
+    # Provenance is derived below, so its absence in the response is not a
+    # failure; what the response *did* cite must still be legal.
+    validate_provenance(
+        node, legal=legal, subject=subject, require_provenance=False
+    )
     return node.model_copy(update={"provenance": tuple(provenance)})
