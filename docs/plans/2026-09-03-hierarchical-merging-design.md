@@ -14,7 +14,7 @@ Boundaries against neighbouring issues:
 
 ## What the numbers say
 
-**A serialized child costs 55 to 870 tokens.** Measured with `o200k_base` on realistic records: a sparse node (summary only) is 54 tokens, a typical one (four content units with evidence) is 290, a rich one (ten units, quotations, contradictions) is 863. Pretty-printing adds 40%. Per-child fencing is about 40 tokens.
+**A serialized child costs 55 to 870 tokens.** Measured with `o200k_base` on realistic records: a sparse node (summary only) is 54 tokens, a typical one (four content units with evidence) is 290, a rich one (ten units, quotations, contradictions) is 863. Pretty-printing adds 40%. Per-child fencing measures 28 tokens marginally, and is measured at runtime rather than assumed — an earlier revision hard-coded 48 while calling it measured.
 
 **Provenance is the only term that grows without bound, and it grows at exactly 4.0 tokens per identifier.** Measured by holding a rich body fixed and widening provenance: 1 id → 863 tokens, 16 → 923, 64 → 1,115, 256 → 1,883.
 
@@ -48,12 +48,12 @@ The model still emits a `provenance` field, because the schema requires every pr
 
 ## Grouping and forward progress
 
-Group size is measured, not fixed: serialize each child, add per-child fencing, and derive how many fit the merge capacity. Groups are then **balanced** rather than greedily packed, because the epic requires that earlier content not be compressed more than later content, and greedy packing leaves a ragged final group that does exactly that.
+Group size is measured, not fixed: serialize each child, add the measured per-child fencing, and derive how many fit the merge capacity — where that capacity has the merge request's own instructions, schema, and outer delimiters subtracted first. The budget calculator measures a *leaf* request, so a caller passing its figure through unchanged would under-reserve; the subtraction happens inside rather than being left to the caller. Groups are then **balanced** rather than greedily packed, because the epic requires that earlier content not be compressed more than later content, and greedy packing leaves a ragged final group that does exactly that.
 
 Two guarantees make the recursion terminate:
 
-- **Every level strictly reduces the node count**, asserted after each level rather than assumed. This is the only property that makes termination provable.
-- **A single child that cannot fit its own merge request fails** with `BudgetError` naming the capacity, the child's serialized size, the fencing, and which child. Reachable on default local configuration, so this is a real path, not a guard.
+- **A capacity that cannot hold a *pair* fails** with `BudgetError` naming the child's cost, the pair's cost, and the capacity. This is what makes termination provable: a merge level is never narrower than two, so the node count always falls. An earlier revision instead floored the fanout at two, which assembled requests of twice the size they had been sized against — verified at 2.03× on the default local configuration, undetectable on a provider that truncates silently.
+- **Every level strictly reduces the node count**, asserted after each level. Given a fanout of at least two this cannot actually fail, so it is a defensive invariant rather than the proof.
 
 A trailing group of one is allowed and passes its node upward without a provider call, since the count still falls when other groups merge.
 
@@ -77,7 +77,7 @@ Parent-to-child edges are stored even though this issue's criterion asks only fo
 Three changes, and one invariant that must survive all of them:
 
 - the legal set becomes a caller-supplied mapping from identifier to attributable text;
-- the "must record provenance for itself" rule becomes "must cite within the legal set and not vacuously", so a merged node cannot pass by citing nothing;
+- the "must record provenance for itself" rule becomes "must cite within the legal set and not vacuously", so a merged node cannot pass by citing something illegal — though a derived-provenance caller may legitimately accept a response that cites nothing, since the stored value does not come from the response;
 - a quotation is checked against the core of *the segment it cites*, not a concatenation of all of them — a concatenation would let a quote straddle two segments and reopen the cross-attribution hole the overlap work closed.
 
 The invariant: the legal set never comes from the payload.
@@ -98,7 +98,7 @@ Children are model-written text, so the injection boundary applies to them exact
 
 - A single child that cannot fit raises `BudgetError` with the arithmetic.
 - A level that fails to reduce the node count raises rather than looping.
-- A merged node citing outside the legal set, or citing nothing, fails validation.
+- A merged node citing outside the legal set fails validation. Citing *nothing* does not, because a merged node's provenance is derived rather than read from the response — see `require_provenance` below.
 - A quotation that does not occur in the core of the segment it cites fails validation.
 - Provider failures propagate; a validation failure fails the run without partial output, as the leaf stage already does.
 
@@ -127,13 +127,15 @@ This issue delivers the tree, grouping, the merge stage and prompt, the generali
 3. **Groups are balanced, not greedily packed**, because the epic requires even compression.
 4. **`SummaryNode` and its schema are reused unchanged**; the tree lives in separate records.
 5. **`_validate_provenance` is generalized in place** rather than duplicated.
-6. **Every level must strictly reduce the node count**, asserted.
+6. **A capacity that cannot hold a pair fails**, which is what makes termination provable; the node-count assertion is defensive.
 7. **The children-per-merge ceiling defaults to unset**, so measurement governs and the quality question stays open.
 8. **Parent-to-child edges are stored** despite not being required here.
 
 ## Measured on completion
 
 Verified end to end against an injected counter and a ceiling of three children per merge: **20 leaves reduce to one root through 3 levels in 11 provider calls**, with per-level counts 20 → 7 → 3 → 1. The root's provenance equals the ordered union of all twenty segment identifiers, and parent-to-child edges are present on all 31 stored nodes.
+
+On the default local configuration — an assumed 8,192-token window with the byte estimator — the merge request's own overhead measures **4,090 tokens against a usable capacity of 3,436**, so no merge can be formed at all and `build_hierarchy` refuses with that arithmetic. Hierarchical execution there requires an explicit context window or an exact counter. That is the honest consequence of the estimator's cost, and it is now reported rather than silently over-filled.
 
 The `require_provenance` flag on the validator was not in the design. It emerged from implementing it: the anti-vacuity rule added for leaves demands non-empty provenance, but a merged node's provenance is derived, so requiring a model to restate a value that is then discarded is ceremony and its absence proves nothing either way. The flag defaults to True, so leaf behaviour is untouched.
 
