@@ -139,7 +139,25 @@ def test_schema_is_strict_at_every_level() -> None:
             assert_strict(definition, name)
 
 
-def test_schema_version_is_present_and_stable() -> None:
+def test_schema_matches_what_the_openai_sdk_would_generate() -> None:
+    """Pins the claim that the generated schema is already strict-mode ready.
+
+    The design rests on pydantic's own output being usable as an OpenAI
+    `strict: true` schema with no post-processing. That claim would otherwise
+    only fail against a live endpoint, so it is checked here against the SDK's
+    own converter. A private module path is used deliberately: it is the
+    oracle, and openai is already a declared dependency.
+
+    It does not cover every strict-mode rule - unsupported keywords such as
+    `minLength` are not stripped by this transform - so it guards drift in
+    `additionalProperties`, `required`, nullable handling and `$ref` siblings
+    rather than proving live acceptance.
+    """
+    to_strict = pytest.importorskip("openai.lib._pydantic").to_strict_json_schema
+
+    assert leaf_summary_schema() == to_strict(SummaryNode)
+
+
+def test_schema_version_is_recorded_for_cache_keys() -> None:
     assert LEAF_SCHEMA_VERSION
     assert isinstance(LEAF_SCHEMA_VERSION, str)
-    assert leaf_summary_schema() == leaf_summary_schema()

@@ -86,6 +86,25 @@ def _has_overlap(segment: SourceSegment) -> bool:
     )
 
 
+def _core_bounds(segment: SourceSegment) -> tuple[int, int]:
+    """Locate the segment's own core inside its context text.
+
+    `SourceSegment.text` spans the whole context range, so these offsets are
+    what separate the part a leaf owns from surrounding context it may read but
+    not attribute.
+    """
+    return (
+        segment.core_start - segment.context_start,
+        segment.core_end - segment.context_start,
+    )
+
+
+def core_text(segment: SourceSegment) -> str:
+    """Return only the text a segment owns, excluding any overlap context."""
+    core_from, core_to = _core_bounds(segment)
+    return segment.text[core_from:core_to]
+
+
 def build_leaf_request(
     segment: SourceSegment,
     *,
@@ -110,8 +129,7 @@ def build_leaf_request(
     if _has_overlap(segment):
         core_begin = _fence(segment, "CORE-BEGIN")
         core_end = _fence(segment, "CORE-END")
-        core_from = segment.core_start - segment.context_start
-        core_to = segment.core_end - segment.context_start
+        core_from, core_to = _core_bounds(segment)
         body = (
             f"{body[:core_from]}{core_begin}\n"
             f"{body[core_from:core_to]}"
@@ -134,13 +152,14 @@ def build_leaf_request(
     )
 
 
-def _extract_json_object(text: str) -> str:
-    """Return the outermost JSON object in a response.
+def _top_level_objects(text: str) -> list[str]:
+    """Return every balanced top-level JSON object in a response.
 
     Constrained decoding reduces slop rather than eliminating it: the native
     Ollama format argument is best effort, and a small local model may still
     wrap its answer in a code fence or introduce it with a sentence.
     """
+    objects = []
     depth = 0
     start = None
     in_string = False
@@ -164,19 +183,55 @@ def _extract_json_object(text: str) -> str:
             if depth:
                 depth -= 1
                 if depth == 0 and start is not None:
-                    return text[start : index + 1]
-    raise ValueError("no JSON object found")
+                    objects.append(text[start : index + 1])
+                    start = None
+    return objects
+
+
+def _extract_json_object(text: str) -> str:
+    """Return the single JSON object in a response.
+
+    Ambiguity is refused rather than resolved by position. Returning the first
+    object that closes would silently discard the rest of an array-wrapped or
+    double-emitted response, and picking a preamble object over the real answer
+    produces a misleading validation failure instead of an actionable one.
+    """
+    objects = _top_level_objects(text)
+    if not objects:
+        raise ValueError("no JSON object found")
+    if len(objects) > 1:
+        raise ValueError(f"expected one JSON object, found {len(objects)}")
+    return objects[0]
+
+
+_MAX_DETAIL_CHARS = 40
+
+
+def _sanitize(value: object) -> str:
+    """Bound a payload-controlled fragment before it enters an error message.
+
+    Field names and identifiers in a response are written by a model that may
+    be following instructions embedded in the source, and these messages reach
+    the operator's console and the log. Collapsing whitespace stops a crafted
+    value from spanning lines, and truncating stops it from flooding the
+    stream. The fragment is still reported, because naming the offending field
+    or identifier is what makes the failure actionable.
+    """
+    collapsed = " ".join(str(value).split())
+    if len(collapsed) > _MAX_DETAIL_CHARS:
+        return f"{collapsed[:_MAX_DETAIL_CHARS]}..."
+    return collapsed
 
 
 def _describe(error: ValidationError) -> str:
-    """Summarize a validation failure by location, never by value.
+    """Summarize a validation failure by location and kind, never by value.
 
-    The payload and the source are both untrusted, so neither is interpolated
-    into an error message.
+    A location can itself be payload-controlled — an unexpected key's own name
+    appears there — so it is sanitized rather than trusted.
     """
     details = []
     for failure in error.errors():
-        location = ".".join(str(part) for part in failure["loc"]) or "(root)"
+        location = ".".join(_sanitize(part) for part in failure["loc"]) or "(root)"
         details.append(f"{location}: {failure['type']}")
     return "; ".join(details)
 
@@ -191,13 +246,9 @@ def parse_leaf_summary(text: str, *, segment: SourceSegment) -> SummaryNode:
         payload = json.loads(_extract_json_object(text))
     except (ValueError, json.JSONDecodeError) as error:
         raise LeafSummaryError(
-            f"{segment.segment_id}: response was not a JSON object"
+            f"{segment.segment_id}: response was not a single JSON object "
+            f"({_sanitize(error)})"
         ) from error
-
-    if not isinstance(payload, dict):
-        raise LeafSummaryError(
-            f"{segment.segment_id}: response was not a JSON object"
-        )
 
     try:
         node = SummaryNode.model_validate(payload)
@@ -229,9 +280,18 @@ def _validate_provenance(node: SummaryNode, *, segment: SourceSegment) -> None:
     if unknown:
         raise LeafSummaryError(
             f"{segment.segment_id}: response cited unknown segments "
-            f"{', '.join(unknown)}"
+            f"{', '.join(_sanitize(value) for value in unknown)}"
         )
 
+    if segment.segment_id not in node.provenance:
+        raise LeafSummaryError(
+            f"{segment.segment_id}: response recorded no provenance for the segment"
+        )
+
+    # Quotations are checked against the core alone. A segment's text spans its
+    # whole context range, so matching against that would attribute a
+    # neighbouring segment's core to this leaf through the overlap window.
+    attributable = core_text(segment)
     quotes = [item.quote for item in node.quotations if item.quote is not None]
     quotes.extend(
         item.quote
@@ -240,7 +300,7 @@ def _validate_provenance(node: SummaryNode, *, segment: SourceSegment) -> None:
         if item.quote is not None
     )
     for quote in quotes:
-        if quote not in segment.text:
+        if quote not in attributable:
             raise LeafSummaryError(
                 f"{segment.segment_id}: a quotation does not occur in the segment"
             )
