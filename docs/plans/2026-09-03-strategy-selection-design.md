@@ -136,6 +136,19 @@ This issue delivers the budget calculator, the context table, strategy selection
 7. **Budget settings live in `StrategyConfig`**, not `AppConfig`, to avoid the positional-construction hazard.
 8. **The output reserve is accounted for but not enforced.** Enforcing it means adding an output cap to `GenerationRequest` and mapping it in both adapters, which re-opens the provider contract for a criterion that only requires the reservation be *accounted* for.
 
+## Measured on completion
+
+The implementation's own numbers, for comparison against the estimates above:
+
+| counter | overlap | instructions | schema | fencing | total |
+|---|---|---|---|---|---|
+| `tiktoken:o200k_base` | no | 249 | 521 | 24 | **794** |
+| `tiktoken:o200k_base` | yes | 343 | 521 | 54 | **918** |
+| `estimate:utf8-bytes` | no | 1,216 | 2,196 | 64 | **3,476** |
+| `estimate:utf8-bytes` | yes | 1,631 | 2,196 | 138 | **3,965** |
+
+Usable input capacity for `gpt-4o-mini` on defaults is **123,622 tokens**. The estimator's 3,476-token overhead exceeds a 2,048-token window on its own, which is what makes the underflow error load-bearing rather than defensive.
+
 ## Open decisions
 
 These change the shape of the code or reflect a product judgment this issue should not make alone:
