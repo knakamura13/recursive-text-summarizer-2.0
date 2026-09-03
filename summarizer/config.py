@@ -69,3 +69,46 @@ class LegacyWorkflowConfig:
             raise ValueError("chunk_size must be positive")
         if self.max_chunks == 0 or self.max_chunks < -1:
             raise ValueError("max_chunks must be -1 or a positive integer")
+
+
+StrategyName = Literal["auto", "direct", "hierarchical"]
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    """How to choose an execution path, and what to reserve when sizing it.
+
+    Kept separate from `AppConfig` rather than added to it. `AppConfig` is
+    constructed positionally in existing tests, and a commit exists in this
+    repository's history solely to repair that after a field moved, so budget
+    settings live in their own record instead of re-opening that hazard.
+    """
+
+    strategy: StrategyName = "auto"
+    context_window: int | None = None
+    max_output_tokens: int = 1_024
+    safety_margin_tokens: int = 256
+    safety_margin_fraction: float = 0.02
+    # Unset means capacity alone decides. A cap exists because a window-only
+    # rule sends very large documents in one call, which is a quality question
+    # this project has not answered; setting it makes hierarchical reachable
+    # without a code change.
+    max_direct_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.strategy not in ("auto", "direct", "hierarchical"):
+            raise ValueError(
+                "strategy must be one of auto, direct, or hierarchical"
+            )
+        if self.context_window is not None and self.context_window <= 0:
+            raise ValueError("context_window must be positive when provided")
+        if self.max_output_tokens <= 0:
+            raise ValueError("max_output_tokens must be positive")
+        if self.safety_margin_tokens < 0:
+            raise ValueError("safety_margin_tokens must not be negative")
+        if not isfinite(self.safety_margin_fraction) or not (
+            0 <= self.safety_margin_fraction < 1
+        ):
+            raise ValueError("safety_margin_fraction must be at least 0 and below 1")
+        if self.max_direct_tokens is not None and self.max_direct_tokens <= 0:
+            raise ValueError("max_direct_tokens must be positive when provided")

@@ -5,7 +5,7 @@ import pytest
 
 from summarizer import cli
 from summarizer.cli import main, parse_args
-from summarizer.config import AppConfig
+from summarizer.config import AppConfig, StrategyConfig
 from summarizer.providers.base import (
     GenerationRequest,
     GenerationResult,
@@ -264,3 +264,66 @@ def test_main_reports_unavailable_selected_ollama_service(
     assert "Ollama connection failed" in stderr
     assert selected[0].provider == "ollama"
     assert not (tmp_path / "output.txt").exists()
+
+
+def test_strategy_defaults_to_auto() -> None:
+    assert parse_args([]).strategy == StrategyConfig()
+
+
+@pytest.mark.parametrize("strategy", ["auto", "direct", "hierarchical"])
+def test_each_strategy_is_accepted(strategy: str) -> None:
+    assert parse_args(["--strategy", strategy]).strategy.strategy == strategy
+
+
+def test_budget_flags_reach_the_strategy_config() -> None:
+    parsed = parse_args(
+        [
+            "--strategy",
+            "direct",
+            "--context-window",
+            "32768",
+            "--max-output-tokens",
+            "2048",
+            "--safety-margin-tokens",
+            "512",
+            "--safety-margin-fraction",
+            "0.05",
+            "--max-direct-tokens",
+            "5000",
+        ]
+    )
+
+    assert parsed.strategy == StrategyConfig(
+        strategy="direct",
+        context_window=32_768,
+        max_output_tokens=2_048,
+        safety_margin_tokens=512,
+        safety_margin_fraction=0.05,
+        max_direct_tokens=5_000,
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--strategy", "sideways"],
+        ["--context-window", "0"],
+        ["--max-output-tokens", "0"],
+        ["--safety-margin-tokens", "-1"],
+        ["--safety-margin-fraction", "1.5"],
+        ["--max-direct-tokens", "0"],
+    ],
+)
+def test_invalid_budget_values_are_usage_errors(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Validation must surface through the parser, not as a traceback.
+
+    `main` catches only OSError and ProviderError, so a ValueError escaping
+    into it would print a traceback instead of an actionable message.
+    """
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(argv)
+
+    assert exit_info.value.code == 2
+    assert "Traceback" not in capsys.readouterr().err

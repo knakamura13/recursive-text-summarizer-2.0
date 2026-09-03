@@ -2,7 +2,7 @@
 
 This project is being rebuilt as a generalized, source-grounded hierarchical summarization pipeline for extremely long artifacts. The current application provides a provider-neutral foundation while preserving the legacy flat, sentence-chunked workflow.
 
-Canonical ingestion, token-aware segmentation, and structured leaf summarization are now available as library components in `summarizer.ingestion`, `summarizer.tokenization`, `summarizer.segmentation`, `summarizer.summaries`, and `summarizer.leaf`. The command-line workflow still runs the legacy flat, sentence-chunked path and does not consume them yet.
+Canonical ingestion, token-aware segmentation, structured leaf summarization, token-budget arithmetic, and whole-document direct summarization are now available as library components in `summarizer.ingestion`, `summarizer.tokenization`, `summarizer.segmentation`, `summarizer.summaries`, `summarizer.leaf`, `summarizer.budget`, and `summarizer.direct`. The command-line workflow still runs the legacy flat, sentence-chunked path and does not consume them yet.
 
 Hierarchical merging, source grounding across merge levels, concurrency, and quality evaluation are not implemented yet.
 
@@ -126,6 +126,26 @@ When a provider can constrain decoding, the request carries a JSON Schema — a 
 Source text is placed only in the request's input slot, never in its instructions, and the instructions state that fenced content is data rather than instructions. The stage fails on the first segment whose response cannot be validated, naming the segment and the failing field without echoing the payload or the source.
 
 The command line does not consume leaf records yet.
+
+## Strategy selection and token budgets
+
+`summarizer.budget` decides how a document should be executed before any provider is called:
+
+```
+usable input = context window − prompt and schema overhead − reserved output − safety margin
+```
+
+Every term is measured or configured, not guessed. Overhead is measured by building a real request and counting it, because a hard-coded figure would rot the moment the prompt or the record changed — it is 798 tokens for `gpt-4o-mini`, of which the schema alone is 521, and it rises to 918 when overlap is configured. The safety margin is the larger of a fixed floor and a fraction of the window, so a small window keeps a usable floor while a very large one is not charged thousands of tokens for nothing.
+
+A configuration that leaves no usable capacity raises an error naming every term, rather than returning a meaningless number. That case is reachable rather than theoretical: the conservative estimator charges roughly four times a real tokenizer on this project's own prompt text, which exhausts a small window on its own.
+
+`--strategy auto` selects direct only when the document provably fits, the context window is *known* rather than assumed, and any configured direct cap is respected; otherwise it selects hierarchical. `--strategy direct` fails before a provider call when the document does not fit, reporting the same arithmetic the decision used. `--strategy hierarchical` always splits.
+
+Context windows come from a hand-maintained table, because there is no offline source of truth and, for OpenAI, no online one either — the client exposes no window, and `tiktoken` maps model names to encodings rather than to sizes. An unrecognized model therefore resolves to an assumed window that is reported as assumed, and `auto` routes it to hierarchical rather than gambling a direct request on a guess. Pass `--context-window` to state a window explicitly and recover the direct path.
+
+Two provider behaviours are worth knowing, because they differ in a way that matters. OpenAI rejects an oversized request outright. Ollama silently truncates the prompt and returns a plausible answer, so on the local path the budget arithmetic is the only thing standing between a too-large document and a confidently ungrounded summary.
+
+The reserved output size is accounted for when sizing a request but not yet enforced on the provider, and the command line accepts strategy configuration without yet running the new pipeline — it still executes the legacy workflow.
 
 Historical scripts under `omscs-ml-lectures/` remain available but are not part of the modern application entry point.
 

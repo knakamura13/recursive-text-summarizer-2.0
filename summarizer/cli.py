@@ -7,7 +7,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from summarizer.config import AppConfig, LegacyWorkflowConfig, RetryPolicy
+from summarizer.config import (
+    AppConfig,
+    LegacyWorkflowConfig,
+    RetryPolicy,
+    StrategyConfig,
+)
 from summarizer.legacy_workflow import LegacyWorkflow, run_file_workflow
 from summarizer.providers.base import (
     GenerationRequest,
@@ -25,6 +30,7 @@ class ParsedConfig:
     app: AppConfig
     retry: RetryPolicy
     workflow: LegacyWorkflowConfig
+    strategy: StrategyConfig = StrategyConfig()
 
 
 class _UnavailableProvider:
@@ -62,6 +68,54 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-size", type=int, default=1000)
     parser.add_argument("--max-chunks", type=int, default=-1)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--strategy",
+        choices=("auto", "direct", "hierarchical"),
+        default="auto",
+        help=(
+            "how to execute: auto picks direct when the document provably "
+            "fits, direct requires that it fits, hierarchical always splits"
+        ),
+    )
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=None,
+        help=(
+            "the model's total context size in tokens; required to use direct "
+            "with a model this project has no table entry for"
+        ),
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=1024,
+        help="tokens reserved for the response when sizing a request",
+    )
+    parser.add_argument(
+        "--safety-margin-tokens",
+        type=int,
+        default=256,
+        help="minimum tokens held back from the context window",
+    )
+    parser.add_argument(
+        "--safety-margin-fraction",
+        type=float,
+        default=0.02,
+        help=(
+            "fraction of the context window held back; the larger of this and "
+            "--safety-margin-tokens applies"
+        ),
+    )
+    parser.add_argument(
+        "--max-direct-tokens",
+        type=int,
+        default=None,
+        help=(
+            "with --strategy auto, refuse direct above this document size "
+            "even when it fits, to force hierarchical execution"
+        ),
+    )
     return parser
 
 
@@ -83,6 +137,14 @@ def parse_args(argv: list[str] | None = None) -> ParsedConfig:
                 chunk_size=args.chunk_size,
                 max_chunks=args.max_chunks,
                 dry_run=args.dry_run,
+            ),
+            strategy=StrategyConfig(
+                strategy=args.strategy,
+                context_window=args.context_window,
+                max_output_tokens=args.max_output_tokens,
+                safety_margin_tokens=args.safety_margin_tokens,
+                safety_margin_fraction=args.safety_margin_fraction,
+                max_direct_tokens=args.max_direct_tokens,
             ),
         )
     except ValueError as error:
