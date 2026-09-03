@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -176,3 +177,45 @@ def test_a_payload_obeying_injected_instructions_fails_validation() -> None:
         summarize_segments(
             all_segments, ObedientProvider(), model="m", timeout_seconds=30
         )
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "article.txt",
+        "report.txt",
+        "transcript.txt",
+        "structured.md",
+        "narrative.txt",
+    ],
+)
+def test_stage_handles_every_genre_in_the_corpus(name: str) -> None:
+    """The prompt claims to be genre-neutral, so exercise it across registers."""
+    document = ingest_text((FIXTURES / name).read_text(encoding="utf-8"))
+    all_segments = segment_document(
+        document,
+        ConservativeUtf8TokenCounter(),
+        SegmentationConfig(max_tokens=400, overlap_tokens=40),
+    )
+    provider = RecordingProvider()
+
+    nodes = summarize_segments(
+        all_segments, provider, model="m", timeout_seconds=30
+    )
+
+    assert len(nodes) == len(all_segments)
+    assert [node.provenance[0] for node in nodes] == [
+        segment.segment_id for segment in all_segments
+    ]
+    # Overlapping segments must still mark only their own core as attributable.
+    overlapping = [
+        request
+        for request, segment in zip(provider.requests, all_segments)
+        if segment.leading_overlap_tokens or segment.trailing_overlap_tokens
+    ]
+    assert all(
+        "not attributable" in request.instructions for request in overlapping
+    )

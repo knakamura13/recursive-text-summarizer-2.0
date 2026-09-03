@@ -120,6 +120,21 @@ Issue #5 delivers the leaf records, their schema, the provider-neutral schema fi
 
 It depends on issue #4, which is open in PR #14. The `SourceSegment` field list is settled, but until #4 merges this design is written against an unmerged API.
 
+## Decisions taken
+
+Implemented as designed, with the selections below confirmed rather than revisited:
+
+1. **Pydantic for the leaf records.** They are the only records built from untrusted model output, and generating the provider's schema from the same definition that validates the response is what stops the two from drifting. Two settings carry that: forbidding extra fields emits `additionalProperties: false`, and declaring no field defaults marks every property required — so the generated schema is already an OpenAI strict schema and no private SDK helper is needed.
+2. **`GenerationRequest` extended**, with both new fields appended and defaulted.
+3. **One `SummaryNode` with a `level`**, zero for leaves.
+4. **The whitespace collapse is now conditional** rather than removed. A schema-carrying response is returned unmodified; a prose response is still collapsed, so the legacy workflow is untouched.
+5. **Quotation limits** were left to the prompt and to post-validation rather than encoded as schema constraints; a cap remains a product decision.
+
+Two details emerged during implementation and are worth recording:
+
+- The fence delimiting source text is derived per segment from the source digest and the segment identifier. That keeps a request byte-identical across runs while making the marker unguessable from source text alone. Precedence is still stated in the instructions, because a fence that merely looks unguessable is not a boundary on its own.
+- Where a segment carries overlap, inner markers identify the part that belongs to it, and the instructions declare the surrounding context unattributable. Without that, an instruction to summarize only the core would not be actionable, because a segment's text spans its whole context range.
+
 ## Open decisions
 
 These change the shape of the code and set precedent beyond this issue:
