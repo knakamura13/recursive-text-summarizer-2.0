@@ -2,9 +2,9 @@
 
 This project is being rebuilt as a generalized, source-grounded hierarchical summarization pipeline for extremely long artifacts. The current application provides a provider-neutral foundation while preserving the legacy flat, sentence-chunked workflow.
 
-Canonical ingestion and token-aware segmentation are now available as library components in `summarizer.ingestion`, `summarizer.tokenization`, and `summarizer.segmentation`. The command-line workflow still runs the legacy flat, sentence-chunked path and does not consume them yet.
+Canonical ingestion, token-aware segmentation, and structured leaf summarization are now available as library components in `summarizer.ingestion`, `summarizer.tokenization`, `summarizer.segmentation`, `summarizer.summaries`, and `summarizer.leaf`. The command-line workflow still runs the legacy flat, sentence-chunked path and does not consume them yet.
 
-Hierarchical reduction, source grounding, concurrency, and quality evaluation are not implemented yet.
+Hierarchical merging, source grounding across merge levels, concurrency, and quality evaluation are not implemented yet.
 
 ## Requirements
 
@@ -112,6 +112,18 @@ Token accounting is injected through the `TokenCounter` protocol, and segmentati
 - Arbitrary Ollama tags and otherwise unsupported models fall back to a conservative estimator that treats every UTF-8 byte as a token. It deliberately under-packs, and reports `exact` as false. Injecting an exact counter for such a model recovers that capacity.
 
 Boundary searches are verified rather than assumed: a returned boundary is always recounted against the budget. Because byte-pair encoders are not monotonic in text length — adding a character can *lower* a token count — a search is not guaranteed to find the largest boundary that would have fit. Segments may therefore be slightly smaller than the budget allows, which is safe; no segment ever exceeds it.
+
+## Structured leaf summarization
+
+`summarizer.leaf` turns each segment into a validated record rather than a paragraph of prose. A record carries a local summary, the content units it asserts, the evidence supporting each one, entities, qualifications, uncertainty, contradictions, and quotations. The records live in `summarizer.summaries` and are shared with later merge levels, which is why each one carries a `level` — zero for a leaf.
+
+Evidence must resolve to a segment identifier the caller supplied. The legal set is built from the segments passed in and never from the model's response, so a citation that arrives because the source text asked for one fails validation instead of entering the hierarchy as a dangling reference. A leaf may cite only itself: text that reached it through overlap is available as context to interpret the segment, but is not attributable. Quotations must occur in the segment character for character, and their offsets are derived from that match rather than taken from the model.
+
+When a provider can constrain decoding, the request carries a JSON Schema — a strict `json_schema` text format for OpenAI, and the native `format` argument for Ollama. Parsing stays defensive regardless, because constraining decoding is best effort on the Ollama side rather than a guarantee, so a response may still arrive fenced or behind a preamble. A structured response is *not* whitespace-collapsed at the provider boundary; a prose response still is, which is what keeps verbatim quotations locatable in their source.
+
+Source text is placed only in the request's input slot, never in its instructions, and the instructions state that fenced content is data rather than instructions. The stage fails on the first segment whose response cannot be validated, naming the segment and the failing field without echoing the payload or the source.
+
+The command line does not consume leaf records yet.
 
 Historical scripts under `omscs-ml-lectures/` remain available but are not part of the modern application entry point.
 
