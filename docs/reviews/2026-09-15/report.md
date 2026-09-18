@@ -1,10 +1,10 @@
 # Full review at 301cc4d — COMPLETE
 
-**Sessions:** 7 (completed). This review certifies the product at the reviewed commit.
+**Sessions:** 8 (completed). This review certifies the product at the reviewed commit.
 
 **Reviewed commit:** `301cc4d56d6326b5b0449da059b3b35f484cc5ca`  
 **Baseline:** `UV_OFFLINE=1 uv run --with-requirements requirements-dev.txt python -m pytest -q` → **766 passed**  
-**Traceability matrix:** 214 acceptance criteria (216 rows, 2 dependency markers marked `not-a-criterion`)
+**Traceability matrix:** 201 acceptance criteria (203 rows, 2 dependency markers marked `not-a-criterion`)
 
 ## Findings summary
 
@@ -12,7 +12,7 @@
 |---|---|---|
 | confirmed | 18 | F-005, F-007, F-008, F-009, F-011, F-012, F-013, F-019, F-020, F-021, F-023, F-027, F-028, F-029, F-030, F-031, F-033, F-034 |
 | downgraded | 8 | F-010, F-014, F-022, F-025 (still minor); F-016, F-024, F-026, F-032 (closed at severity none) |
-| refuted | 7 | F-001, F-002, F-004, F-006, F-015, F-017, F-018 |
+| refuted | 8 | F-001, F-002, F-004, F-006, F-015, F-017, F-018, F-035 |
 | pending | 1 | F-003 |
 
 **Confirmed by severity:** **critical 2** (F-012, F-013), **major 4** (F-009, F-011, F-019, F-029), **minor 12** (F-005, F-007, F-008, F-020, F-021, F-023, F-027, F-028, F-030, F-031, F-033, F-034).
@@ -29,15 +29,14 @@
 
 ## Traceability
 
-The matrix holds **214 actual acceptance criteria** (216 rows, 2 dependency markers). **5 violated rows**, split by kind:
+The matrix holds **201 actual acceptance criteria** (203 rows, 2 dependency markers). **7 violated rows**, split by kind:
 
 | kind | rows | description |
 |---|---|---|
-| behavior/documentation violations | 2 | row 195 (#32 fenced-code-block crash + missing fixture), row 215 (#39 docs clause — evaluator `max_merge_children=2` not distinguished) |
-| coverage-clause violations (behavior correct) | 2 | row 194 (#32 "e.g." abbreviation test), row 153 (#10 repair-pass exhaustion) |
-| process violation | 1 | row 222 (#39 closing-comment requirement) — tracked as process items P-005/P-006, not a code defect |
+| behavior/documentation violations | 2 | row 193 (#35 fenced-code-block crash + missing fixture), row 205 (#39 docs clause — evaluator `max_merge_children=2` not distinguished) |
+| coverage-clause violations (behavior correct) | 4 | row 153 (#10 repair-pass exhaustion), row 174 (#26 grounding reserve regression test), row 180 (#27 regression test), row 193 (#36 schema caps test missing) |
+| process violation | 1 | row 213 (#39 closing-comment requirement) — tracked as process items P-005/P-006, not a code defect |
 
-**Evidence standard:** `verified` requires a named pytest node id or a runnable repro path; `inspection-only` records code that was read and looks correct without executable evidence.
 
 ## Issues filed (all on milestone *Full review 2026-09-15 (301cc4d)*)
 
@@ -74,12 +73,11 @@ The matrix holds **214 actual acceptance criteria** (216 rows, 2 dependency mark
 1. Verify three remaining candidates: C-S3M-003, C-S3M-004, C-S2H-001 (all confirmed genuine survivors; only reachability/severity left).
 2. S4 mutation angle on `verification.py` (2003 lines) — never run, highest predicted defect density.
 3. S4 live angle.
-4. Fold S4/S5/S6 row statuses into traceability as a dedicated sync pass.
-5. S1 and S2 remain reopened rather than closed.
+4. S1/S2 traceability largely complete; remaining pending rows are cross-cutting (#1, #12) and S3 (#2, #4, #5) which were not in scope for this review.
 
 ## Artifacts
 
-- `traceability.md` — full 214-criterion matrix with status and evidence references.
+- `traceability.md` — full 201-criterion matrix with status and evidence references.
 - `reproduction_scripts/` — 42 runnable scripts (`.review/repro/*.py|.sh` + `.review/test_exhaustion/*.py`) reproducing every finding and key verification.
 
 ## Review protocol adherence
