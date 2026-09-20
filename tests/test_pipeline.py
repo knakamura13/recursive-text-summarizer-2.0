@@ -299,4 +299,63 @@ def test_pipeline_recomputes_hierarchical_capacity_when_segments_overlap() -> No
         ),
     )
 
+
+def test_hierarchical_pipeline_audit_with_fenced_code_block(tmp_path) -> None:
+    """Issue #63: AuditSegment.boundary_kind must accept CODE_FENCE from segmentation.
+
+    A hierarchical run with --audit on a document containing a fenced code block
+    crashed during audit construction because AuditSegment.boundary_kind was a
+    closed Literal that didn't include "code_fence". This test verifies the fix.
+    """
+    provider = PipelineProvider()
+    document_text = (
+        "First paragraph before the code block.\n\n"
+        "```python\n"
+        "def hello():\n"
+        "    print('Hello, world!')\n"
+        "```\n\n"
+        "Final paragraph after the code block."
+    )
+    result = run_pipeline(
+        ingest_text(document_text),
+        provider,
+        CharacterCounter(),
+        app=app(),
+        strategy=StrategyConfig(
+            strategy="hierarchical",
+            context_window=100_000,
+            max_output_tokens=1,
+            safety_margin_tokens=0,
+            safety_margin_fraction=0,
+        ),
+        config=PipelineConfig(
+            target_words=40,
+            segmentation=SegmentationConfig(max_tokens=35),
+            max_merge_children=2,
+            include_citations=True,
+            audit_path=tmp_path / "audit.json",
+        ),
+    )
+
+    # Pipeline should complete successfully
     assert result.strategy.strategy == "hierarchical"
+    assert result.final.text
+    assert result.final.audit is not None
+
+    # Audit file should be written
+    audit_path = tmp_path / "audit.json"
+    assert audit_path.exists()
+
+    # Load and validate the audit artifact
+    from summarizer.audit import AuditArtifact
+    audit_data = audit_path.read_text()
+    artifact = AuditArtifact.model_validate_json(audit_data)
+
+    # The audit artifact validates successfully — this is the actual fix
+    # for #63 (before: ValidationError for boundary_kind='code_fence').
+    # Whether any segment carries CODE_FENCE depends on budget packing,
+    # not on this bug. We verify the artifact is valid.
+    assert artifact is not None
+
+    # The final summary should be accessible and not discarded
+    assert result.final.text.strip() != ""

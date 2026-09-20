@@ -185,7 +185,7 @@ class AuditSegment(_AuditRecord):
     leading_overlap_tokens: int
     trailing_overlap_tokens: int
     boundary_kind: Literal[
-        "heading", "paragraph", "list", "sentence", "hard", "document"
+        "heading", "paragraph", "list", "sentence", "hard", "document", "code_fence"
     ]
 
     _valid_segment_id = field_validator("segment_id")(_audit_segment_id)
