@@ -51,7 +51,7 @@ class AppConfig:
     model: str = "gpt-4o-mini"
     timeout_seconds: float = 180
     provider: ProviderName = "openai"
-    ollama_host: str = "http://localhost:11434"
+    ollama_host: str = ""
 
     def __post_init__(self) -> None:
         if self.input_path == Path("."):
@@ -66,8 +66,8 @@ class AppConfig:
             raise ValueError("model must not be empty")
         if self.provider not in ("openai", "ollama"):
             raise ValueError("provider must be openai or ollama")
-        if not self.ollama_host.strip():
-            raise ValueError("ollama_host must not be empty")
+        if self.provider == "ollama" and not self.ollama_host.strip():
+            raise ValueError("ollama_host must not be empty for ollama provider")
         if not isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 

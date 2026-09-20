@@ -1,0 +1,22 @@
+QUARTERLY TRANSIT RELIABILITY REPORT
+Period: January through March 2028
+
+SUMMARY
+Fictional Northline Transit operated 18,420 scheduled trips. On-time performance was 87.6 percent, up from 84.1 percent last quarter but below the 90 percent target. The figures are preliminary because forty-two operator logs remain under review.
+
+KEY METRICS
+Completed trips: 18,112, or 98.3 percent.
+Average delay: 4.8 minutes.
+Passenger complaints: 316, down 9 percent.
+Wheelchair lift failures: 11, unchanged.
+
+CAUSES
+Signal work near Alder Junction accounted for an estimated 31 percent of recorded delay minutes. Late vehicle departures contributed 24 percent. Two severe rain days also disrupted service, although dispatch records cannot isolate their full effect.
+
+RECOMMENDATIONS
+Extend recovery time on Route 7 during construction.
+Assign one spare bus to the eastern depot each weekday.
+Audit lift maintenance records before the next quarter.
+
+OUTLOOK
+Management expects modest improvement in April, provided signal work ends on schedule. The planning team will validate the remaining logs before publishing final results on May 15.

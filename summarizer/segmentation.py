@@ -55,6 +55,7 @@ class CacheCoordinator:
     source_id: str
     provider: str
     model: str
+    ollama_host: str
     counter_identity: str
     counter_exact: bool
     context_window_tokens: int
@@ -73,6 +74,7 @@ class CacheCoordinator:
             source_id=self.source_id, input_hash=hashlib.sha256(encoded_input).hexdigest(),
             stage=stage, work_id=work_id, prompt_version=prompt_version,
             schema_version=schema_version, provider=self.provider, model=self.model,
+            ollama_host=self.ollama_host,
             counter_identity=self.counter_identity, counter_exact=self.counter_exact,
             context_window_tokens=self.context_window_tokens,
             behavior={**self.behavior, **behavior},

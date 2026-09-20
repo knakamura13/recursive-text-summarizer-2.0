@@ -41,6 +41,7 @@ def _descriptor(work_id: str) -> CacheDescriptor:
         schema_version="summary/1",
         provider="openai",
         model="gpt-4o-mini",
+        ollama_host="",
         counter_identity="tiktoken:o200k_base",
         counter_exact=True,
         context_window_tokens=128_000,

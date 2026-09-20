@@ -64,7 +64,8 @@ def coordinator(tmp_path, document) -> CacheCoordinator:
     counter = CharacterCounter()
     return CacheCoordinator(
         store=CacheStore(tmp_path / "cache"), source_id=document.source_id,
-        provider="openai", model="m", counter_identity=counter.identity,
+        provider="openai", model="m", ollama_host="",
+        counter_identity=counter.identity,
         counter_exact=counter.exact, context_window_tokens=100,
         behavior={"strategy_config": {"strategy": "direct", "context_window": 100, "max_direct_tokens": None, "max_output_tokens": 1, "safety_margin_tokens": 0}},
     )

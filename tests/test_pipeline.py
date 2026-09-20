@@ -137,7 +137,7 @@ def test_hierarchical_pipeline_runs_offline_with_ollama_defaults_and_explicit_wi
     tmp_path,
 ) -> None:
     provider = PipelineProvider()
-    app_config = AppConfig(provider="ollama", model="qwen3.8")
+    app_config = AppConfig(provider="ollama", model="qwen3.8", ollama_host="http://localhost:11434")
     counter = resolve_token_counter(
         provider=app_config.provider,
         model=app_config.model,

@@ -44,13 +44,13 @@ an object-format version, descriptor, payload kind, payload, and payload digest.
 The descriptor is canonical JSON with sorted keys and UTF-8 encoding.
 
 Every descriptor includes the source and input-content hashes; stage identity;
-prompt and schema versions; provider and model identities; token-counter and
-context identities where behavior depends on them; and every stage behavior
-setting that can affect output (segmentation, strategy, verification, repair,
-and relevant retry-independent generation settings). It excludes credentials,
-hosts or endpoints, filesystem paths, request text, and operational run IDs.
-Changing any included field produces a different key rather than an ambiguous
-reuse.
+prompt and schema versions; provider and model identities; the Ollama host
+URL (redacted of credentials); token-counter and context identities where
+behavior depends on them; and every stage behavior setting that can affect
+output (segmentation, strategy, verification, repair, and relevant
+retry-independent generation settings). It excludes credentials, filesystem
+paths, request text, and operational run IDs. Changing any included field
+produces a different key rather than an ambiguous reuse.
 
 Objects hold only successful, locally validated intermediates: segmentation
 records; direct, leaf, and merge summaries; editorial drafts; and successful
@@ -63,11 +63,13 @@ drains is validated and stored independently.
 Cached summaries and verification data can contain source-derived text. New
 object and manifest files are created with mode `0600` (directories `0700`),
 and the `.gitignore` entry `.summarizer-cache/` covers objects,
-manifests, locks, and temporary files. Descriptor, manifest, and audit
-projections exclude application credentials supplied outside the source, along
-with cache roots, paths, hosts, endpoints, prompts, requests, and raw provider
-errors. Cached source-derived payloads may still contain credential-like source
-text. The cache is not encrypted and must be treated as sensitive local data.
+manifests, locks, and temporary files. The cache descriptor (which never
+leaves the local machine) includes the redacted Ollama host URL so that
+cross-host collisions are impossible. Manifest and audit projections exclude
+application credentials supplied outside the source, along with cache roots,
+paths, hosts, endpoints, prompts, requests, and raw provider errors. Cached
+source-derived payloads may still contain credential-like source text. The
+cache is not encrypted and must be treated as sensitive local data.
 
 ## Validation and atomicity
 
@@ -220,8 +222,8 @@ clock/RNG/sleeper, and fault-injected filesystem calls. Coverage includes:
 
 - canonical keys, sharding, permissions, validation before write, idempotent
   concurrent object writes, and corrupt/incompatible miss reasons;
-- exact descriptor invalidation for source, prompt/schema, model, and behavior
-  configuration changes, with credentials, hosts, and paths absent from keys;
+- exact descriptor invalidation for source, prompt/schema, model, **host**, and behavior
+  configuration changes, with credentials and paths absent from keys;
 - manifest locking, checkpoint recovery, and resume call counts for completed
   direct, leaf, merge, and eligible verification batches;
 - maximum in-flight enforcement, stable request/result ordering, level barriers,
