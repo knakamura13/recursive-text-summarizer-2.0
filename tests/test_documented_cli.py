@@ -54,6 +54,13 @@ def test_help_lists_every_documented_flag() -> None:
         "force hierarchical",
     ):
         assert description in result.stdout
+    for unexpected in (
+        "also runs the legacy chunk workflow",
+        "--chunk-size",
+        "--max-chunks",
+    ):
+        normalized = " ".join(result.stdout.split())
+        assert unexpected not in normalized, f"unexpected help text: {unexpected}"
 
 
 def test_entrypoint_applies_strategy_budget_flags_during_dry_run(
