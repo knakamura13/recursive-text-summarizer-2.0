@@ -1004,3 +1004,118 @@ def test_verify_and_repair_exhaustion_with_persistent_contradiction_fails_closed
         "decomposition",
         "classification",
     ]
+
+def test_verify_and_repair_exhaustion_with_insufficiently_supported_fails_closed() -> None:
+    """Test that exhaustion with insufficiently supported evidence on re-verification fails closed.
+
+    This test covers the exhaustion path where max_repair_passes is exhausted after a repair
+    was triggered by a contradicted claim, but re-verification returns insufficiently_supported.
+    The baseline behavior returns the original draft with failed=True, exhausted=True, and
+    failure_codes=('repair_reverification_failed',).
+
+    Mutation 4 (exhaustion fail-open with insufficiently supported) changes the returned text
+    from draft to repaired, which would cause the mutant to publish an unverified repair.
+    This test catches that regression.
+    """
+    source_text = "The value is 41."
+    draft = "The value is 42."
+    source_hash = hashlib.sha256(draft.encode()).hexdigest()
+
+    def contradicted(pass_index: int, quote: str, *, anchor: str = "42") -> tuple[str, str]:
+        prefix = f"V{pass_index:02d}"
+        return (
+            json.dumps({"spans": [{"span_id": f"{prefix}S000001", "anchors": [anchor]}]}),
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "claim_id": f"{prefix}C000001",
+                            "verdict": "contradicted",
+                            "evidence": [{"segment_id": "S000001", "exact_quote": quote}],
+                        },
+                        {
+                            "claim_id": f"{prefix}C000002",
+                            "verdict": "contradicted",
+                            "evidence": [{"segment_id": "S000001", "exact_quote": quote}],
+                        },
+                    ]
+                }
+            ),
+        )
+
+    def insufficiently_supported(pass_index: int, quote: str, *, anchor: str = "42") -> tuple[str, str]:
+        prefix = f"V{pass_index:02d}"
+        return (
+            json.dumps({"spans": [{"span_id": f"{prefix}S000001", "anchors": [anchor]}]}),
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "claim_id": f"{prefix}C000001",
+                            "verdict": "insufficiently_supported",
+                            "evidence": [{"segment_id": "S000001", "exact_quote": quote}],
+                        },
+                        {
+                            "claim_id": f"{prefix}C000002",
+                            "verdict": "insufficiently_supported",
+                            "evidence": [{"segment_id": "S000001", "exact_quote": quote}],
+                        },
+                    ]
+                }
+            ),
+        )
+
+    def repair_response(span_id: str, original_hash: str, replacement: str) -> str:
+        return json.dumps(
+            {
+                "repairs": [
+                    {
+                        "span_id": span_id,
+                        "original_hash": original_hash,
+                        "action": "replace",
+                        "replacement": replacement,
+                    }
+                ]
+            }
+        )
+
+    class ScriptedProvider:
+        def __init__(self) -> None:
+            self.responses = iter(
+                (
+                    *contradicted(1, "value is 41", anchor="42"),
+                    repair_response(f"V01S000001", source_hash, source_text),
+                    *insufficiently_supported(2, "value is 41", anchor="value is 41"),
+                )
+            )
+
+        def generate(self, request):
+            return GenerationResult(next(self.responses), "scripted", "model")
+
+    result = verify_and_repair(
+        draft,
+        source_id="a" * 64,
+        source_index=build_source_lexical_index(
+            provenance_ids=("S000001",), source={"S000001": source_text}
+        ),
+        runtime=VerificationRuntime(
+            ScriptedProvider(), ConservativeUtf8TokenCounter(), "model", 30, 10_000
+        ),
+        config=VerificationConfig(enabled=True, max_repair_passes=1),
+    )
+
+    # Baseline: fails closed to original draft
+    assert result.text == draft, "Should return original draft, not repaired text"
+    assert result.failed is True
+    assert result.exhausted is True
+    assert result.failure_codes == ("repair_reverification_failed",)
+    assert result.diagnostic_codes == ("repair_reverification_failed",)
+    assert len(result.passes) == 2
+    assert len(result.repairs) == 0, "Repairs should be discarded in exhaustion"
+    assert [item.phase for item in result.phase_generations] == [
+        "decomposition",
+        "classification",
+        "repair",
+        "decomposition",
+        "classification",
+    ]
