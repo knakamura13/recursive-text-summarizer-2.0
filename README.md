@@ -92,34 +92,34 @@ Segmentation prefers headings, paragraphs/lists, and sentences, then uses a toke
 
 Run `python main.py --help` for parser-generated help. The complete options are:
 
-| Option | Default | Purpose |
-| --- | --- | --- |
-| `--input PATH` | `input.txt` | UTF-8 source text or Markdown file. |
-| `--output PATH` | `output.txt` | Final plain-text summary path. |
-| `--provider {openai,ollama}` | `openai` | Provider adapter. |
-| `--model MODEL` | `gpt-4o-mini` | Provider model identifier. |
-| `--ollama-host URL` | `http://localhost:11434` | Ollama service endpoint. |
-| `--timeout SECONDS` | `180` | Per-provider request timeout. |
-| `--max-retries N` | `5` | Maximum attempts for retryable provider failures. |
-| `--strategy {auto,direct,hierarchical}` | `auto` | Execution strategy. |
-| `--context-window TOKENS` | unset | Explicit total context window; otherwise use the model table/assumed value. |
-| `--max-output-tokens TOKENS` | `1024` | Output tokens reserved during budget calculations. |
-| `--safety-margin-tokens TOKENS` | `256` | Fixed budget safety floor. |
-| `--safety-margin-fraction FRACTION` | `0.02` | Fractional safety margin; the larger margin applies. |
-| `--max-direct-tokens TOKENS` | unset | Optional direct-path cap used by `auto`. |
-| `--target-words N` | `300` | Target size for final editorial writing. |
-| `--chunk-tokens TOKENS` | unset | Maximum leaf segment tokens; unset uses measured hierarchical capacity. |
-| `--overlap-tokens TOKENS` | `0` | Context overlap around adjacent segment cores. |
-| `--max-merge-children N` | unset | Optional upper bound on children per merge. |
-| `--verify` | off | Verify final-draft claims against bounded source evidence. |
-| `--max-repair-passes N` | `1` | Maximum verification repair passes (`0` disables repairs while verification remains enabled). |
-| `--citations` | off | Append a deterministic, source-ordered `Sources:` list. |
-| `--audit PATH` | unset | Write validated audit JSON (`audit/2`, `audit/3` with direct-run reliability metadata, or `audit/4` for hierarchical merge grounding). |
-| `--cache-dir PATH` | unset | Opt into the local JSON cache and resumable run manifest. An actual cached run also requires `--run-id` and `--audit`. |
-| `--run-id ID` | unset | Stable identifier required when cache is enabled. |
-| `--resume` | off | Resume the manifest named by `--run-id`; requires `--cache-dir` and `--run-id`. |
-| `--max-concurrency N` | `1` | Maximum in-flight leaf/merge calls; values above `1` require `--cache-dir`; output order remains deterministic. |
-| `--dry-run` | off | Report budget/strategy without provider construction or final-output writes. |
+| Option                                  | Default                  | Purpose                                                                                                                                |
+| --------------------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `--input PATH`                          | `input.txt`              | UTF-8 source text or Markdown file.                                                                                                    |
+| `--output PATH`                         | `output.txt`             | Final plain-text summary path.                                                                                                         |
+| `--provider {openai,ollama}`            | `openai`                 | Provider adapter.                                                                                                                      |
+| `--model MODEL`                         | `gpt-4o-mini`            | Provider model identifier.                                                                                                             |
+| `--ollama-host URL`                     | `http://localhost:11434` | Ollama service endpoint.                                                                                                               |
+| `--timeout SECONDS`                     | `180`                    | Per-provider request timeout.                                                                                                          |
+| `--max-retries N`                       | `5`                      | Maximum attempts for retryable provider failures.                                                                                      |
+| `--strategy {auto,direct,hierarchical}` | `auto`                   | Execution strategy.                                                                                                                    |
+| `--context-window TOKENS`               | unset                    | Explicit total context window; otherwise use the model table/assumed value.                                                            |
+| `--max-output-tokens TOKENS`            | `1024`                   | Output tokens reserved during budget calculations.                                                                                     |
+| `--safety-margin-tokens TOKENS`         | `256`                    | Fixed budget safety floor.                                                                                                             |
+| `--safety-margin-fraction FRACTION`     | `0.02`                   | Fractional safety margin; the larger margin applies.                                                                                   |
+| `--max-direct-tokens TOKENS`            | unset                    | Optional direct-path cap used by `auto`.                                                                                               |
+| `--target-words N`                      | `300`                    | Target size for final editorial writing.                                                                                               |
+| `--chunk-tokens TOKENS`                 | unset                    | Maximum leaf segment tokens; unset uses measured hierarchical capacity.                                                                |
+| `--overlap-tokens TOKENS`               | `0`                      | Context overlap around adjacent segment cores.                                                                                         |
+| `--max-merge-children N`                | unset                    | Optional upper bound on children per merge.                                                                                            |
+| `--verify`                              | off                      | Verify final-draft claims against bounded source evidence.                                                                             |
+| `--max-repair-passes N`                 | `1`                      | Maximum verification repair passes (`0` disables repairs while verification remains enabled).                                          |
+| `--citations`                           | off                      | Append a deterministic, source-ordered `Sources:` list.                                                                                |
+| `--audit PATH`                          | unset                    | Write validated audit JSON (`audit/2`, `audit/3` with direct-run reliability metadata, or `audit/4` for hierarchical merge grounding). |
+| `--cache-dir PATH`                      | unset                    | Opt into the local JSON cache and resumable run manifest. An actual cached run also requires `--run-id` and `--audit`.                 |
+| `--run-id ID`                           | unset                    | Stable identifier required when cache is enabled.                                                                                      |
+| `--resume`                              | off                      | Resume the manifest named by `--run-id`; requires `--cache-dir` and `--run-id`.                                                        |
+| `--max-concurrency N`                   | `1`                      | Maximum in-flight leaf/merge calls; values above `1` require `--cache-dir`; output order remains deterministic.                        |
+| `--dry-run`                             | off                      | Report budget/strategy without provider construction or final-output writes.                                                           |
 
 `--chunk-size` and `--max-chunks` are removed. They are not aliases: the pipeline no longer exposes the old character-chunk and prefix-truncation controls.
 
@@ -210,9 +210,57 @@ Before closing an implementation issue, the merged diff must pass an adversarial
 **Closing comment requirements:**
 
 The closing issue comment must record:
+
 1. The merge evidence (PR number, merge commit SHA).
 2. Which acceptance criteria were verified and how (commands run, files read, tests mutated).
 3. Any findings or limitations discovered during the review.
+
+## Web application
+
+The browser UI lives in `frontend/` and is served by the FastAPI application in `summarizer_web/`.
+
+### Development
+
+```sh
+python -m pip install -r requirements-dev.txt
+cd frontend && pnpm install && cd ..
+./scripts/dev.sh
+```
+
+Vite serves the SPA at `http://127.0.0.1:5173` and proxies `/api` to the backend on port `8000`.
+
+### Production
+
+```sh
+cd frontend && pnpm install && pnpm build && cd ..
+uvicorn summarizer_web.main:app --host 127.0.0.1 --port 8000
+```
+
+### Application data
+
+Private documents, SQLite state, cache, and run artifacts are stored outside the repository. Override the location with:
+
+```sh
+export SUMMARIZER_DATA_DIR="$HOME/.local/share/recursive-text-summarizer"
+```
+
+### Ollama setup for the web UI
+
+The web application uses Ollama only. Install Ollama, start the service, and pull a model before the first run:
+
+```sh
+ollama serve
+ollama pull gemma3:4b
+```
+
+Select the model explicitly in Settings or the Summarize panel. The application does not pull models automatically.
+
+### Supported imports in the web UI
+
+- UTF-8 `.txt` and `.md`
+- `.pdf` with bounded extraction (50 MiB, 2,000 pages, 120-second timeout)
+
+PDF imports require preview acceptance before summarization. Encrypted or textless PDFs are rejected.
 
 ## Limitations
 
