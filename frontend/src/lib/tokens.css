@@ -1,0 +1,55 @@
+:root {
+	--color-bg: #ffffff;
+	--color-surface: #f8f8f7;
+	--color-surface-elevated: #ffffff;
+	--color-border: #e4e4e2;
+	--color-border-strong: #d0d0cd;
+
+	--color-text: #2b2b28;
+	--color-text-muted: #6b6b66;
+	--color-text-subtle: #8a8a84;
+
+	--color-sage: #5a7d5c;
+	--color-sage-soft: #e8f0e9;
+	--color-sage-border: #b8d4ba;
+
+	--color-amber: #c9922e;
+	--color-amber-soft: #fdf6e8;
+	--color-amber-border: #e8c878;
+
+	--color-danger: #b44a3a;
+	--color-danger-soft: #fceeed;
+
+	--color-focus: #4a6fa5;
+
+	--sidebar-left-width: 280px;
+	--sidebar-right-width: 320px;
+
+	--font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+	--font-mono: 'SF Mono', ui-monospace, Menlo, Monaco, Consolas, monospace;
+
+	--radius-sm: 6px;
+	--radius-md: 10px;
+	--radius-lg: 14px;
+
+	--shadow-sm: 0 1px 2px rgba(43, 43, 40, 0.06);
+	--shadow-md: 0 4px 12px rgba(43, 43, 40, 0.08);
+
+	--space-1: 0.25rem;
+	--space-2: 0.5rem;
+	--space-3: 0.75rem;
+	--space-4: 1rem;
+	--space-5: 1.25rem;
+	--space-6: 1.5rem;
+	--space-8: 2rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
+	}
+}
