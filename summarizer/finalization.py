@@ -290,6 +290,7 @@ def _finalize_summary(
     segments: Sequence[SourceSegment],
     nodes: Sequence[TreeNode],
     root_node_id: str,
+    max_output_tokens: int | None = None,
     include_citations: bool = False,
     audit_configuration: Mapping[str, object] | None = None,
     audit_path: Path | None = None,
@@ -319,6 +320,7 @@ def _finalize_summary(
         model=model,
         timeout_seconds=timeout_seconds,
         target_words=target_words,
+        max_output_tokens=max_output_tokens,
     )
     verification_result: VerificationResult | None = None
     if verification.enabled:
@@ -409,6 +411,7 @@ def finalize_summary(
     segments: Sequence[SourceSegment],
     nodes: Sequence[TreeNode],
     root_node_id: str,
+    max_output_tokens: int | None = None,
     include_citations: bool = False,
     audit_configuration: Mapping[str, object] | None = None,
     audit_path: Path | None = None,
@@ -436,6 +439,7 @@ def finalize_summary(
         segments=segments,
         nodes=nodes,
         root_node_id=root_node_id,
+        max_output_tokens=max_output_tokens,
         include_citations=include_citations,
         audit_configuration=audit_configuration,
         audit_path=audit_path,

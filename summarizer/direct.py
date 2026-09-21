@@ -60,6 +60,7 @@ def summarize_direct(
     *,
     model: str,
     timeout_seconds: float,
+    max_output_tokens: int | None = None,
     coordinator: CacheCoordinator | None = None,
 ) -> SummaryNode:
     """Summarize a whole document in a single call.
@@ -71,7 +72,10 @@ def summarize_direct(
     """
     segment = whole_document_segment(document, counter)
     request = build_leaf_request(
-        segment, model=model, timeout_seconds=timeout_seconds
+        segment,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        max_output_tokens=max_output_tokens,
     )
     if coordinator is None:
         result = provider.generate(request)
@@ -90,6 +94,7 @@ def summarize_direct(
             "instructions": request.instructions,
             "input_text": request.input_text,
             "schema": request.response_schema,
+            "max_output_tokens": request.max_output_tokens,
         },
         behavior={},
         decode=decode,

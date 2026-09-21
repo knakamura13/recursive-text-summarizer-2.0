@@ -14,7 +14,8 @@ from summarizer.summaries import (
     MAX_QUOTATIONS_PER_NODE,
     MAX_QUOTE_CHARS,
     SummaryNode,
-    leaf_summary_schema,
+    quote_candidates,
+    summary_schema,
 )
 
 
@@ -24,7 +25,7 @@ class LeafSummaryError(ValueError):
 
 # Identifies the prompt wording for cache keys and audit artifacts. Bump it
 # whenever a change could alter a model's output for identical input.
-LEAF_PROMPT_VERSION = "leaf-prompt/3"
+LEAF_PROMPT_VERSION = "leaf-prompt/4"
 
 LEAF_SCHEMA_NAME = "leaf_summary"
 
@@ -47,18 +48,22 @@ not write commentary before or after it.
 
 Follow these rules:
 
+- Write a nonempty summary of the {noun}.
 - Summarize only what the {noun} states. Do not add outside knowledge and do \
 not infer beyond it.
-- Record each substantive point as a content unit, together with the evidence \
-supporting it.
-- Cite evidence with the identifier {segment_id} and no other value. It is the \
-only identifier valid for this request.
-- Copy a quotation character for character from the {noun}. Keep each quotation \
-under {max_quote_chars} characters, and provide no more than {max_quotations} \
-salient quotations in total. Leave quotations empty rather than paraphrasing \
-into them.
+- Record each substantive point as a content unit. Every content unit must have \
+at least one evidence item. In every evidence item, segment_id must be exactly \
+{segment_id}; never use an empty string or any other value. Set provenance to \
+["{segment_id}"].
+- Copy any quotation character for character from the {noun}. Every quote must \
+be one of the values the schema allows, or null when none of them fits. Set \
+quote to null, never an empty string, whenever you are unsure that the text is \
+exact. Keep each quotation under {max_quote_chars} characters, and provide no \
+more than {max_quotations} salient quotations in total. Never paraphrase into \
+a quote.
 - Record qualifications, and mark a content unit uncertain, wherever the \
-{noun} hedges. Leave contradictions empty when the {noun} states none.
+{noun} hedges. Set qualification to null when a content unit has none. Leave \
+contradictions as an empty array when the {noun} states none.
 - Use a level of 0.
 
 The {noun} is delimited by these markers:
@@ -128,6 +133,7 @@ def build_leaf_request(
     *,
     model: str,
     timeout_seconds: float,
+    max_output_tokens: int | None = None,
 ) -> GenerationRequest:
     """Build the request that turns one segment into a structured leaf.
 
@@ -164,14 +170,19 @@ def build_leaf_request(
             core_end=core_end,
         )
 
+    candidates = quote_candidates((core_text(segment),))
     return GenerationRequest(
         model=model,
         instructions=instructions,
         input_text=f"{begin}\n{body}\n{end}",
         timeout_seconds=timeout_seconds,
         operation_id=segment.segment_id,
-        response_schema=leaf_summary_schema(),
+        response_schema=summary_schema(candidates=candidates),
         schema_name=LEAF_SCHEMA_NAME,
+        quote_candidates_by_segment={segment.segment_id: candidates},
+        expected_summary_level=0,
+        allowed_summary_segment_ids=(segment.segment_id,),
+        max_output_tokens=max_output_tokens,
     )
 
 
@@ -410,6 +421,7 @@ def summarize_segments(
     *,
     model: str,
     timeout_seconds: float,
+    max_output_tokens: int | None = None,
     coordinator: CacheCoordinator | None = None,
 ) -> tuple[SummaryNode, ...]:
     """Summarize every segment into a validated leaf record, in source order.
@@ -433,12 +445,17 @@ def summarize_segments(
     if coordinator is not None and coordinator.session is not None:
         prepared = []
         for segment in sorted(segments, key=lambda candidate: candidate.order):
-            request = build_leaf_request(segment, model=model, timeout_seconds=timeout_seconds)
+            request = build_leaf_request(
+                segment,
+                model=model,
+                timeout_seconds=timeout_seconds,
+                max_output_tokens=max_output_tokens,
+            )
             def decode(payload: object, segment: SourceSegment = segment) -> SummaryNode:
                 node = SummaryNode.model_validate(payload)
                 validate_provenance(node, legal={segment.segment_id: core_text(segment)}, subject=segment.segment_id)
                 return node
-            descriptor = coordinator.descriptor_for(stage="leaf", work_id=segment.segment_id, prompt_version=LEAF_PROMPT_VERSION, schema_version=LEAF_SCHEMA_VERSION, input_value={"instructions": request.instructions, "input_text": request.input_text, "schema": request.response_schema}, behavior={})
+            descriptor = coordinator.descriptor_for(stage="leaf", work_id=segment.segment_id, prompt_version=LEAF_PROMPT_VERSION, schema_version=LEAF_SCHEMA_VERSION, input_value={"instructions": request.instructions, "input_text": request.input_text, "schema": request.response_schema, "max_output_tokens": request.max_output_tokens}, behavior={})
             prepared.append((segment, request, descriptor, decode))
         hit_by_id = coordinator.reusable_batch(
             work_ids=tuple(item[0].segment_id for item in prepared),
@@ -458,7 +475,10 @@ def summarize_segments(
         return tuple(item[3](values[item[0].segment_id]) for item in prepared)
     for segment in sorted(segments, key=lambda candidate: candidate.order):
         request = build_leaf_request(
-            segment, model=model, timeout_seconds=timeout_seconds
+            segment,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            max_output_tokens=max_output_tokens,
         )
         def decode(payload: object, segment: SourceSegment = segment) -> SummaryNode:
             node = SummaryNode.model_validate(payload)
@@ -481,6 +501,7 @@ def summarize_segments(
                         "instructions": request.instructions,
                         "input_text": request.input_text,
                         "schema": request.response_schema,
+                        "max_output_tokens": request.max_output_tokens,
                     },
                     behavior={},
                     decode=decode,

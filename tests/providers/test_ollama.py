@@ -1,6 +1,7 @@
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
@@ -18,6 +19,11 @@ from summarizer.providers.base import (
     ProviderTimeoutError,
 )
 from summarizer.providers.ollama import OllamaProvider
+from summarizer.summaries import (
+    MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES,
+    leaf_summary_schema,
+    summary_schema,
+)
 
 REQUEST = GenerationRequest(
     model="gemma3:4b",
@@ -28,9 +34,26 @@ REQUEST = GenerationRequest(
 
 
 class FakeClient:
-    def __init__(self, outcome: object) -> None:
+    def __init__(
+        self,
+        outcome: object,
+        modelinfo: dict[str, object] | None = None,
+        show_error: BaseException | None = None,
+    ) -> None:
         self.outcome = outcome
+        self.modelinfo = modelinfo or {
+            "general.architecture": "gemma3",
+            "gemma3.context_length": 131_072,
+        }
+        self.show_error = show_error
         self.calls: list[dict[str, object]] = []
+        self.show_calls: list[str] = []
+
+    def show(self, model: str) -> SimpleNamespace:
+        self.show_calls.append(model)
+        if self.show_error is not None:
+            raise self.show_error
+        return SimpleNamespace(modelinfo=self.modelinfo)
 
     def chat(self, **kwargs: object) -> object:
         self.calls.append(kwargs)
@@ -93,6 +116,77 @@ def test_adapts_native_chat_request_and_response_lazily() -> None:
 
     provider.generate(REQUEST)
     assert len(constructions) == 1
+
+
+
+def test_configures_and_enforces_discovered_context_window() -> None:
+    client = FakeClient(response())
+    provider = OllamaProvider(client_factory=lambda **_kwargs: client)
+
+    selected = provider.configure_context_window(
+        REQUEST.model,
+        None,
+        timeout_seconds=REQUEST.timeout_seconds,
+    )
+    provider.generate(REQUEST)
+
+    assert selected == 32_768
+    assert client.show_calls == [REQUEST.model]
+    assert client.calls[0]["options"] == {"num_ctx": 32_768}
+
+
+def test_forwards_output_token_limit_with_context_window() -> None:
+    client = FakeClient(response())
+    provider = OllamaProvider(client_factory=lambda **_kwargs: client)
+    provider.configure_context_window(REQUEST.model, 32_768, timeout_seconds=42)
+
+    provider.generate(replace(REQUEST, max_output_tokens=321))
+
+    assert client.calls[0]["options"] == {"num_ctx": 32_768, "num_predict": 321}
+
+
+def test_reports_a_response_cut_off_at_the_output_limit() -> None:
+    client = FakeClient(response(done_reason="length"))
+    provider = OllamaProvider(client_factory=lambda **_kwargs: client)
+
+    with pytest.raises(ProviderResponseError, match="output token limit of 321"):
+        provider.generate(replace(REQUEST, max_output_tokens=321))
+
+
+def test_rejects_context_larger_than_model_architecture() -> None:
+    client = FakeClient(
+        response(),
+        modelinfo={
+            "general.architecture": "tiny",
+            "tiny.context_length": 8_192,
+        },
+    )
+    provider = OllamaProvider(client_factory=lambda **_kwargs: client)
+
+    with pytest.raises(ProviderRequestError, match="exceeds the model maximum"):
+        provider.configure_context_window(
+            REQUEST.model,
+            16_384,
+            timeout_seconds=REQUEST.timeout_seconds,
+        )
+
+
+
+def test_sanitizes_malformed_model_metadata() -> None:
+    client = FakeClient(
+        response(),
+        show_error=json.JSONDecodeError("secret response body", "secret", 0),
+    )
+    provider = OllamaProvider(client_factory=lambda **_kwargs: client)
+
+    with pytest.raises(ProviderResponseError) as error:
+        provider.configure_context_window(
+            REQUEST.model,
+            None,
+            timeout_seconds=REQUEST.timeout_seconds,
+        )
+
+    assert str(error.value) == "Ollama returned malformed model metadata"
 
 
 def test_uses_a_client_with_each_distinct_request_timeout() -> None:
@@ -291,6 +385,135 @@ def test_omits_format_when_no_schema_is_requested() -> None:
     _provider_for(client).generate(REQUEST)
 
     assert "format" not in client.calls[0]
+
+
+def test_strengthens_summary_schema_for_local_constrained_decoding() -> None:
+    schema = leaf_summary_schema()
+    request = GenerationRequest(
+        model="gemma3:4b",
+        instructions="Summarize accurately.",
+        input_text="Source material",
+        timeout_seconds=42,
+        operation_id="S000001",
+        response_schema=schema,
+        schema_name="leaf_summary",
+        quote_candidates_by_segment={"S000001": ("quote from one",)},
+        expected_summary_level=0,
+        allowed_summary_segment_ids=("S000001",),
+    )
+    client = FakeClient(response(message=SimpleNamespace(content="{}")))
+
+    _provider_for(client).generate(request)
+
+    emitted = client.calls[0]["format"]
+    assert isinstance(emitted, dict)
+    definitions = emitted["$defs"]
+    pair_variants = definitions["EvidenceItem"]["anyOf"]
+    assert all(
+        variant["required"] == ["segment_id", "quote"]
+        and variant["additionalProperties"] is False
+        for variant in pair_variants
+    )
+    assert pair_variants[0]["properties"] == {
+        "segment_id": {
+            "type": "string",
+            "minLength": 1,
+            "enum": ["S000001"],
+        },
+        "quote": {"type": "null"},
+    }
+    constrained_pairs = {
+        variant["properties"]["quote"]["enum"][0]: variant["properties"][
+            "segment_id"
+        ]["enum"]
+        for variant in pair_variants[1:]
+    }
+    assert constrained_pairs == {"quote from one": ["S000001"]}
+    assert emitted["properties"]["level"]["enum"] == [0]
+    assert emitted["properties"]["provenance"]["items"]["enum"] == ["S000001"]
+    assert emitted["properties"]["quotations"]["maxItems"] == 5
+    assert definitions["ContentUnit"]["properties"]["evidence"]["minItems"] == 1
+    assert emitted["properties"]["summary"]["minLength"] == 1
+    base_bytes = len(json.dumps(schema, separators=(",", ":"), sort_keys=True))
+    emitted_bytes = len(json.dumps(emitted, separators=(",", ":"), sort_keys=True))
+    assert emitted_bytes - base_bytes <= MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
+    assert schema == leaf_summary_schema()
+
+
+def test_constrains_each_merge_quote_to_its_source_segment() -> None:
+    quotes = ("quote from one", "quote from two")
+    request = GenerationRequest(
+        model="gemma3:4b",
+        instructions="Summarize accurately.",
+        input_text="Source material",
+        timeout_seconds=42,
+        response_schema=summary_schema(candidates=quotes),
+        schema_name="merged_summary",
+        quote_candidates_by_segment={
+            "S000001": (quotes[0],),
+            "S000002": (quotes[1],),
+        },
+        expected_summary_level=1,
+        allowed_summary_segment_ids=("S000001", "S000002"),
+    )
+    client = FakeClient(response(message=SimpleNamespace(content="{}")))
+
+    _provider_for(client).generate(request)
+
+    emitted = client.calls[0]["format"]
+    variants = emitted["$defs"]["EvidenceItem"]["anyOf"]
+    constrained_pairs = {
+        variant["properties"]["quote"]["enum"][0]: variant["properties"][
+            "segment_id"
+        ]["enum"]
+        for variant in variants[1:]
+    }
+    assert constrained_pairs == {
+        "quote from one": ["S000001"],
+        "quote from two": ["S000002"],
+    }
+    assert variants[0]["properties"]["segment_id"]["enum"] == [
+        "S000001",
+        "S000002",
+    ]
+    assert emitted["properties"]["provenance"]["items"]["enum"] == [
+        "S000001",
+        "S000002",
+    ]
+    assert emitted["properties"]["level"]["enum"] == [1]
+
+
+def test_bounds_pair_schema_when_a_quote_repeats_across_many_sources() -> None:
+    quote = "A repeated exact quotation."
+    schema = summary_schema(candidates=(quote,))
+    source_count = 10_000
+    request = GenerationRequest(
+        model="gemma3:4b",
+        instructions="Summarize accurately.",
+        input_text="Source material",
+        timeout_seconds=42,
+        response_schema=schema,
+        schema_name="merged_summary",
+        quote_candidates_by_segment={
+            f"S{index:06}": (quote,) for index in range(source_count)
+        },
+        allowed_summary_segment_ids=tuple(
+            f"S{index:06}" for index in range(source_count)
+        ),
+    )
+    client = FakeClient(response(message=SimpleNamespace(content="{}")))
+
+    _provider_for(client).generate(request)
+
+    emitted = client.calls[0]["format"]
+    emitted_bytes = len(json.dumps(emitted, separators=(",", ":"), sort_keys=True))
+    base_bytes = len(json.dumps(schema, separators=(",", ":"), sort_keys=True))
+    variants = emitted["$defs"]["EvidenceItem"]["anyOf"]
+    represented_sources = variants[0]["properties"]["segment_id"]["enum"]
+    provenance_sources = emitted["properties"]["provenance"]["items"]["enum"]
+    assert emitted_bytes - base_bytes <= MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
+    assert represented_sources == provenance_sources
+    assert 0 < len(represented_sources) < source_count
 
 
 def test_passes_a_requested_schema_as_the_native_format_argument() -> None:

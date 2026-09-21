@@ -49,13 +49,25 @@ def test_overhead_is_measured_not_assumed() -> None:
     character length of what is sent, so this fails if the schema or the
     instruction template stops being measured at all.
     """
-    from summarizer.summaries import leaf_summary_schema
+    from summarizer.summaries import (
+        MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES,
+        MAX_QUOTE_CANDIDATE_JSON_BYTES,
+        leaf_summary_schema,
+    )
     import json
 
-    overhead = measure_overhead(CharacterCounter(), with_overlap=False)
+    overhead = measure_overhead(
+        CharacterCounter(),
+        with_overlap=False,
+        provider_schema_reserve=MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES,
+    )
     schema_chars = len(json.dumps(leaf_summary_schema(), separators=(",", ":")))
 
-    assert overhead.schema == schema_chars
+    assert overhead.schema == (
+        schema_chars
+        + MAX_QUOTE_CANDIDATE_JSON_BYTES
+        + MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
+    )
 
 
 def test_overhead_with_a_real_encoding_matches_the_measured_scale() -> None:
@@ -66,6 +78,7 @@ def test_overhead_with_a_real_encoding_matches_the_measured_scale() -> None:
     """
     import tiktoken
 
+    from summarizer.summaries import MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
     from summarizer.tokenization import TiktokenCounter
 
     try:
@@ -74,18 +87,19 @@ def test_overhead_with_a_real_encoding_matches_the_measured_scale() -> None:
         pytest.skip(f"tiktoken vocabulary is unavailable offline: {error}")
 
     overhead = measure_overhead(
-        TiktokenCounter.for_model("gpt-4o-mini"), with_overlap=False
+        TiktokenCounter.for_model("gpt-4o-mini"),
+        with_overlap=False,
+        provider_schema_reserve=MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES,
     )
 
     # Pinned exactly rather than banded: a band this wide would not notice the
     # prompt or the record changing, which is the thing worth noticing.
     assert (overhead.instructions, overhead.schema, overhead.fencing) == (
-        270,
-        610,
-        25,
+        345,
+        1_890,
+        27,
     )
-    assert overhead.total == 905
-
+    assert overhead.total == 2_262
 
 def test_safety_margin_takes_the_larger_term() -> None:
     config = StrategyConfig(safety_margin_tokens=256, safety_margin_fraction=0.02)
