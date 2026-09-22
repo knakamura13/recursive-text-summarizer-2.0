@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -1429,17 +1430,30 @@ def serialize_audit(artifact: AuditArtifactV2 | AuditArtifactV3 | AuditArtifactV
     return encoded
 
 
+def _atomic_replace(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+
+
 def write_audit(path: Path, artifact: AuditArtifact) -> None:
     """Atomically replace an artifact only after canonical validation succeeds."""
     payload = serialize_audit(artifact)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(
-        dir=path.parent, prefix=f".{path.name}.", delete=False
-    ) as handle:
-        temporary = Path(handle.name)
-        try:
-            handle.write(payload)
-        except OSError:
-            temporary.unlink(missing_ok=True)
-            raise
-    temporary.replace(path)
+    _atomic_replace(path, payload)

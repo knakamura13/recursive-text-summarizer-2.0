@@ -167,7 +167,11 @@ def test_hierarchical_pipeline_runs_offline_with_ollama_defaults_and_explicit_wi
 
 def test_ollama_merge_uses_request_budget_not_leaf_capacity() -> None:
     counter = CharacterCounter()
-    app_config = AppConfig(provider="ollama", model="qwen3.5:9b")
+    app_config = AppConfig(
+        provider="ollama",
+        model="qwen3.5:9b",
+        ollama_host="http://localhost:11434",
+    )
     strategy = StrategyConfig(strategy="hierarchical", context_window=10_000)
     provider = GroundedPipelineProvider()
 

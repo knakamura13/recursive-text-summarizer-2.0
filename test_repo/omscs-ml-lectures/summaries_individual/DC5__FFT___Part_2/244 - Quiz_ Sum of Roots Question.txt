@@ -1,1 +1,0 @@
-The sum of nth roots of unity, for even n, equals zero. This covers summing omega_n^0, omega_n^1, ... up to omega_n^(n-1).

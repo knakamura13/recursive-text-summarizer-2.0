@@ -1,1 +1,0 @@
-Input: undirected graph and goal g. Output: independent set S (size ≥ g) if possible, else NO. The problem is a search problem in NP class. Independent set problem is NP-complete.

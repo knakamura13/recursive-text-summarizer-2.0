@@ -328,6 +328,10 @@ def test_budget_flags_reach_the_strategy_config() -> None:
 
 def test_ollama_uses_offline_conservative_counter() -> None:
     counter = cli.build_counter(
-        AppConfig(provider="ollama", model="unknown-local-model")
+        AppConfig(
+            provider="ollama",
+            model="unknown-local-model",
+            ollama_host="http://localhost:11434",
+        )
     )
     assert counter.identity == "estimate:utf8-bytes"

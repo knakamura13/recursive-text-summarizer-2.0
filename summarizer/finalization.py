@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import threading
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
 from summarizer.audit import (
+    _atomic_replace,
     AuditArtifact,
     Citation,
     build_audit_artifact,
@@ -65,29 +64,6 @@ class PublicationError(RuntimeError):
 
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
-
-
-def _atomic_replace(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with NamedTemporaryFile(
-            dir=path.parent, prefix=f".{path.name}.", delete=False
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    except OSError:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-        raise
 
 
 def _path_key(summary_path: Path, audit_path: Path) -> tuple[str, str]:

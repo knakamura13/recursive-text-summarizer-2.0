@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 from dataclasses import replace
 
 import pytest
@@ -95,6 +97,41 @@ def test_audit_is_canonical_redacted_and_contains_only_segment_metadata(tmp_path
     path = tmp_path / "audit.json"
     write_audit(path, artifact)
     assert path.read_bytes() == first
+
+
+def test_write_audit_syncs_file_and_parent_before_returning(
+    tmp_path, monkeypatch
+) -> None:
+    document, segment, node, citations = fixture()
+    artifact = build_audit_artifact(
+        source_id=document.source_id,
+        strategy="direct",
+        model="m",
+        configuration={"app": {"provider": "openai", "model": "m"}},
+        segments=(segment,),
+        nodes=(node,),
+        root_node_id=node.node_id,
+        citations=citations,
+    )
+    expected = serialize_audit(artifact)
+    syncs: list[str] = []
+
+    def record_sync(fd: int) -> None:
+        mode = os.fstat(fd).st_mode
+        if stat.S_ISREG(mode):
+            syncs.append("file")
+        elif stat.S_ISDIR(mode):
+            syncs.append("directory")
+        else:
+            pytest.fail(f"unexpected fd type for fsync: {mode:o}")
+
+    monkeypatch.setattr(os, "fsync", record_sync)
+
+    path = tmp_path / "audit.json"
+    write_audit(path, artifact)
+
+    assert path.read_bytes() == expected
+    assert syncs == ["file", "directory"]
 
 
 @pytest.mark.parametrize(
