@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import os
+import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -17,6 +19,7 @@ from summarizer.finalization import (
     publish_final_output,
     read_published_summary,
 )
+from summarizer import finalization
 from summarizer.hierarchy import TreeNode
 from summarizer.ingestion import ingest_text
 from summarizer.summaries import SummaryNode
@@ -102,6 +105,29 @@ def test_publication_writes_audit_first_before_summary(tmp_path: Path) -> None:
         read_published_summary(summary_path, audit_path, session.manifest)
         == "Final summary text."
     )
+
+
+def test_atomic_replace_flushes_and_syncs_file_and_parent_before_returning(
+    tmp_path: Path, monkeypatch
+) -> None:
+    syncs: list[str] = []
+
+    def record_sync(fd: int) -> None:
+        mode = os.fstat(fd).st_mode
+        if stat.S_ISREG(mode):
+            syncs.append("file")
+        elif stat.S_ISDIR(mode):
+            syncs.append("directory")
+        else:
+            pytest.fail(f"unexpected fd type for fsync: {mode:o}")
+
+    monkeypatch.setattr(os, "fsync", record_sync)
+
+    path = tmp_path / "output.txt"
+    finalization._atomic_replace(path, b"payload")
+
+    assert path.read_bytes() == b"payload"
+    assert syncs == ["file", "directory"]
 
 
 def test_publication_rejects_unreliable_audit_v4(tmp_path: Path) -> None:
