@@ -26,17 +26,54 @@ def test_resolves_a_known_model_family_by_prefix() -> None:
 @pytest.mark.parametrize(
     ("model", "expected_tokens"),
     [
-        ("gpt-4-0613", 8_192),
-        ("gpt-4-32k-0613", 32_768),
+        ("gpt-4", 8_192),
+        ("gpt-4-32k", 32_768),
+        ("gpt-3.5-turbo", 16_385),
     ],
 )
-def test_resolves_dated_gpt_4_snapshots_by_family(
+def test_resolves_exact_model_table_entries(
     model: str,
     expected_tokens: int,
 ) -> None:
     window = resolve_context_window(provider="openai", model=model)
 
     assert window == ContextWindow(tokens=expected_tokens, assumed=False)
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_tokens"),
+    [
+        ("gpt-4-0613", 8_192),
+        ("gpt-4-32k-0613", 32_768),
+        ("gpt-4o", 128_000),
+        ("gpt-4o-2024-05-13", 128_000),
+        ("gpt-4o-mini", 128_000),
+        ("gpt-4o-mini-2024-07-18", 128_000),
+        ("gpt-4-turbo", 128_000),
+        ("gpt-4.1", 1_047_576),
+        ("gpt-5", 400_000),
+        ("o1", 200_000),
+        ("o1-preview", 200_000),
+        ("o1-mini", 128_000),
+        ("o1-mini-2024-09-12", 128_000),
+        ("o3", 200_000),
+        ("o3-mini", 200_000),
+        ("o4", 200_000),
+    ],
+)
+def test_resolves_model_prefix_families(
+    model: str,
+    expected_tokens: int,
+) -> None:
+    window = resolve_context_window(provider="openai", model=model)
+
+    assert window == ContextWindow(tokens=expected_tokens, assumed=False)
+
+
+def test_resolves_context_window_with_untrimmed_whitespace() -> None:
+    window = resolve_context_window(provider=" OPENAI ", model="  gpt-4  ")
+
+    assert window == ContextWindow(tokens=8_192, assumed=False)
 
 
 def test_does_not_prefix_match_gpt_3_5_turbo_snapshots() -> None:
