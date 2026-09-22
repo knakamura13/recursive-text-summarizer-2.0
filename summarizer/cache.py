@@ -17,6 +17,8 @@ import secrets
 import stat
 from typing import TypeVar
 
+from summarizer.safety import redact_text
+
 
 CACHE_FORMAT_VERSION = "cache/1"
 _PROJECTION_FORMAT_VERSION = "cache-projection/1"
@@ -34,6 +36,7 @@ _MODEL = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._/-]*)?$"
 )
 _HOST_PORT = re.compile(r"^[A-Za-z0-9.-]+:[0-9]{2,5}$")
+_HOST_URL = re.compile(r"^[a-z][a-z0-9+.-]*://[A-Za-z0-9.-]+(:[0-9]{2,5})?$")
 _CREDENTIAL_TOKEN = re.compile(
     r"^(?:gh[opsu]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
     r"sk-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{12,}|AKIA[A-Z0-9]{12,}|"
@@ -232,13 +235,13 @@ class CacheDescriptor:
     prompt_version: str
     schema_version: str
     provider: str
+    ollama_host: str
     model: str
     counter_identity: str
     counter_exact: bool
     context_window_tokens: int
     behavior: Mapping[str, object]
     _behavior_bytes: bytes = field(init=False, repr=False, compare=False)
-
     def __post_init__(self) -> None:
         if self.stage not in _STAGES:
             raise ValueError("unsafe descriptor stage")
@@ -250,6 +253,17 @@ class CacheDescriptor:
             raise ValueError("unsafe descriptor schema_version")
         if self.provider not in _PROVIDERS:
             raise ValueError("unsafe descriptor provider")
+        if self.provider == "ollama":
+            if not self.ollama_host.strip():
+                raise ValueError("ollama_host must not be empty for ollama provider")
+            redacted = redact_text(self.ollama_host)
+            if redacted != self.ollama_host:
+                raise ValueError("ollama_host must not contain credentials")
+            if not _HOST_URL.fullmatch(self.ollama_host):
+                raise ValueError("ollama_host must be a valid URL without credentials")
+        else:
+            if self.ollama_host:
+                raise ValueError("ollama_host must be empty for non-ollama providers")
         if not _is_safe_model(self.model):
             raise ValueError("unsafe descriptor model")
         if _COUNTER.fullmatch(self.counter_identity) is None:
@@ -276,6 +290,7 @@ class CacheDescriptor:
             "counter_identity": self.counter_identity,
             "input_hash": self.input_hash,
             "model": self.model,
+            "ollama_host": self.ollama_host,
             "prompt_version": self.prompt_version,
             "provider": self.provider,
             "schema_version": self.schema_version,
@@ -302,7 +317,11 @@ def _descriptor_invalidation_reasons(
         reasons.append("prompt_changed")
     if previous.schema_version != current.schema_version:
         reasons.append("schema_changed")
-    if (previous.provider, previous.model) != (current.provider, current.model):
+    if (previous.provider, previous.model, previous.ollama_host) != (
+        current.provider,
+        current.model,
+        current.ollama_host,
+    ):
         reasons.append("model_changed")
     behavior_changed = (
         previous.counter_identity != current.counter_identity

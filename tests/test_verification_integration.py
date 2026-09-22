@@ -155,6 +155,7 @@ def _verify_with_global_cache(
             source_id=source_id,
             provider="openai",
             model="verifier-model",
+            ollama_host="",
             counter_identity="test:characters",
             counter_exact=True,
             context_window_tokens=100_000,
@@ -302,6 +303,7 @@ def test_provider_cache_coordinator_attribute_cannot_enable_verification_caching
             source_id=source_id,
             provider="openai",
             model="verifier-model",
+            ollama_host="",
             counter_identity="test:characters",
             counter_exact=True,
             context_window_tokens=100_000,
@@ -558,7 +560,7 @@ def test_injected_verifier_runtime_reuses_its_own_cached_terminal_result(tmp_pat
         document,
         first_summary,
         CharacterCounter(),
-        app=app(),
+        app=AppConfig(provider="ollama", model="gpt-4o-mini", timeout_seconds=30, ollama_host="http://localhost:11434"),
         strategy=strategy(),
         config=PipelineConfig(**{**config.__dict__, "verification_runtime": runtime}),
     )
@@ -602,7 +604,7 @@ def test_injected_verifier_runtime_reuses_its_own_cached_terminal_result(tmp_pat
         document,
         resumed_summary,
         CharacterCounter(),
-        app=app(),
+        app=AppConfig(provider="ollama", model="gpt-4o-mini", timeout_seconds=30, ollama_host="http://localhost:11434"),
         strategy=strategy(),
         config=PipelineConfig(
             **{

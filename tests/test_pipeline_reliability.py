@@ -522,6 +522,7 @@ def test_cache_coordinator_returns_the_locked_first_writer_payload_for_concurren
             source_id=document.source_id,
             provider="openai",
             model="gpt-4o-mini",
+            ollama_host="",
             counter_identity="test:characters",
             counter_exact=True,
             context_window_tokens=100_000,

@@ -24,7 +24,7 @@ def test_configuration_defaults_are_legacy_compatible() -> None:
     assert app.output_path == Path("output.txt")
     assert app.model == "gpt-4o-mini"
     assert app.provider == "openai"
-    assert app.ollama_host == "http://localhost:11434"
+    assert app.ollama_host == ""
     assert app.timeout_seconds == 180
     assert cache.enabled is False
     assert cache.root == Path(".summarizer-cache")
@@ -74,7 +74,7 @@ def test_cache_configuration_rejects_a_symlinked_final_root(tmp_path: Path) -> N
     [
         (lambda: AppConfig(model=" "), "model"),
         (lambda: AppConfig(provider="other"), "provider"),
-        (lambda: AppConfig(ollama_host=" "), "ollama_host"),
+        (lambda: AppConfig(provider="ollama", ollama_host=" "), "ollama_host"),
         (lambda: AppConfig(input_path=Path("")), "input_path"),
         (lambda: AppConfig(output_path=Path("")), "output_path"),
         (
