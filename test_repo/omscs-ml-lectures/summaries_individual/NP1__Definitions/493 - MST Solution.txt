@@ -1,1 +1,0 @@
-Minimum Spanning Tree (MST) problem classified as NP (nondeterministic polynomial time) and also in P (polynomial time).

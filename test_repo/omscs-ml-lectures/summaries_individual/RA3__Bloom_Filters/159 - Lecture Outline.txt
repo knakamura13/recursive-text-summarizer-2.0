@@ -1,1 +1,0 @@
-Traditional hashing description complete, focus shifts to bloom filters.
