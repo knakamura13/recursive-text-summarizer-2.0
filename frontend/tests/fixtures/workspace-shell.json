@@ -1,0 +1,51 @@
+{
+  "document": {
+    "document_id": "doc-attention",
+    "title": "Attention Is All You Need",
+    "filename": "attention.pdf",
+    "format": "pdf",
+    "size_bytes": 15728640,
+    "import_state": "ready",
+    "latest_run_state": "running",
+    "page_count": 36
+  },
+  "stages": [
+    { "stage": "Parse", "state": "completed", "completed": 36, "total": 36 },
+    { "stage": "Segment", "state": "completed", "completed": 128, "total": 128 },
+    { "stage": "Summarize", "state": "active", "completed": 54, "total": 128 },
+    { "stage": "Verify", "state": "pending", "completed": null, "total": null }
+  ],
+  "selectedNodeId": "node-3-2",
+  "hierarchy": [
+    {
+      "node_id": "root",
+      "parent_id": null,
+      "level": 0,
+      "order": 0,
+      "label": "Full document",
+      "provisional": false,
+      "state": "completed"
+    },
+    {
+      "node_id": "node-3",
+      "parent_id": "root",
+      "level": 1,
+      "order": 2,
+      "label": "Section 3",
+      "provisional": false,
+      "state": "completed"
+    },
+    {
+      "node_id": "node-3-2",
+      "parent_id": "node-3",
+      "level": 2,
+      "order": 1,
+      "label": "3.2 Self-Attention",
+      "provisional": true,
+      "state": "active"
+    }
+  ],
+  "sourcePreview": "We call our particular attention formulation scaled dot-product attention...",
+  "summaryPreview": "Self-attention computes a weighted combination of values using scaled dot products between queries and keys.",
+  "finalSummary": "The Transformer replaces recurrence with multi-head self-attention to model dependencies in parallel."
+}

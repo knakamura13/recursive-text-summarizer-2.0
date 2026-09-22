@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from summarizer.budget import BudgetReport, select_strategy
@@ -21,7 +21,7 @@ from summarizer.finalization import (
 )
 from summarizer.ingestion import read_source
 from summarizer.pipeline import PipelineConfig, run_pipeline
-from summarizer.providers.base import ModelProvider, ProviderError
+from summarizer.providers.base import ContextWindowProvider, ModelProvider, ProviderError
 from summarizer.providers.openai import OpenAIProvider
 from summarizer.providers.ollama import OllamaProvider
 from summarizer.providers.retrying import RetryingProvider
@@ -259,13 +259,23 @@ def main(
             )
             _report_dry_run(report)
             return 0
-        provider = RetryingProvider(provider_factory(config.app), config.retry)
+        raw_provider = provider_factory(config.app)
+        strategy = config.strategy
+        if isinstance(raw_provider, ContextWindowProvider):
+            context_window = raw_provider.configure_context_window(
+                config.app.model,
+                strategy.context_window,
+                timeout_seconds=config.app.timeout_seconds,
+            )
+            if context_window is not None:
+                strategy = replace(strategy, context_window=context_window)
+        provider = RetryingProvider(raw_provider, config.retry)
         result = run_pipeline(
             document,
             provider,
             counter,
             app=config.app,
-            strategy=config.strategy,
+            strategy=strategy,
             config=config.pipeline,
         )
         # Reliable mode publishes the summary and audit together inside the

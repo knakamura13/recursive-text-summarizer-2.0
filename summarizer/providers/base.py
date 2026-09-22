@@ -24,6 +24,12 @@ class GenerationRequest:
     # Stable internal work identity for ordered diagnostics. Provider adapters
     # do not transmit it or include it in model input.
     audit_work_id: str | None = None
+    # Provider-only decoding metadata. Hosted adapters ignore it; local
+    # adapters may use it to enforce source-dependent constraints.
+    quote_candidates_by_segment: Mapping[str, tuple[str, ...]] | None = None
+    expected_summary_level: int | None = None
+    allowed_summary_segment_ids: tuple[str, ...] | None = None
+    max_output_tokens: int | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("model", "instructions", "input_text"):
@@ -33,6 +39,25 @@ class GenerationRequest:
             raise ValueError("timeout_seconds must be positive")
         if self.response_schema is not None and not (self.schema_name or "").strip():
             raise ValueError("schema_name is required when response_schema is set")
+        if self.quote_candidates_by_segment is not None:
+            normalized: dict[str, tuple[str, ...]] = {}
+            for segment_id, candidates in self.quote_candidates_by_segment.items():
+                if not segment_id.strip():
+                    raise ValueError("quote candidate segment identifiers must not be blank")
+                values = tuple(candidates)
+                if any(not candidate.strip() for candidate in values):
+                    raise ValueError("quote candidates must not be blank")
+                normalized[segment_id] = values
+            object.__setattr__(self, "quote_candidates_by_segment", normalized)
+        if self.expected_summary_level is not None and self.expected_summary_level < 0:
+            raise ValueError("expected_summary_level must not be negative")
+        if self.allowed_summary_segment_ids is not None:
+            identifiers = tuple(dict.fromkeys(self.allowed_summary_segment_ids))
+            if any(not identifier.strip() for identifier in identifiers):
+                raise ValueError("allowed summary segment identifiers must not be blank")
+            object.__setattr__(self, "allowed_summary_segment_ids", identifiers)
+        if self.max_output_tokens is not None and self.max_output_tokens <= 0:
+            raise ValueError("max_output_tokens must be positive when provided")
 
 
 @dataclass(frozen=True)
@@ -83,6 +108,19 @@ class ModelProvider(Protocol):
     """
 
     def generate(self, request: GenerationRequest) -> GenerationResult: ...
+
+
+@runtime_checkable
+class ContextWindowProvider(Protocol):
+    """Configure the context a provider will use for subsequent requests."""
+
+    def configure_context_window(
+        self,
+        model: str,
+        requested: int | None,
+        *,
+        timeout_seconds: float,
+    ) -> int | None: ...
 
 
 class ProviderError(RuntimeError):

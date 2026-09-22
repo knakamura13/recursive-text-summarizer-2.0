@@ -7,6 +7,11 @@ from summarizer.config import StrategyConfig, StrategyName
 from summarizer.ingestion import SourceDocument
 from summarizer.leaf import build_leaf_request
 from summarizer.segmentation import BoundaryKind, SourceSegment
+from summarizer.summaries import (
+    MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES,
+    MAX_QUOTE_CANDIDATE_JSON_BYTES,
+    leaf_summary_schema,
+)
 from summarizer.tokenization import TokenCounter
 
 # Context windows have no offline source of truth, and for OpenAI no online one
@@ -119,6 +124,7 @@ def measure_overhead(
     counter: TokenCounter,
     *,
     with_overlap: bool,
+    provider_schema_reserve: int = 0,
 ) -> OverheadMeasurement:
     """Measure per-request overhead rather than assuming a constant.
 
@@ -136,8 +142,16 @@ def measure_overhead(
     probe = _overhead_probe_segment(with_overlap=with_overlap)
     request = build_leaf_request(probe, model="probe", timeout_seconds=1)
 
-    schema = counter.count(
-        json.dumps(request.response_schema, separators=(",", ":"), sort_keys=True)
+    # The schema a real request carries also enumerates verbatim quote
+    # candidates, which this probe is too small to produce. Their compact,
+    # ASCII-escaped JSON contribution is capped in bytes. Byte-fallback
+    # tokenizers cannot emit more tokens than bytes, so the reserve is safe.
+    schema = (
+        counter.count(
+            json.dumps(leaf_summary_schema(), separators=(",", ":"), sort_keys=True)
+        )
+        + MAX_QUOTE_CANDIDATE_JSON_BYTES
+        + provider_schema_reserve
     )
     fencing = counter.count(request.input_text) - counter.count(probe.text)
     return OverheadMeasurement(
@@ -270,7 +284,15 @@ def select_strategy(
     # A direct request carries no overlap. A stage that sends overlap-carrying
     # requests must measure its own overhead: the overlap variant is about 120
     # tokens larger, and sizing against this figure would under-reserve.
-    overhead = measure_overhead(counter, with_overlap=False)
+    overhead = measure_overhead(
+        counter,
+        with_overlap=False,
+        provider_schema_reserve=(
+            MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
+            if provider.strip().lower() == "ollama"
+            else 0
+        ),
+    )
     margin = safety_margin(window.tokens, config)
     capacity = usable_input_capacity(
         window=window, overhead=overhead, config=config

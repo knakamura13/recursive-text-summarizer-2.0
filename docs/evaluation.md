@@ -10,7 +10,7 @@ From the repository root, run the evaluator with a disposable output directory:
 python -m tests.support.evaluation --output-dir <temporary-directory>
 ```
 
-The runner executes five original-genre cases on the `auto` path, one article case on the `direct` path, and one expanded article case on `auto`. The expanded case is configured to exercise a genuine hierarchy with more than one merge level. It writes only the requested directory:
+The runner executes five original-genre cases on the `auto` path, one article case on the `direct` path, and one expanded article case on `auto`. The expanded case is configured to exercise a genuine hierarchy with more than one merge level. In this evaluator, the expanded case explicitly sets `max_merge_children=2` to force a two-child merge ceiling and produce more than one merge level. In a normal run, `max_merge_children` is unset, so merge fan-out is derived from the measured request capacity rather than fixed at two. It writes only the requested directory:
 
 - `evaluation.json`, one JSON object containing all cases;
 - `{case_id}.audit.json` for each case (`article-auto`, `article-direct`, and `article-auto-hierarchy`, for example), produced by the pipeline's audit writer.

@@ -152,6 +152,19 @@ def test_compatible_direct_result_reuses_the_validated_summary(tmp_path) -> None
     assert second.requests == []
 
 
+def test_a_different_output_cap_is_not_served_from_cache(tmp_path) -> None:
+    """A cap changes what the model may emit, so its result is a distinct record."""
+    document = ingest_text(DOCUMENT)
+    first, second = RecordingProvider(), RecordingProvider()
+
+    summarize_direct(document, first, CharacterCounter(), model="m", timeout_seconds=30, max_output_tokens=256, coordinator=coordinator(tmp_path, document))
+    summarize_direct(document, second, CharacterCounter(), model="m", timeout_seconds=30, max_output_tokens=512, coordinator=coordinator(tmp_path, document))
+
+    assert len(first.requests) == 1
+    assert len(second.requests) == 1
+    assert second.requests[0].max_output_tokens == 512
+
+
 def test_malformed_direct_response_is_not_cached(tmp_path) -> None:
     document = ingest_text(DOCUMENT)
     first = RecordingProvider("not json")

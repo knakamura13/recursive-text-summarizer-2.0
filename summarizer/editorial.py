@@ -83,6 +83,7 @@ def build_editorial_request(
     model: str,
     timeout_seconds: float,
     target_words: int,
+    max_output_tokens: int | None = None,
 ) -> GenerationRequest:
     if not source_id.strip():
         raise ValueError("source_id must not be blank")
@@ -101,6 +102,7 @@ def build_editorial_request(
         operation_id="editorial-final",
         response_schema=final_draft_schema(),
         schema_name=EDITORIAL_SCHEMA_NAME,
+        max_output_tokens=max_output_tokens,
     )
 
 
@@ -127,6 +129,7 @@ def write_editorial(
     model: str,
     timeout_seconds: float,
     target_words: int,
+    max_output_tokens: int | None = None,
 ) -> EditorialResult:
     request = build_editorial_request(
         root,
@@ -134,6 +137,7 @@ def write_editorial(
         model=model,
         timeout_seconds=timeout_seconds,
         target_words=target_words,
+        max_output_tokens=max_output_tokens,
     )
     coordinator = getattr(provider, "cache_coordinator", None)
     if coordinator is not None and not isinstance(coordinator, CacheCoordinator):
@@ -159,6 +163,7 @@ def write_editorial(
                 "instructions": request.instructions,
                 "input_text": request.input_text,
                 "schema": request.response_schema,
+                "max_output_tokens": request.max_output_tokens,
             },
             behavior={"editorial_version": EDITORIAL_PROMPT_VERSION, "target_words": target_words},
             decode=decode,

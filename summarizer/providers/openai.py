@@ -43,6 +43,8 @@ class OpenAIProvider:
             "input": request.input_text,
             "timeout": request.timeout_seconds,
         }
+        if request.max_output_tokens is not None:
+            arguments["max_output_tokens"] = request.max_output_tokens
         if request.response_schema is not None:
             arguments["text"] = {
                 "format": {

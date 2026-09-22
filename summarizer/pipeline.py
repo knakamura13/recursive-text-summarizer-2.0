@@ -40,7 +40,9 @@ from summarizer.segmentation import (
     SegmentationConfig,
     cached_segment_document,
 )
+from summarizer.summaries import MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
 from summarizer.tokenization import TokenCounter
+from summarizer.runtime.observers import RuntimeObserver, StageEvent, StageName, get_observer
 from summarizer.verification import VerificationConfig, VerificationRuntime
 
 
@@ -157,7 +159,15 @@ def _hierarchical_capacity(
     )
     return usable_input_capacity(
         window=window,
-        overhead=measure_overhead(counter, with_overlap=True),
+        overhead=measure_overhead(
+            counter,
+            with_overlap=True,
+            provider_schema_reserve=(
+                MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
+                if app.provider == "ollama"
+                else 0
+            ),
+        ),
         config=strategy,
     )
 
@@ -170,10 +180,16 @@ def run_pipeline(
     app: AppConfig,
     strategy: StrategyConfig,
     config: PipelineConfig = _DEFAULT_PIPELINE_CONFIG,
+    observer: RuntimeObserver | None = None,
 ) -> PipelineResult:
+    runtime_observer = get_observer(observer)
+    runtime_observer.emit(StageEvent(StageName.PREPARING, "active"))
     report = select_strategy(
         document, counter, provider=app.provider, model=app.model, config=strategy
     )
+    runtime_observer.emit(StageEvent(StageName.PREPARING, "completed"))
+    if runtime_observer.cancelled():
+        raise RuntimeError("cancelled before pipeline execution")
     if not config.cache.enabled:
         return _run_pipeline(
             document,
@@ -184,6 +200,7 @@ def run_pipeline(
             config=config,
             report=report,
             coordinator=None,
+            observer=runtime_observer,
         )
     if not config.reliability.run_id:
         raise ValueError("enabled cache requires a reliability run_id")
@@ -289,6 +306,7 @@ def run_pipeline(
             config=config,
             report=report,
             coordinator=coordinator,
+            observer=runtime_observer,
         )
 
 
@@ -302,6 +320,7 @@ def _run_pipeline(
     config: PipelineConfig,
     report: BudgetReport,
     coordinator: CacheCoordinator | None,
+    observer: RuntimeObserver,
 ) -> PipelineResult:
     """Execute direct or hierarchical stages, then final editorial writing."""
     reliability_tracker = (
@@ -309,7 +328,9 @@ def _run_pipeline(
     )
     recording = _RecordingProvider(provider, coordinator, reliability_tracker)
     if report.strategy == "direct":
+        observer.emit(StageEvent(StageName.SEGMENTING, "skipped"))
         segment = whole_document_segment(document, counter)
+        observer.emit(StageEvent(StageName.SUMMARIZING, "active", total=1))
         summary = summarize_direct(
             document,
             recording,
@@ -326,9 +347,12 @@ def _run_pipeline(
             children=(),
             covered_segments=(segment.segment_id,),
         )
+        observer.emit(StageEvent(StageName.SUMMARIZING, "completed", completed=1, total=1))
+        observer.emit(StageEvent(StageName.MERGING, "skipped"))
         nodes = (root,)
         segments = (segment,)
     else:
+        observer.emit(StageEvent(StageName.SEGMENTING, "active"))
         requested_segmentation = config.segmentation or SegmentationConfig(
             max_tokens=max(
                 1,
@@ -336,10 +360,15 @@ def _run_pipeline(
                 // _DEFAULT_SEGMENT_CAPACITY_DIVISOR,
             )
         )
-        capacity = _hierarchical_capacity(
+        leaf_capacity = _hierarchical_capacity(
             report, counter, app, strategy, requested_segmentation
         )
-        if requested_segmentation.max_tokens > capacity:
+        request_input_budget = (
+            report.context_window_tokens
+            - report.reserved_output_tokens
+            - report.safety_margin_tokens
+        )
+        if requested_segmentation.max_tokens > leaf_capacity:
             raise BudgetError(
                 "segmentation max_tokens exceeds the safely measured leaf capacity"
             )
@@ -347,6 +376,19 @@ def _run_pipeline(
             cached_segment_document(
                 document, counter, requested_segmentation, coordinator=coordinator
             )
+        )
+        observer.emit(
+            StageEvent(
+                StageName.SEGMENTING,
+                "completed",
+                completed=len(segments),
+                total=len(segments),
+            )
+        )
+        if observer.cancelled():
+            raise RuntimeError("cancelled during segmentation")
+        observer.emit(
+            StageEvent(StageName.SUMMARIZING, "active", total=len(segments))
         )
         if coordinator is not None and coordinator.session is not None:
             coordinator.session.ensure_work_prefix(
@@ -359,6 +401,17 @@ def _run_pipeline(
             timeout_seconds=app.timeout_seconds,
             coordinator=coordinator,
         )
+        observer.emit(
+            StageEvent(
+                StageName.SUMMARIZING,
+                "completed",
+                completed=len(leaves),
+                total=len(segments),
+            )
+        )
+        if observer.cancelled():
+            raise RuntimeError("cancelled during summarization")
+        observer.emit(StageEvent(StageName.MERGING, "active"))
         root, nodes, _ = build_hierarchy(
             leaves,
             recording,
@@ -369,13 +422,22 @@ def _run_pipeline(
                 segment.segment_id: document.text[segment.core_start : segment.core_end]
                 for segment in segments
             },
-            usable_tokens=capacity,
+            usable_tokens=request_input_budget,
             model=app.model,
             timeout_seconds=app.timeout_seconds,
             max_merge_children=config.max_merge_children,
             coordinator=coordinator,
+            provider_schema_reserve=(
+                MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
+                if app.provider == "ollama"
+                else 0
+            ),
         )
+        observer.emit(StageEvent(StageName.MERGING, "completed"))
 
+    if observer.cancelled():
+        raise RuntimeError("cancelled before finalization")
+    observer.emit(StageEvent(StageName.WRITING, "active"))
     completed_before_editorial = tuple(recording.generations)
     if coordinator is not None and coordinator.session is not None:
         coordinator.session.ensure_work_prefix(
@@ -453,6 +515,8 @@ def _run_pipeline(
                 "V01",
             )
         )
+    if config.verification.enabled:
+        observer.emit(StageEvent(StageName.VERIFYING, "active"))
     final = _finalize_summary(
         root.summary,
         recording,
@@ -494,6 +558,12 @@ def _run_pipeline(
             and coordinator.session is not None
         ),
     )
+    observer.emit(StageEvent(StageName.WRITING, "completed"))
+    if config.verification.enabled:
+        observer.emit(StageEvent(StageName.VERIFYING, "completed"))
+    if observer.cancelled():
+        raise RuntimeError("cancelled before publication")
+    observer.emit(StageEvent(StageName.PUBLISHING, "active"))
     if (
         config.audit_path is not None
         and coordinator is not None
@@ -505,4 +575,5 @@ def _run_pipeline(
             audit_path=config.audit_path,
             session=coordinator.session,
         )
+    observer.emit(StageEvent(StageName.PUBLISHING, "completed"))
     return PipelineResult(final=final, strategy=report, root=root, nodes=nodes)

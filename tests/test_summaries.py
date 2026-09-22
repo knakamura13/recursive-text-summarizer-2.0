@@ -1,8 +1,11 @@
+import json
+
 import pytest
 from pydantic import ValidationError
 
 from summarizer.summaries import (
     LEAF_SCHEMA_VERSION,
+    MAX_QUOTE_CANDIDATE_JSON_BYTES,
     MAX_QUOTE_CHARS,
     ContentKind,
     ContentUnit,
@@ -10,6 +13,8 @@ from summarizer.summaries import (
     GroundedAnnotation,
     SummaryNode,
     leaf_summary_schema,
+    quote_candidates,
+    summary_schema,
 )
 
 
@@ -177,9 +182,47 @@ def test_schema_matches_what_the_openai_sdk_would_generate() -> None:
     assert leaf_summary_schema() == to_strict(SummaryNode)
 
 
+def test_quote_candidate_schema_stays_within_ascii_escaped_byte_budget() -> None:
+    sentence = "漢" * 20 + "."
+    source = " ".join(sentence for _ in range(20))
+
+    candidates = quote_candidates((source,))
+    base = json.dumps(
+        summary_schema(), separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    constrained = json.dumps(
+        summary_schema(candidates=candidates), separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+
+    assert candidates
+    assert all(candidate in source for candidate in candidates)
+    assert len(constrained) - len(base) <= MAX_QUOTE_CANDIDATE_JSON_BYTES
+
+
+def test_unpunctuated_candidate_ignores_trailing_whitespace() -> None:
+    source = "An unpunctuated statement with enough supporting detail   \n"
+
+    assert quote_candidates((source,)) == (source.strip(),)
+
+
+def test_oversized_candidate_uses_an_exact_bounded_prefix() -> None:
+    source = "x" * 300
+
+    assert quote_candidates((source,)) == (source[:240],)
+
+
+def test_supplied_empty_candidate_set_allows_only_null_quotes() -> None:
+    quote = summary_schema(candidates=())["$defs"]["EvidenceItem"][
+        "properties"
+    ]["quote"]
+
+    assert quote["anyOf"] == [{"type": "null"}]
+
+
 def test_schema_version_is_recorded_for_cache_keys() -> None:
     assert LEAF_SCHEMA_VERSION
     assert isinstance(LEAF_SCHEMA_VERSION, str)
+
 
 def test_rejects_overly_long_quotes() -> None:
     with pytest.raises(ValidationError, match="quote must not exceed 500 characters"):
@@ -228,3 +271,38 @@ def test_oversized_quote_is_rejected_wherever_it_appears() -> None:
         GroundedAnnotation.model_validate(
             {"text": "A hedge.", "evidence": [oversized_evidence]}
         )
+
+
+def test_evidence_item_normalizes_empty_quotes_and_whitespace_segment_id() -> None:
+    item = EvidenceItem.model_validate({"segment_id": "  S000001  ", "quote": ""})
+    assert item.segment_id == "S000001"
+    assert item.quote is None
+
+    item_space = EvidenceItem.model_validate({"segment_id": "S000001", "quote": "   "})
+    assert item_space.quote is None
+
+
+def test_content_unit_normalizes_kind_and_qualification() -> None:
+    unit_caps = ContentUnit.model_validate(
+        {
+            "text": "Assertion text.",
+            "kind": "FACT",
+            "evidence": [{"segment_id": "S000001", "quote": None}],
+            "qualification": "   ",
+            "uncertain": False,
+        }
+    )
+    assert unit_caps.kind is ContentKind.FACT
+    assert unit_caps.qualification is None
+
+    unit_unknown = ContentUnit.model_validate(
+        {
+            "text": "Assertion text.",
+            "kind": "custom_kind",
+            "evidence": [{"segment_id": "S000001", "quote": None}],
+            "qualification": "Valid qualification",
+            "uncertain": False,
+        }
+    )
+    assert unit_unknown.kind is ContentKind.OTHER
+    assert unit_unknown.qualification == "Valid qualification"

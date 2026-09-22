@@ -527,11 +527,18 @@ def test_overlap_rejects_a_non_monotonic_counter_without_a_backward_search() -> 
 # Bug 2: abbreviation-aware sentence tokenizer
 # ---------------------------------------------------------------------------
 
-def test_abbreviation_tokenizer_does_not_split_on_dr_and_us() -> None:
+def test_abbreviation_tokenizer_does_not_split_on_abbreviations() -> None:
     from summarizer.segmentation import _SENTENCE_TOKENIZER
 
-    text = "Dr. Smith reviewed the U.S. market. It rose."
-    spans = list(_SENTENCE_TOKENIZER.span_tokenize(text))
-    assert len(spans) == 2, (
-        f"Expected 2 sentences, got {len(spans)}: {[text[s:e] for s, e in spans]}"
-    )
+    cases = [
+        ("Dr. Smith reviewed the U.S. market. It rose.", 2),
+        ("For various reasons (e.g. cost, time) the project stalled. Next sentence.", 2),
+        ("Use a linter (e.g. Ruff) before committing. It catches typos.", 2),
+        ("Common tools include linters, i.e. code checkers, and formatters. Both help.", 2),
+    ]
+
+    for text, expected_count in cases:
+        spans = list(_SENTENCE_TOKENIZER.span_tokenize(text))
+        assert len(spans) == expected_count, (
+            f"Expected {expected_count} sentences for {text!r}, got {len(spans)}: {[text[s:e] for s, e in spans]}"
+        )

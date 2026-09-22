@@ -14,6 +14,18 @@ The fictional Atlas team plans to move warehouse inventory records from LedgerFo
   - Freeze manual adjustments at 18:00 Friday.
   - Reopen access only after the reconciliation report passes.
 
+## Configuration Example
+
+Below is a snippet showing the migration configuration format:
+
+```yaml
+source:
+  system: ledgerfox_4
+  export_inactive: false
+destination:
+  system: meridian_cloud
+```
+
 ## Rollback
 
 The database team will retain a read-only LedgerFox snapshot for thirty days. A rollback may still require several hours because scanner configurations must be restored separately.

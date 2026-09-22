@@ -8,9 +8,11 @@ import summarizer.pipeline as pipeline
 from summarizer.budget import select_strategy
 from summarizer.config import AppConfig, StrategyConfig
 from summarizer.ingestion import ingest_text
+from summarizer.merge import measure_merge_request_tokens
 from summarizer.pipeline import PipelineConfig, run_pipeline
 from summarizer.providers.base import GenerationRequest, GenerationResult
 from summarizer.segmentation import SegmentationConfig
+from summarizer.summaries import MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
 from summarizer.tokenization import TiktokenCounter, resolve_token_counter
 from summarizer.verification import VerificationConfig
 
@@ -162,6 +164,43 @@ def test_hierarchical_pipeline_runs_offline_with_ollama_defaults_and_explicit_wi
         "editorial-final",
     ]
 
+
+def test_ollama_merge_uses_request_budget_not_leaf_capacity() -> None:
+    counter = CharacterCounter()
+    app_config = AppConfig(provider="ollama", model="qwen3.5:9b")
+    strategy = StrategyConfig(strategy="hierarchical", context_window=10_000)
+    provider = GroundedPipelineProvider()
+
+    result = run_pipeline(
+        ingest_text("alpha " * 600),
+        provider,
+        counter,
+        app=app_config,
+        strategy=strategy,
+        config=PipelineConfig(),
+    )
+
+    base_request_budget = (
+        result.strategy.context_window_tokens
+        - result.strategy.reserved_output_tokens
+        - result.strategy.safety_margin_tokens
+    )
+    merge_requests = [
+        request
+        for request in provider.requests
+        if (request.operation_id or "").startswith("merge-L")
+    ]
+    merge_costs = [
+        measure_merge_request_tokens(
+            request,
+            counter,
+            provider_schema_reserve=MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES,
+        )
+        for request in merge_requests
+    ]
+    assert merge_costs
+    assert max(merge_costs) > result.strategy.usable_input_capacity
+    assert max(merge_costs) <= base_request_budget
 
 def test_default_pipeline_merges_full_capacity_segments_with_a_real_tokenizer() -> None:
     encoding = Encoding(

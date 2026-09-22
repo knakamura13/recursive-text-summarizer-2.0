@@ -12,7 +12,7 @@ import re
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
 
 REQUIRED = ["article.txt", "report.txt", "transcript.txt", "structured.md", "narrative.txt"]
