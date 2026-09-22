@@ -139,6 +139,8 @@ The output path contains the final editorial text. Without `--citations`, it con
 - `verification`, including pass/claim/evidence links, verdicts, repair actions, usage, warnings, limitations, and failures;
 - `reliability` in `audit/3` and reliable `audit/4` output, including cache outcomes, retry categories, resume state, reuse count, and recomputation count.
 
+Every `--audit` artifact uses durable same-directory replacement: the replacement file and its parent directory are flushed and synced. With `--cache-dir`, audit and summary publication additionally uses a manifest-witnessed protocol; the pair is not a single cross-file atomic transaction.
+
 Audit artifacts deliberately do not contain raw source text, generated summary prose, quotations, prompts, request bodies, provider request IDs, or authentication data. Source-derived text may still exist in cache payloads, so cache directories are sensitive local data even though descriptors and audit projections are secret-safe.
 
 ## Cache, resume, retries, and concurrency
