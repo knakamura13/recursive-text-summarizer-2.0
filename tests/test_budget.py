@@ -153,6 +153,22 @@ def test_non_positive_capacity_reports_every_term() -> None:
     assert "safety margin of 256" in message
 
 
+def test_capacity_of_exactly_one_succeeds() -> None:
+    """The smallest positive capacity value (capacity == 1) returns 1 without error."""
+    config = StrategyConfig(
+        max_output_tokens=1, safety_margin_tokens=0, safety_margin_fraction=0
+    )
+    overhead = measure_overhead(CharacterCounter(), with_overlap=False)
+
+    capacity = usable_input_capacity(
+        window=ContextWindow(tokens=overhead.total + 2, assumed=False),
+        overhead=overhead,
+        config=config,
+    )
+
+    assert capacity == 1
+
+
 def test_capacity_of_exactly_zero_is_refused() -> None:
     """The boundary itself, not merely a deeply negative case."""
     config = StrategyConfig(
@@ -185,6 +201,24 @@ def test_fencing_excludes_the_probe_text_it_measured_with() -> None:
 
     assert overhead.fencing == len(request.input_text) - len(probe.text)
     assert "probe" not in str(overhead.fencing)
+
+
+def test_fencing_is_clamped_to_zero_when_negative() -> None:
+    """If counter returns fewer tokens for input_text than probe.text, fencing clamps to 0."""
+
+    class MockNegativeFencingCounter:
+        identity: str = "test:negative_fencing"
+        exact: bool = True
+        monotonic: bool = True
+
+        def count(self, text: str) -> int:
+            if "probe" in text and len(text) <= 10:
+                return 100
+            return 10
+
+    overhead = measure_overhead(MockNegativeFencingCounter(), with_overlap=False)  # type: ignore[arg-type]
+
+    assert overhead.fencing == 0
 
 
 def test_capacity_is_deterministic() -> None:
