@@ -107,7 +107,7 @@ def test_publication_writes_audit_first_before_summary(tmp_path: Path) -> None:
     )
 
 
-def test_atomic_replace_flushes_and_syncs_file_and_parent_before_returning(
+def test_atomic_replace_syncs_file_and_parent_before_returning(
     tmp_path: Path, monkeypatch
 ) -> None:
     syncs: list[str] = []

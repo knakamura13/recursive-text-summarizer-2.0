@@ -99,7 +99,7 @@ def test_audit_is_canonical_redacted_and_contains_only_segment_metadata(tmp_path
     assert path.read_bytes() == first
 
 
-def test_write_audit_flushes_and_syncs_file_and_parent_before_returning(
+def test_write_audit_syncs_file_and_parent_before_returning(
     tmp_path, monkeypatch
 ) -> None:
     document, segment, node, citations = fixture()
