@@ -72,24 +72,34 @@ class EvidenceItem(_Record):
     segment_id: str
     quote: str | None
 
-    _reject_blank_segment_id = field_validator("segment_id")(_reject_blank)
+    @field_validator("segment_id", mode="before")
+    @classmethod
+    def _clean_segment_id(cls, value: Any) -> str:
+        if isinstance(value, str):
+            value = value.strip()
+        if not isinstance(value, str) or not value:
+            raise ValueError("must not be blank")
+        return value
 
-    @field_validator("quote")
+    @field_validator("quote", mode="before")
     @classmethod
     def _validate_quote(cls, value: str | None) -> str | None:
         """Absent means null, not empty. Also enforces a length cap.
 
-        A blank quote would otherwise pass a verbatim check trivially, since
-        every string contains the empty string, and code reading `quote is not
-        None` as "has a quotation" would get nothing. The length cap bounds
-        one quote's contribution to its node's serialized size: a model asked
-        to copy verbatim has no natural stopping point.
+        Normalizes blank or whitespace-only quotes to null (None) so that models
+        emitting empty string quotes (e.g. "") pass validation cleanly as null.
+        The length cap bounds one quote's contribution to its node's serialized size.
         """
         if value is not None:
-            if not value.strip():
-                raise ValueError("quote must be null rather than blank")
-            if len(value) > MAX_QUOTE_CHARS:
-                raise ValueError(f"quote must not exceed {MAX_QUOTE_CHARS} characters")
+            if isinstance(value, str):
+                cleaned = value.strip()
+                if not cleaned:
+                    return None
+                if len(cleaned) > MAX_QUOTE_CHARS:
+                    raise ValueError(f"quote must not exceed {MAX_QUOTE_CHARS} characters")
+                return cleaned
+            if not str(value).strip():
+                return None
         return value
 
 
@@ -104,6 +114,29 @@ class ContentUnit(_Record):
 
     _reject_blank_text = field_validator("text")(_reject_blank)
     _empty_evidence = field_validator("evidence", mode="before")(_empty_when_null)
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _normalize_kind(cls, value: Any) -> ContentKind:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            try:
+                return ContentKind(normalized)
+            except ValueError:
+                return ContentKind.OTHER
+        if isinstance(value, ContentKind):
+            return value
+        return ContentKind.OTHER
+
+    @field_validator("qualification", mode="before")
+    @classmethod
+    def _normalize_qualification(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            cleaned = value.strip()
+            return cleaned if cleaned else None
+        return str(value).strip() if str(value).strip() else None
 
 
 class GroundedAnnotation(_Record):

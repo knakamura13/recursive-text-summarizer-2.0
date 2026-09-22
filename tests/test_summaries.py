@@ -228,3 +228,38 @@ def test_oversized_quote_is_rejected_wherever_it_appears() -> None:
         GroundedAnnotation.model_validate(
             {"text": "A hedge.", "evidence": [oversized_evidence]}
         )
+
+
+def test_evidence_item_normalizes_empty_quotes_and_whitespace_segment_id() -> None:
+    item = EvidenceItem.model_validate({"segment_id": "  S000001  ", "quote": ""})
+    assert item.segment_id == "S000001"
+    assert item.quote is None
+
+    item_space = EvidenceItem.model_validate({"segment_id": "S000001", "quote": "   "})
+    assert item_space.quote is None
+
+
+def test_content_unit_normalizes_kind_and_qualification() -> None:
+    unit_caps = ContentUnit.model_validate(
+        {
+            "text": "Assertion text.",
+            "kind": "FACT",
+            "evidence": [{"segment_id": "S000001", "quote": None}],
+            "qualification": "   ",
+            "uncertain": False,
+        }
+    )
+    assert unit_caps.kind is ContentKind.FACT
+    assert unit_caps.qualification is None
+
+    unit_unknown = ContentUnit.model_validate(
+        {
+            "text": "Assertion text.",
+            "kind": "custom_kind",
+            "evidence": [{"segment_id": "S000001", "quote": None}],
+            "qualification": "Valid qualification",
+            "uncertain": False,
+        }
+    )
+    assert unit_unknown.kind is ContentKind.OTHER
+    assert unit_unknown.qualification == "Valid qualification"

@@ -295,13 +295,34 @@ def test_rejects_a_fabricated_quote_on_a_content_unit() -> None:
         )
 
 
-def test_rejects_a_blank_quotation() -> None:
-    """Every string contains the empty string, so a blank quote must not pass."""
-    with pytest.raises(LeafSummaryError):
-        parse_leaf_summary(
-            payload(quotations=[{"segment_id": "S000001", "quote": ""}]),
-            segment=segment(),
-        )
+def test_normalizes_a_blank_quotation_to_none() -> None:
+    """Empty or whitespace-only quotes are normalized to None."""
+    node = parse_leaf_summary(
+        payload(quotations=[{"segment_id": "S000001", "quote": "   "}]),
+        segment=segment(),
+    )
+    assert node.quotations[0].quote is None
+
+
+def test_normalizes_kind_and_qualification_resiliently() -> None:
+    node = parse_leaf_summary(
+        payload(
+            content_units=[
+                {
+                    "text": "The archive moved in March.",
+                    "kind": "FACT",
+                    "evidence": [{"segment_id": "  S000001  ", "quote": ""}],
+                    "qualification": "   ",
+                    "uncertain": False,
+                }
+            ]
+        ),
+        segment=segment(),
+    )
+    assert node.content_units[0].kind == "fact"
+    assert node.content_units[0].evidence[0].segment_id == "S000001"
+    assert node.content_units[0].evidence[0].quote is None
+    assert node.content_units[0].qualification is None
 
 
 def test_rejects_more_than_one_json_object() -> None:
