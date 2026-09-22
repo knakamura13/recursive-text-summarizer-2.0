@@ -101,6 +101,37 @@ def test_rejects_an_unknown_field() -> None:
         )
 
 
+def test_validate_provenance_rejects_annotation_without_evidence() -> None:
+    """Test F-011: validate_provenance rejects contradictions or qualifications without evidence."""
+    # Qualification without evidence
+    with pytest.raises(LeafSummaryError, match="grounded annotation must record supporting evidence"):
+        parse_leaf_summary(
+            payload(
+                qualifications=[
+                    {
+                        "text": "This qualification lacks evidence.",
+                        "evidence": [],
+                    }
+                ]
+            ),
+            segment=segment(),
+        )
+
+    # Contradiction without evidence
+    with pytest.raises(LeafSummaryError, match="grounded annotation must record supporting evidence"):
+        parse_leaf_summary(
+            payload(
+                contradictions=[
+                    {
+                        "text": "This contradiction lacks evidence.",
+                        "evidence": [],
+                    }
+                ]
+            ),
+            segment=segment(),
+        )
+
+
 def test_rejects_evidence_citing_an_unknown_segment() -> None:
     """The legal identifier comes from the caller, never from the payload.
 

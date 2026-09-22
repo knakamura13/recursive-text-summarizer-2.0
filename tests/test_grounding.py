@@ -60,6 +60,65 @@ def child() -> SummaryNode:
     )
 
 
+def test_select_source_passages_rejects_empty_children() -> None:
+    with pytest.raises(ValueError, match="source grounding requires at least one child"):
+        select_source_passages(
+            (),
+            source=SOURCE,
+            counter=CharacterCounter(),
+            policy=GroundingPolicy(max_tokens=1000),
+        )
+
+
+def test_select_source_passages_rejects_unknown_segment() -> None:
+    child_unknown = SummaryNode.model_validate(
+        {
+            "summary": "Unknown citation.",
+            "content_units": [],
+            "entities": [],
+            "qualifications": [],
+            "contradictions": [],
+            "quotations": [],
+            "provenance": ["S999999"],
+            "level": 0,
+        }
+    )
+    with pytest.raises(ValueError, match="source text is missing for segment S999999"):
+        select_source_passages(
+            (child_unknown,),
+            source=SOURCE,
+            counter=CharacterCounter(),
+            policy=GroundingPolicy(max_tokens=1000),
+        )
+
+
+def test_select_source_passages_at_exact_cost_boundary() -> None:
+    from summarizer.grounding import SourcePassage, serialize_source_passage
+
+    passage = SourcePassage("S000001", "ordinary source")
+    cost = CharacterCounter().count(serialize_source_passage(passage))
+    child_node = SummaryNode.model_validate(
+        {
+            "summary": "Exact boundary.",
+            "content_units": [],
+            "entities": [],
+            "qualifications": [],
+            "contradictions": [],
+            "quotations": [],
+            "provenance": ["S000001"],
+            "level": 0,
+        }
+    )
+    # At exact boundary (max_tokens == cost), passage should be accepted.
+    selection = select_source_passages(
+        (child_node,),
+        source={"S000001": "ordinary source"},
+        counter=CharacterCounter(),
+        policy=GroundingPolicy(max_tokens=cost),
+    )
+    assert selection.selected_ids == ("S000001",)
+
+
 def test_prioritizes_ambiguous_evidence_before_other_retained_claims() -> None:
     selection = select_source_passages(
         (child(),),

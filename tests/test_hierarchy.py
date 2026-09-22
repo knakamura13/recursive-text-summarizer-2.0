@@ -11,9 +11,10 @@ import pytest
 from summarizer.budget import BudgetError
 from summarizer.cache import CacheStore
 from summarizer.checkpoint import CheckpointStore, RunPlan
-from summarizer.grounding import GroundingPolicy
+from summarizer.grounding import GroundingPolicy, GroundingSelection
 from summarizer.hierarchy import (
     HierarchyError,
+    MergeGrounding,
     build_hierarchy,
     group_children,
     measure_child_tokens,
@@ -127,6 +128,23 @@ def build(count: int, *, ceiling: int | None = None, usable: int = 100_000,
         grounding_policy=GroundingPolicy(max_tokens=grounding_tokens),
     )
     return root, nodes, report, provider
+
+
+def test_merge_grounding_rejects_non_positive_request_capacity_tokens() -> None:
+    selection = GroundingSelection(passages=(), selected_ids=(), omitted_ids=())
+    for capacity in (0, -1, -100):
+        with pytest.raises(ValueError, match="grounding request capacity must be positive"):
+            MergeGrounding(
+                selection=selection,
+                reserve_tokens=None,
+                request_capacity_tokens=capacity,
+            )
+
+
+def test_group_children_rejects_non_positive_count() -> None:
+    for count in (0, -1, -5):
+        with pytest.raises(ValueError, match="cannot group zero children"):
+            group_children(count, fanout=2)
 
 
 def test_groups_are_balanced_rather_than_ragged() -> None:
