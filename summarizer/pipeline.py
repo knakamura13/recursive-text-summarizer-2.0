@@ -40,6 +40,7 @@ from summarizer.segmentation import (
     SegmentationConfig,
     cached_segment_document,
 )
+from summarizer.summaries import MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
 from summarizer.tokenization import TokenCounter
 from summarizer.runtime.observers import RuntimeObserver, StageEvent, StageName, get_observer
 from summarizer.verification import VerificationConfig, VerificationRuntime
@@ -158,7 +159,15 @@ def _hierarchical_capacity(
     )
     return usable_input_capacity(
         window=window,
-        overhead=measure_overhead(counter, with_overlap=True),
+        overhead=measure_overhead(
+            counter,
+            with_overlap=True,
+            provider_schema_reserve=(
+                MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
+                if app.provider == "ollama"
+                else 0
+            ),
+        ),
         config=strategy,
     )
 
@@ -350,10 +359,15 @@ def _run_pipeline(
                 // _DEFAULT_SEGMENT_CAPACITY_DIVISOR,
             )
         )
-        capacity = _hierarchical_capacity(
+        leaf_capacity = _hierarchical_capacity(
             report, counter, app, strategy, requested_segmentation
         )
-        if requested_segmentation.max_tokens > capacity:
+        request_input_budget = (
+            report.context_window_tokens
+            - report.reserved_output_tokens
+            - report.safety_margin_tokens
+        )
+        if requested_segmentation.max_tokens > leaf_capacity:
             raise BudgetError(
                 "segmentation max_tokens exceeds the safely measured leaf capacity"
             )
@@ -407,11 +421,16 @@ def _run_pipeline(
                 segment.segment_id: document.text[segment.core_start : segment.core_end]
                 for segment in segments
             },
-            usable_tokens=capacity,
+            usable_tokens=request_input_budget,
             model=app.model,
             timeout_seconds=app.timeout_seconds,
             max_merge_children=config.max_merge_children,
             coordinator=coordinator,
+            provider_schema_reserve=(
+                MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
+                if app.provider == "ollama"
+                else 0
+            ),
         )
         observer.emit(StageEvent(StageName.MERGING, "completed"))
 

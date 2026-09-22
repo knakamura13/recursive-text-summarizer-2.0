@@ -17,16 +17,20 @@ from summarizer.leaf import (
 )
 from summarizer.providers.base import GenerationRequest
 from summarizer.summaries import (
+    MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES,
     MAX_QUOTATIONS_PER_NODE,
+    MAX_QUOTE_CANDIDATE_JSON_BYTES,
     MAX_QUOTE_CHARS,
     SummaryNode,
     leaf_summary_schema,
+    quote_candidates,
+    summary_schema,
 )
 from summarizer.tokenization import TokenCounter
 
 # A distinct cache-key input from the leaf prompt. Bump it whenever a change
 # could alter a model's output for identical children.
-MERGE_PROMPT_VERSION = "merge-prompt/4"
+MERGE_PROMPT_VERSION = "merge-prompt/6"
 
 MERGE_SCHEMA_NAME = "merged_summary"
 
@@ -41,6 +45,7 @@ not write commentary before or after it.
 
 Follow these rules:
 
+- Write a nonempty summary of the combined material.
 - Combine the generated child summaries. Use the supplied authoritative source \
 passages to validate the material they cover, and correct a misleading \
 generated summary when the original source differs. A source passage may be \
@@ -60,10 +65,12 @@ document order, and that order alone is not evidence that one caused, \
 preceded, or followed from another.
 - Cite only identifiers already carried by the child summaries or attached to \
 the authoritative source passages below. Do not invent an identifier and do \
-not cite one that is merely plausible.
-- Copy a quotation character for character from the summary that carries it. \
-When its authoritative source passage is supplied below, the quotation must \
-also occur there. Leave quotations empty rather than paraphrasing into them.
+not cite one that is merely plausible. List every cited identifier in provenance.
+- Copy any quotation character for character from the summary that carries it. \
+Every quote must be one of the values the schema allows, or null when none of \
+them fits. When its authoritative source passage is supplied below, the \
+quotation must also occur there. Set quote to null, never an empty string, \
+whenever you are unsure that the text is exact. Never paraphrase into a quote.
 - Keep at most {max_quotations} quotations, each at most {max_quote_chars} \
 characters. Where the children together carry more, keep only the most \
 salient rather than exceed either limit.
@@ -113,7 +120,9 @@ def serialize_child(node: SummaryNode) -> str:
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
-def measure_merge_overhead(counter: TokenCounter, *, level: int = 1) -> int:
+def measure_merge_overhead(
+    counter: TokenCounter, *, level: int = 1, provider_schema_reserve: int = 0
+) -> int:
     """Measure what a merge request costs before any child is added.
 
     The budget calculator measures a *leaf* request, and a merge request is
@@ -154,10 +163,21 @@ def measure_merge_overhead(counter: TokenCounter, *, level: int = 1) -> int:
     schema = counter.count(
         json.dumps(leaf_summary_schema(), separators=(",", ":"), sort_keys=True)
     )
-    return counter.count(probe) + outer + schema
+    return (
+        counter.count(probe)
+        + outer
+        + schema
+        + MAX_QUOTE_CANDIDATE_JSON_BYTES
+        + provider_schema_reserve
+    )
 
 
-def measure_merge_request_tokens(request: GenerationRequest, counter: TokenCounter) -> int:
+def measure_merge_request_tokens(
+    request: GenerationRequest,
+    counter: TokenCounter,
+    *,
+    provider_schema_reserve: int = 0,
+) -> int:
     """Measure the complete request shape used for hierarchy budget checks."""
     schema = json.dumps(
         request.response_schema, separators=(",", ":"), sort_keys=True
@@ -166,6 +186,7 @@ def measure_merge_request_tokens(request: GenerationRequest, counter: TokenCount
         counter.count(request.instructions)
         + counter.count(request.input_text)
         + counter.count(schema)
+        + provider_schema_reserve
     )
 
 
@@ -188,6 +209,25 @@ def serialize_source_passage_block(
     return f"{passage_begin}\n{serialize_source_passage(passage)}\n{passage_end}"
 
 
+def _child_evidence_sources(
+    children: Sequence[SummaryNode],
+) -> tuple[tuple[str, str | None], ...]:
+    sources: list[tuple[str, str | None]] = []
+    for child in children:
+        evidence_groups = [child.quotations]
+        evidence_groups.extend(unit.evidence for unit in child.content_units)
+        evidence_groups.extend(
+            annotation.evidence
+            for annotation in (*child.qualifications, *child.contradictions)
+        )
+        sources.extend(
+            (evidence.segment_id, evidence.quote)
+            for evidence_group in evidence_groups
+            for evidence in evidence_group
+        )
+    return tuple(sources)
+
+
 def build_merge_request(
     children: Sequence[SummaryNode],
     *,
@@ -196,8 +236,8 @@ def build_merge_request(
     source_id: str,
     model: str,
     timeout_seconds: float,
+    max_output_tokens: int | None = None,
 ) -> GenerationRequest:
-    """Build the request that combines several children into one node."""
     if not children:
         raise ValueError("a merge requires at least one child")
     if not passages:
@@ -218,9 +258,7 @@ def build_merge_request(
     for ordinal, child in enumerate(children):
         child_begin = _fence(source_id, level, "SUMMARY-BEGIN", ordinal)
         child_end = _fence(source_id, level, "SUMMARY-END", ordinal)
-        blocks.append(
-            f"{child_begin}\n{serialize_child(child)}\n{child_end}"
-        )
+        blocks.append(f"{child_begin}\n{serialize_child(child)}\n{child_end}")
     source_blocks = []
     for ordinal, passage in enumerate(passages):
         source_blocks.append(
@@ -228,6 +266,42 @@ def build_merge_request(
                 passage, source_id=source_id, level=level, ordinal=ordinal
             )
         )
+
+    child_evidence_sources = _child_evidence_sources(children)
+    candidates = quote_candidates(
+        [passage.text for passage in passages],
+        preferred=[
+            quote for _, quote in child_evidence_sources if quote is not None
+        ],
+    )
+    candidates_by_segment: dict[str, list[str]] = {}
+    for candidate in candidates:
+        identifiers = [
+            passage.segment_id
+            for passage in passages
+            if candidate in passage.text
+        ]
+        identifiers.extend(
+            segment_id
+            for segment_id, quote in child_evidence_sources
+            if quote is not None
+            and candidate in quote
+            and segment_id not in identifiers
+        )
+        for identifier in identifiers:
+            candidates_by_segment.setdefault(identifier, []).append(candidate)
+
+    allowed_identifiers = tuple(
+        dict.fromkeys(
+            [passage.segment_id for passage in passages]
+            + [segment_id for segment_id, _ in child_evidence_sources]
+            + [
+                segment_id
+                for child in children
+                for segment_id in child.provenance
+            ]
+        )
+    )
 
     return GenerationRequest(
         model=model,
@@ -249,8 +323,15 @@ def build_merge_request(
         ),
         timeout_seconds=timeout_seconds,
         operation_id=f"merge-L{level}",
-        response_schema=leaf_summary_schema(),
+        response_schema=summary_schema(candidates=candidates),
         schema_name=MERGE_SCHEMA_NAME,
+        quote_candidates_by_segment={
+            segment_id: tuple(values)
+            for segment_id, values in candidates_by_segment.items()
+        },
+        expected_summary_level=level,
+        allowed_summary_segment_ids=allowed_identifiers,
+        max_output_tokens=max_output_tokens,
     )
 
 

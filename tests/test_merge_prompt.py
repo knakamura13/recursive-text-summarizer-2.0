@@ -11,12 +11,7 @@ from summarizer.merge import (
     parse_merged_summary,
     serialize_child,
 )
-from summarizer.summaries import (
-    MAX_QUOTATIONS_PER_NODE,
-    MAX_QUOTE_CHARS,
-    SummaryNode,
-    leaf_summary_schema,
-)
+from summarizer.summaries import MAX_QUOTATIONS_PER_NODE, MAX_QUOTE_CHARS, SummaryNode
 
 LEGAL = {
     "S000001": "The archive moved in March.",
@@ -70,6 +65,39 @@ def request_for(
         model="m",
         timeout_seconds=30,
     )
+
+
+def test_request_schema_preserves_short_child_quotes() -> None:
+    request = request_for(
+        child(
+            quotations=[
+                {"segment_id": "S000001", "quote": "The archive moved"}
+            ]
+        )
+    )
+    quote = request.response_schema["$defs"]["EvidenceItem"]["properties"]["quote"]
+    allowed = next(
+        variant["enum"]
+        for variant in quote["anyOf"]
+        if variant.get("type") == "string"
+    )
+
+    assert "The archive moved" in allowed
+
+
+def test_truncated_child_quote_keeps_its_source_pairing() -> None:
+    full_quote = '"' * MAX_QUOTE_CHARS
+    request = request_for(
+        child(
+            quotations=[{"segment_id": "S999999", "quote": full_quote}],
+            provenance=["S999999"],
+        ),
+        passages=(SourcePassage("S000001", full_quote),),
+    )
+
+    candidates = request.quote_candidates_by_segment["S999999"]
+    assert candidates[0] != full_quote
+    assert candidates[0] in full_quote
 
 
 def test_children_never_reach_the_instructions() -> None:
@@ -156,7 +184,11 @@ def test_prompt_is_genre_neutral() -> None:
 
 
 def test_prompt_states_the_target_level() -> None:
-    assert "level 2" in request_for(level=2).instructions
+    instructions = request_for(level=2).instructions
+
+    assert "level 2" in instructions
+    assert "nonempty summary" in instructions
+    assert "null, never an empty string" in instructions
 
 
 def test_prompt_does_not_enumerate_the_legal_identifiers() -> None:
@@ -179,8 +211,30 @@ def test_prompt_does_not_enumerate_the_legal_identifiers() -> None:
 def test_request_carries_the_shared_schema_under_a_merge_name() -> None:
     request = request_for()
 
-    assert request.response_schema == leaf_summary_schema()
     assert request.schema_name == MERGE_SCHEMA_NAME
+    quote = request.response_schema["$defs"]["EvidenceItem"]["properties"]["quote"]
+    allowed = next(
+        variant["enum"]
+        for variant in quote["anyOf"]
+        if variant.get("type") == "string"
+    )
+    assert allowed == [LEGAL["S000001"], LEGAL["S000002"]]
+    assert request.quote_candidates_by_segment == {
+        "S000001": (LEGAL["S000001"],),
+        "S000002": (LEGAL["S000002"],),
+    }
+    assert request.expected_summary_level == 1
+    assert request.allowed_summary_segment_ids == ("S000001", "S000002")
+
+
+def test_request_identifier_set_includes_child_provenance_without_evidence() -> None:
+    request = request_for(child(provenance=["S999999"]))
+
+    assert request.allowed_summary_segment_ids == (
+        "S000001",
+        "S000002",
+        "S999999",
+    )
 
 
 def test_each_child_is_fenced_separately_and_cannot_forge_a_fence() -> None:
@@ -306,4 +360,4 @@ def test_prompt_version_is_bound_into_the_fences() -> None:
     finally:
         merge.MERGE_PROMPT_VERSION = original
 
-    assert MERGE_PROMPT_VERSION == "merge-prompt/4"
+    assert MERGE_PROMPT_VERSION == "merge-prompt/6"

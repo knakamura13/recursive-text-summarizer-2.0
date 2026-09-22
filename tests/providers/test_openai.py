@@ -1,6 +1,7 @@
 import importlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx2
@@ -84,6 +85,17 @@ def test_adapts_request_response_and_constructs_client_lazily() -> None:
     assert first.finish_status == "completed"
     assert first.request_id == "req_123"
     assert second == first
+
+
+def test_forwards_output_token_limit() -> None:
+    responses = FakeResponses(SimpleNamespace(output_text="summary"))
+    provider = OpenAIProvider(
+        client_factory=lambda **_kwargs: SimpleNamespace(responses=responses)
+    )
+
+    provider.generate(replace(REQUEST, max_output_tokens=321))
+
+    assert responses.calls[0]["max_output_tokens"] == 321
 
 
 def test_concurrent_first_calls_construct_one_client_without_deadlock() -> None:

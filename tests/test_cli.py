@@ -171,6 +171,42 @@ def test_main_runs_default_pipeline_without_network(tmp_path: Path, monkeypatch:
     assert [call.operation_id for call in provider.calls] == ["D000001", "editorial-final"]
 
 
+def test_main_uses_discovered_ollama_context_for_budget_and_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ContextProvider(RecordingProvider):
+        def __init__(self) -> None:
+            super().__init__("concise summary")
+            self.context_calls: list[tuple[str, int | None, float]] = []
+
+        def configure_context_window(
+            self,
+            model: str,
+            requested: int | None,
+            *,
+            timeout_seconds: float,
+        ) -> int:
+            self.context_calls.append((model, requested, timeout_seconds))
+            return 32_768
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "input.txt").write_text("source " * 1_500, encoding="utf-8")
+    provider = ContextProvider()
+
+    exit_code = main(
+        ["--provider", "ollama", "--model", "local-model"],
+        provider_factory=lambda _config: provider,
+        counter_factory=counter_factory,
+    )
+
+    assert exit_code == 0
+    assert provider.context_calls == [("local-model", None, 180)]
+    assert [call.operation_id for call in provider.calls] == [
+        "D000001",
+        "editorial-final",
+    ]
+
+
 def test_main_reports_provider_failure_and_preserves_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

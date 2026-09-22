@@ -238,9 +238,11 @@ def build_hierarchy(
     usable_tokens: int,
     model: str,
     timeout_seconds: float,
+    max_output_tokens: int | None = None,
     max_merge_children: int | None = None,
     grounding_policy: GroundingPolicy | None = None,
     coordinator: CacheCoordinator | None = None,
+    provider_schema_reserve: int = 0,
 ) -> tuple[TreeNode, tuple[TreeNode, ...], HierarchyReport]:
     """Reduce ordered leaves to a single root through as many levels as needed.
 
@@ -263,7 +265,8 @@ def build_hierarchy(
         raise ValueError("a hierarchy requires at least one leaf")
     if len(covered) != len(leaves):
         raise ValueError("each leaf needs its covered segment identifiers")
-
+    if provider_schema_reserve < 0:
+        raise ValueError("provider schema reserve must not be negative")
     configured_policy = (
         grounding_policy if grounding_policy is not None else DEFAULT_GROUNDING_POLICY
     )
@@ -321,7 +324,11 @@ def build_hierarchy(
 
     while len(current) > 1:
         level += 1
-        overhead = measure_merge_overhead(counter, level=level)
+        overhead = measure_merge_overhead(
+            counter,
+            level=level,
+            provider_schema_reserve=provider_schema_reserve,
+        )
         child_capacity = usable_tokens - overhead
         if not adaptive_grounding:
             child_capacity -= configured_policy.max_tokens
@@ -381,6 +388,7 @@ def build_hierarchy(
                             source_id=source_id,
                             model=model,
                             timeout_seconds=timeout_seconds,
+                            max_output_tokens=max_output_tokens,
                             counter=counter,
                             usable_tokens=usable_tokens,
                             grounding_policy=(
@@ -391,6 +399,7 @@ def build_hierarchy(
                             configured_grounding_policy=configured_policy,
                             adaptive_grounding=adaptive_grounding,
                             coordinator=coordinator,
+                            provider_schema_reserve=provider_schema_reserve,
                         )
                     )
             except BudgetError:
@@ -492,12 +501,14 @@ def _prepare_merge(
     source_id: str,
     model: str,
     timeout_seconds: float,
+    max_output_tokens: int | None,
     counter: TokenCounter,
     usable_tokens: int,
     grounding_policy: GroundingPolicy,
     configured_grounding_policy: GroundingPolicy,
     coordinator: CacheCoordinator | None,
     adaptive_grounding: bool,
+    provider_schema_reserve: int,
 ) -> _PreparedMerge:
     node_id = f"L{level}N{order + 1:04d}"
     # A union in document order: deduplicated, first occurrence wins. Three
@@ -530,10 +541,15 @@ def _prepare_merge(
                     source_id=source_id,
                     model=model,
                     timeout_seconds=timeout_seconds,
+                    max_output_tokens=max_output_tokens,
                 ),
                 audit_work_id=node_id,
             )
-            return measure_merge_request_tokens(candidate, counter)
+            return measure_merge_request_tokens(
+                candidate,
+                counter,
+                provider_schema_reserve=provider_schema_reserve,
+            )
         return counter.count(
             "\n".join(
                 serialize_source_passage_block(
@@ -569,9 +585,14 @@ def _prepare_merge(
         source_id=source_id,
         model=model,
         timeout_seconds=timeout_seconds,
+        max_output_tokens=max_output_tokens,
     )
     request = replace(request, audit_work_id=node_id)
-    request_tokens = measure_merge_request_tokens(request, counter)
+    request_tokens = measure_merge_request_tokens(
+        request,
+        counter,
+        provider_schema_reserve=provider_schema_reserve,
+    )
     if request_tokens > usable_tokens:
         raise BudgetError(
             f"grounded merge request at {node_id} costs {request_tokens} tokens "
@@ -594,6 +615,7 @@ def _prepare_merge(
                 "instructions": request.instructions,
                 "input_text": request.input_text,
                 "schema": request.response_schema,
+                "max_output_tokens": request.max_output_tokens,
                 "grounding_max_tokens": configured_grounding_policy.max_tokens,
                 "effective_grounding_max_tokens": grounding_policy.max_tokens,
                 "usable_tokens": usable_tokens,
