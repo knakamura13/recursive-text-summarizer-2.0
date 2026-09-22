@@ -21,6 +21,18 @@ def test_normalization_preserves_structure_and_unicode() -> None:
     assert normalized == "# H\n\n  - café\nNext"
 
 
+def test_normalization_removes_multiple_leading_blank_lines() -> None:
+    source = "\n\n\n# Heading\nBody"
+
+    assert normalize_source_text(source) == "# Heading\nBody"
+
+
+def test_normalization_preserves_trailing_nbsp() -> None:
+    source = "A trailing non-breaking space\xa0"
+
+    assert normalize_source_text(source) == source
+
+
 def test_source_identity_is_based_on_canonical_utf8_text() -> None:
     document = ingest_text("\ufeff# H\r\n\r\n  - café  \r\n")
 
