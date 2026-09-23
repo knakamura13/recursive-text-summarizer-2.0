@@ -33,11 +33,15 @@ from summarizer.segmentation import CacheCoordinator, SourceSegment
 from summarizer.summaries import SummaryNode
 from summarizer.tokenization import TokenCounter
 from summarizer.verification import (
+    ClaimVerdict,
+    SourceLexicalIndex,
     VerificationConfig,
+    VerificationPassResult,
     VerificationResult,
     VerificationRuntime,
     build_source_lexical_index,
     verify_and_repair,
+    verify_draft_once,
 )
 
 _DEFAULT_VERIFICATION_CONFIG = VerificationConfig()
@@ -56,6 +60,192 @@ class FinalizationResult:
 
 class FinalizationVerificationError(RuntimeError):
     """Verification closed without a safe reader-facing final summary."""
+
+
+def _all_claims_supported(result: VerificationPassResult) -> bool:
+    return (
+        not result.failed
+        and bool(result.assessments)
+        and all(
+            assessment.verdict is ClaimVerdict.SUPPORTED
+            for assessment in result.assessments
+        )
+    )
+
+
+def _supported_fragment_text(result: VerificationPassResult, unit_text: str) -> str | None:
+    """Return unit text that can be rechecked, excluding unsupported fragments.
+
+    A fully supported unit is returned unchanged. A contradicted claim rejects
+    the unit. Mixed support keeps only the supported non-fallback anchors, in
+    source order, so an unsupported fragment is not published with them.
+    """
+    if result.failed or not result.assessments:
+        return None
+    if any(
+        assessment.verdict is ClaimVerdict.CONTRADICTED
+        for assessment in result.assessments
+    ):
+        return None
+    if _all_claims_supported(result):
+        return unit_text.strip()
+    verdicts = {
+        assessment.claim_id: assessment.verdict for assessment in result.assessments
+    }
+    anchors: list[tuple[int, str]] = []
+    cursor = 0
+    for claim in result.claims:
+        if claim.is_fallback or verdicts.get(claim.claim_id) is not ClaimVerdict.SUPPORTED:
+            continue
+        index = unit_text.find(claim.anchor, cursor)
+        if index < 0:
+            index = unit_text.find(claim.anchor)
+        if index < 0:
+            continue
+        anchor = claim.anchor.strip()
+        if anchor:
+            anchors.append((index, anchor))
+        cursor = index + len(claim.anchor)
+    if not anchors:
+        return None
+    reduced = " ".join(anchor for _, anchor in sorted(anchors))
+    if reduced == unit_text.strip():
+        return None
+    return reduced
+
+
+def _assembled_addition_supported(
+    result: VerificationPassResult,
+    prior_texts: Sequence[str],
+) -> bool:
+    """Accept a new sentence when only an already kept sentence's fragment flips.
+
+    A new claim, a fallback claim, or a contradiction still rejects the addition.
+    """
+    if _all_claims_supported(result):
+        return True
+    claims = getattr(result, "claims", ())
+    spans = getattr(result, "spans", ())
+    if result.failed or not result.assessments or not claims or not spans:
+        return False
+    if any(
+        assessment.verdict is ClaimVerdict.CONTRADICTED
+        for assessment in result.assessments
+    ):
+        return False
+    claims_by_id = {claim.claim_id: claim for claim in claims}
+    span_text = {span.span_id: span.text.strip() for span in spans}
+    prior = {text.strip() for text in prior_texts}
+    for assessment in result.assessments:
+        if assessment.verdict is ClaimVerdict.SUPPORTED:
+            continue
+        claim = claims_by_id.get(assessment.claim_id)
+        if (
+            claim is None
+            or claim.is_fallback
+            or span_text.get(claim.span_id, "") not in prior
+        ):
+            return False
+    return True
+
+
+def _passing_sentence_text(result: VerificationResult) -> str | None:
+    """Keep sentences whose every claim passed, and drop the rest.
+
+    A contract failure has no sentence verdicts to trust, so nothing is kept.
+    The same text is not returned, which stops a failed draft from being checked again.
+    """
+    if not result.failed or not result.pass_results:
+        return None
+    passed = result.pass_results[-1]
+    if passed.failed or not passed.spans or not passed.claims or not passed.assessments:
+        return None
+    verdicts = {
+        assessment.claim_id: assessment.verdict for assessment in passed.assessments
+    }
+    claims_by_span: dict[str, list[str]] = {}
+    for claim in passed.claims:
+        claims_by_span.setdefault(claim.span_id, []).append(claim.claim_id)
+    kept: list[str] = []
+    for span in passed.spans:
+        claim_ids = claims_by_span.get(span.span_id, [])
+        if claim_ids and all(
+            verdicts.get(claim_id) is ClaimVerdict.SUPPORTED for claim_id in claim_ids
+        ):
+            text = span.text.strip()
+            if text:
+                kept.append(text)
+    if not kept:
+        return None
+    reduced = " ".join(kept)
+    if reduced == result.text.strip():
+        return None
+    return reduced
+
+
+def _recheck_fallback_draft(
+    text: str,
+    *,
+    verify: Callable[[str], VerificationResult],
+) -> VerificationResult:
+    """Drop failing sentences and publish only a remainder that passes."""
+    result = verify(text)
+    for _ in range(7):
+        if not result.failed:
+            return result
+        reduced = _passing_sentence_text(result)
+        if reduced is None:
+            return result
+        result = verify(reduced)
+    return result
+
+
+def _verified_content_unit_draft(
+    root: SummaryNode,
+    *,
+    source_id: str,
+    source_index: SourceLexicalIndex,
+    runtime: VerificationRuntime,
+    config: VerificationConfig,
+    target_words: int,
+) -> tuple[str, tuple[GenerationResult, ...]]:
+    """Select a bounded set of independently supported root assertions."""
+    selected: list[str] = []
+    generations: list[GenerationResult] = []
+
+    def _verify(text: str) -> VerificationPassResult:
+        result = verify_draft_once(
+            text,
+            source_id=source_id,
+            source_index=source_index,
+            runtime=runtime,
+            config=config,
+            pass_index=1,
+            terminalize_errors=True,
+        )
+        generations.extend(result.generations)
+        return result
+
+    for unit in root.content_units[:8]:
+        if unit.uncertain:
+            continue
+        result = _verify(unit.text)
+        if result.failed:
+            continue
+        candidate = _supported_fragment_text(result, unit.text)
+        if candidate is None:
+            continue
+        if candidate != unit.text.strip() and not _all_claims_supported(_verify(candidate)):
+            continue
+        if selected and not _assembled_addition_supported(
+            _verify(" ".join((*selected, candidate))),
+            selected,
+        ):
+            continue
+        selected.append(candidate)
+        if sum(len(text.split()) for text in selected) >= target_words:
+            break
+    return " ".join(selected), tuple(generations)
 
 
 class PublicationError(RuntimeError):
@@ -275,6 +465,7 @@ def _finalize_summary(
     failures: Sequence[str] = (),
     counter: TokenCounter | None = None,
     source_cores: Mapping[str, str] | None = None,
+    verification_segments: Sequence[SourceSegment] = (),
     verification: VerificationConfig = _DEFAULT_VERIFICATION_CONFIG,
     verification_runtime: VerificationRuntime | None = None,
     verification_context_window_tokens: int | None = None,
@@ -299,6 +490,10 @@ def _finalize_summary(
         max_output_tokens=max_output_tokens,
     )
     verification_result: VerificationResult | None = None
+    final_text = editorial.text
+    fallback_generations: tuple[GenerationResult, ...] = ()
+    audit_warnings = tuple(warnings)
+    audit_segments = (*segments, *verification_segments)
     if verification.enabled:
         if source_cores is None:
             raise ValueError(
@@ -312,17 +507,53 @@ def _finalize_summary(
             context_window_tokens=verification_context_window_tokens,
             injected=verification_runtime,
         )
+        source_index = build_source_lexical_index(
+            provenance_ids=(
+                tuple(segment.segment_id for segment in verification_segments)
+                if verification_segments else root.provenance
+            ),
+            source={
+                **source_cores,
+                **{segment.segment_id: segment.text for segment in verification_segments},
+            },
+        )
         verification_result = verify_and_repair(
             editorial.text,
             source_id=source_id,
-            source_index=build_source_lexical_index(
-                provenance_ids=root.provenance,
-                source=source_cores,
-            ),
+            source_index=source_index,
             runtime=runtime,
             config=verification,
             coordinator=verification_coordinator,
         )
+        if not verification_result.failed:
+            final_text = verification_result.text
+        if verification_result.failed:
+            fallback_text, fallback_generations = _verified_content_unit_draft(
+                root,
+                source_id=source_id,
+                source_index=source_index,
+                runtime=runtime,
+                config=verification,
+                target_words=target_words,
+            )
+            if fallback_text:
+                fallback_result = _recheck_fallback_draft(
+                    fallback_text,
+                    verify=lambda candidate: verify_and_repair(
+                        candidate,
+                        source_id=source_id,
+                        source_index=source_index,
+                        runtime=runtime,
+                        config=verification,
+                        coordinator=verification_coordinator,
+                    ),
+                )
+                verification_result = fallback_result
+                if not fallback_result.failed:
+                    final_text = fallback_result.text
+                    audit_warnings = (*audit_warnings, "verified_content_unit_fallback")
+            if verification_result.failed:
+                audit_warnings = (*audit_warnings, "verified_content_unit_fallback_failed")
         if verification_result.failed:
             _build_audit(
                 audit_path=audit_path,
@@ -330,12 +561,12 @@ def _finalize_summary(
                 strategy=strategy,
                 model=model,
                 audit_configuration=audit_configuration,
-                segments=segments,
+                segments=audit_segments,
                 nodes=nodes,
                 root_node_id=root_node_id,
                 citations=(),
-                generations=(*generations, editorial.generation),
-                warnings=warnings,
+                generations=(*generations, editorial.generation, *fallback_generations),
+                warnings=audit_warnings,
                 failures=failures,
                 verification=verification_result,
                 verification_enabled=True,
@@ -350,7 +581,6 @@ def _finalize_summary(
     citations = resolve_citations(
         root.provenance, source_id=source_id, segments=segments
     )
-    final_text = verification_result.text if verification_result else editorial.text
     text = render_citations(final_text, citations) if include_citations else final_text
 
     artifact = _build_audit(
@@ -359,12 +589,12 @@ def _finalize_summary(
         strategy=strategy,
         model=model,
         audit_configuration=audit_configuration,
-        segments=segments,
+        segments=audit_segments,
         nodes=nodes,
         root_node_id=root_node_id,
         citations=citations,
-        generations=(*generations, editorial.generation),
-        warnings=warnings,
+        generations=(*generations, editorial.generation, *fallback_generations),
+        warnings=audit_warnings,
         failures=failures,
         verification=verification_result,
         verification_enabled=verification.enabled,

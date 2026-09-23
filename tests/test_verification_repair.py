@@ -217,6 +217,46 @@ def test_verify_and_repair_is_disabled_without_provider_calls() -> None:
     assert result.pass_results == ()
 
 
+def test_verify_and_repair_does_not_publish_initially_unsupported_factual_claim() -> None:
+    class ScriptedProvider:
+        def generate(self, request):
+            if request.operation_id == "verification-decompose:V01":
+                response = {"spans": [{"span_id": "V01S000001", "anchors": ["one person died"]}]}
+            elif request.operation_id == "verification-classify:V01":
+                response = {
+                    "findings": [
+                        {"claim_id": claim_id, "verdict": "insufficiently_supported", "evidence": []}
+                        for claim_id in ("V01C000001", "V01C000002")
+                    ]
+                }
+            else:
+                raise AssertionError(f"unexpected request {request.operation_id}")
+            return GenerationResult(json.dumps(response), "fake", request.model)
+
+    draft = "Of the 16 people, one person died."
+    result = verify_and_repair(
+        draft,
+        source_id="a" * 64,
+        source_index=build_source_lexical_index(
+            provenance_ids=("S000001",),
+            source={"S000001": "Sixteen people entered Tunnel Creek."},
+        ),
+        runtime=VerificationRuntime(
+            provider=ScriptedProvider(),
+            counter=ConservativeUtf8TokenCounter(),
+            model="repair-model",
+            timeout_seconds=30,
+            context_window_tokens=8192,
+        ),
+        config=VerificationConfig(enabled=True),
+    )
+
+    assert result.failed
+    assert result.failure_codes == ("insufficient_support",)
+    assert result.text == draft
+    assert result.repairs == ()
+
+
 def test_verify_once_escalates_raw_contradictions_through_omitted_evidence() -> None:
     class ScriptedProvider:
         def __init__(self) -> None:
@@ -349,12 +389,13 @@ def test_verify_and_repair_terminalizes_malformed_initial_decomposition() -> Non
     assert result.text == draft
     assert result.failure_codes == ("decomposition_failed",)
     assert [(item.phase, item.prompt_version) for item in result.phase_generations] == [
-        ("decomposition", "verification-decomposition/1")
+        ("decomposition", "verification-decomposition/2"),
+        ("decomposition", "verification-decomposition/2"),
     ]
 
 
 def test_verify_and_repair_terminalizes_invalid_span_anchor_result_after_repair() -> None:
-    """A structurally valid but mismatched anchor response is a closed failure."""
+    """A duplicate-anchor response remains a closed failure after retry."""
     draft = "The value is 42."
 
     class ScriptedProvider:
@@ -364,7 +405,8 @@ def test_verify_and_repair_terminalizes_invalid_span_anchor_result_after_repair(
                     *contradicted_atomic_and_fallback(1, "value is 41"),
                     '{"repairs":[{"span_id":"V01S000001","original_hash":"%s","action":"replace","replacement":"The value is 41."}]}'
                     % hashlib.sha256(draft.encode()).hexdigest(),
-                    '{"spans":[{"span_id":"V02S000001","anchors":["not in the draft"]}]}',
+                    '{"spans":[{"span_id":"V02S000001","anchors":["value","value"]}]}',
+                    '{"spans":[{"span_id":"V02S000001","anchors":["value","value"]}]}',
                 )
             )
 
@@ -385,7 +427,7 @@ def test_verify_and_repair_terminalizes_invalid_span_anchor_result_after_repair(
     assert result.text == draft
     assert result.failure_codes == ("anchor_failed",)
     assert [item.phase for item in result.phase_generations] == [
-        "decomposition", "classification", "repair", "decomposition",
+        "decomposition", "classification", "repair", "decomposition", "decomposition",
     ]
 
 
@@ -443,6 +485,7 @@ def test_post_repair_malformed_pass_does_not_consume_another_repair_attempt() ->
                     *contradicted_atomic_and_fallback(1, "value is 41"),
                     '{"repairs":[{"span_id":"V01S000001","original_hash":"%s","action":"replace","replacement":"The value is 41."}]}' % hashlib.sha256(draft.encode()).hexdigest(),
                     "not-json",
+                    "not-json",
                 )
             )
 
@@ -463,7 +506,7 @@ def test_post_repair_malformed_pass_does_not_consume_another_repair_attempt() ->
 
     assert result.failed
     assert result.text == draft
-    assert provider.calls == 4
+    assert provider.calls == 5
     assert result.failure_codes == ("decomposition_failed",)
 
 
@@ -693,6 +736,7 @@ def test_verify_and_repair_discards_nested_repairs_when_continuation_fails() -> 
                             ]
                         }
                     ),
+                    "not-json",
                     "not-json",
                 )
             )

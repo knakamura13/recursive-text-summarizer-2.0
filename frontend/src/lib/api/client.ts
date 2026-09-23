@@ -116,7 +116,8 @@ export const api = {
 			},
 			body: JSON.stringify({ document_id: documentId, config })
 		}),
-	getRun: (runId: string) => apiFetch<{ state: string }>(`/api/v1/runs/${runId}`),
+	getRun: (runId: string) =>
+		apiFetch<{ state: string; failure_reason?: string | null }>(`/api/v1/runs/${runId}`),
 	cancelRun: (runId: string) =>
 		apiFetch(`/api/v1/runs/${runId}/cancel`, { method: 'POST' }),
 	resumeRun: (runId: string) =>

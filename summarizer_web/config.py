@@ -46,5 +46,6 @@ class AppPaths:
 def load_paths() -> AppPaths:
     paths = AppPaths.from_root(resolve_data_dir())
     for directory in (paths.root, paths.documents, paths.runs, paths.cache):
-        directory.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
     return paths

@@ -25,6 +25,7 @@ from summarizer.finalization import (
     _finalize_summary,
     publish_final_output,
 )
+from summarizer.grounding import SourcePassage, serialize_source_passage
 from summarizer.hierarchy import TreeNode, build_hierarchy
 from summarizer.ingestion import SourceDocument
 from summarizer.leaf import summarize_segments
@@ -39,6 +40,7 @@ from summarizer.segmentation import (
     CacheCoordinator,
     SegmentationConfig,
     cached_segment_document,
+    segment_document,
 )
 from summarizer.summaries import MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
 from summarizer.tokenization import TokenCounter
@@ -517,6 +519,18 @@ def _run_pipeline(
         )
     if config.verification.enabled:
         observer.emit(StageEvent(StageName.VERIFYING, "active"))
+    verification_segments = ()
+    if config.verification.enabled and report.strategy == "direct":
+        document_passage = SourcePassage(segment.segment_id, document.text)
+        if counter.count(serialize_source_passage(document_passage)) > config.verification.evidence_tokens:
+            verification_segments = tuple(
+                replace(item, order=item.order + 1)
+                for item in segment_document(
+                    document,
+                    counter,
+                    SegmentationConfig(max_tokens=max(1, config.verification.evidence_tokens // 2)),
+                )
+            )
     final = _finalize_summary(
         root.summary,
         recording,
@@ -547,6 +561,7 @@ def _run_pipeline(
             segment.segment_id: document.text[segment.core_start : segment.core_end]
             for segment in segments
         },
+        verification_segments=verification_segments,
         verification=config.verification,
         verification_runtime=verifier_runtime,
         verification_context_window_tokens=report.context_window_tokens,

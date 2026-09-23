@@ -214,6 +214,34 @@ def test_enabled_direct_verification_repairs_editorial_before_citations_and_audi
     assert result.final.audit.configuration["verification"]["enabled"] is True
 
 
+def test_direct_verification_uses_bounded_source_passages_for_large_document(tmp_path) -> None:
+    provider = VerificationPipelineProvider(verification="supported")
+    source = "The source confirms the value is 41. " + "Background detail. " * 260
+
+    result = run_pipeline(
+        ingest_text(source),
+        provider,
+        CharacterCounter(),
+        app=app(),
+        strategy=strategy(),
+        config=PipelineConfig(
+            target_words=40,
+            audit_path=tmp_path / "audit.json",
+            verification=VerificationConfig(enabled=True),
+        ),
+    )
+
+    assert result.final.text == "42."
+    assert result.root.covered_segments == ("D000001",)
+    assert result.final.audit is not None
+    assert result.final.audit.verification.passes[0].assessments
+    selected = result.final.audit.verification.passes[0].selections[0].selected_ids
+    assert selected and all(identifier.startswith("S") for identifier in selected)
+    assert set(selected) <= {
+        segment.segment_id for segment in result.final.audit.source_segments
+    }
+
+
 def test_enabled_hierarchical_verification_uses_default_complete_runtime(tmp_path) -> None:
     provider = VerificationPipelineProvider(verification="supported")
     counter = CharacterCounter()
