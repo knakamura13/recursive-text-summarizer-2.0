@@ -127,7 +127,14 @@ export const api = {
 			`/api/v1/runs/${runId}/tree`
 		),
 	getRunSummary: (runId: string) =>
-		apiFetch<{ available: boolean; text?: string | null }>(`/api/v1/runs/${runId}/summary`),
+		apiFetch<{
+			available: boolean;
+			text?: string | null;
+			word_count?: number | null;
+			target_words?: number | null;
+			short_of_target?: boolean;
+			audit_warnings?: string[];
+		}>(`/api/v1/runs/${runId}/summary`),
 	confirmExtraction: (documentId: string) =>
 		apiFetch(`/api/v1/documents/${documentId}/confirm-extraction`, { method: 'POST' })
 };

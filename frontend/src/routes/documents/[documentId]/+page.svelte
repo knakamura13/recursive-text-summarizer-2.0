@@ -24,6 +24,9 @@
 	let runId = $state<string | null>(null);
 	let runState = $state<string | null>(null);
 	let runFailure = $state<string | null>(null);
+	let summaryWordCount = $state<number | null>(null);
+	let summaryTargetWords = $state<number | null>(null);
+	let summaryShortOfTarget = $state(false);
 	let showHierarchyDrawer = $state(false);
 	let showDocumentsDrawer = $state(false);
 	let summarizeOpen = $state(false);
@@ -60,6 +63,9 @@
 		]);
 		hierarchy = tree.nodes;
 		finalSummary = summary.available ? summary.text ?? '' : '';
+		summaryWordCount = summary.available ? summary.word_count ?? null : null;
+		summaryTargetWords = summary.available ? summary.target_words ?? null : null;
+		summaryShortOfTarget = summary.available ? Boolean(summary.short_of_target) : false;
 		summaryPreview =
 			hierarchy.find((node) => node.node_id === selectedNodeId)?.label ?? 'Select a node to inspect.';
 		stages = mapStages(run.state);
@@ -153,6 +159,9 @@
 			{stages}
 			{runState}
 			{runFailure}
+			{summaryWordCount}
+			{summaryTargetWords}
+			{summaryShortOfTarget}
 			onSummarize={() => (summarizeOpen = true)}
 		/>
 	{:else if error}

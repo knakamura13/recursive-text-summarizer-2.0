@@ -11,6 +11,9 @@
 		stages = [],
 		runState = null,
 		runFailure = null,
+		summaryWordCount = null,
+		summaryTargetWords = null,
+		summaryShortOfTarget = false,
 		onSummarize
 	}: {
 		activeTab?: WorkspaceTab;
@@ -21,6 +24,9 @@
 		stages?: ProgressStage[];
 		runState?: string | null;
 		runFailure?: string | null;
+		summaryWordCount?: number | null;
+		summaryTargetWords?: number | null;
+		summaryShortOfTarget?: boolean;
 		onSummarize?: () => void;
 	} = $props();
 
@@ -63,7 +69,14 @@
 	{:else if runState === 'interrupted'}
 		<p role="status">Run interrupted. It can be resumed.</p>
 	{:else if runState === 'completed'}
-		<p role="status">Run completed.</p>
+		{#if summaryShortOfTarget && summaryWordCount !== null && summaryTargetWords !== null}
+			<p class="run-short" role="status">
+				Run completed. Published summary is {summaryWordCount} words, below the {summaryTargetWords}-word
+				target.
+			</p>
+		{:else}
+			<p role="status">Run completed.</p>
+		{/if}
 	{/if}
 
 	{#if activeTab === 'document'}
@@ -126,6 +139,10 @@
 
 	.run-error {
 		color: var(--color-error, #a7352f);
+	}
+
+	.run-short {
+		color: var(--color-amber-text, #8a5a00);
 	}
 
 	.tablist {
