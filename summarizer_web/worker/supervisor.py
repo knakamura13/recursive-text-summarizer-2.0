@@ -32,10 +32,13 @@ class RunSupervisor:
 
     def start(self) -> None:
         init_database()
-        reconcile_on_startup()
-        if self.thread is None or not self.thread.is_alive():
-            self.thread = threading.Thread(target=self._loop, daemon=True)
-            self.thread.start()
+        if self.thread is not None and self.thread.is_alive():
+            return
+        with self.lock:
+            pending = {run_id for run_id, _resume in self.queue}
+        reconcile_on_startup(exclude_run_ids=pending)
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
 
     def enqueue(self, run_id: str, *, resume: bool = False) -> None:
         with self.lock:

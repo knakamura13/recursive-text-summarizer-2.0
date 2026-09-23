@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime, timezone
-from pathlib import Path
 
 from summarizer.finalization import read_published_summary
 from summarizer_web.config import load_paths
@@ -14,13 +14,16 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def reconcile_on_startup() -> None:
+def reconcile_on_startup(exclude_run_ids: Collection[str] = ()) -> None:
     db = get_database()
+    excluded = set(exclude_run_ids)
     rows = db.fetchall(
         "SELECT run_id, state FROM runs WHERE state IN ('running', 'cancelling', 'queued')"
     )
     for row in rows:
         run_id = row["run_id"]
+        if run_id in excluded:
+            continue
         summary_path = load_paths().runs / run_id / "summary.txt"
         if summary_path.exists() and summary_path.read_text(encoding="utf-8").strip():
             db.execute(
