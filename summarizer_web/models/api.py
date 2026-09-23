@@ -164,6 +164,10 @@ class FinalSummaryResponse(ApiModel):
     available: bool
     text: str | None = None
     citations: list[dict[str, Any]] = Field(default_factory=list)
+    word_count: int | None = None
+    target_words: int | None = None
+    short_of_target: bool = False
+    audit_warnings: list[str] = Field(default_factory=list)
     verification_state: Literal[
         "not_run", "in_progress", "completed", "failed"
     ] = "not_run"

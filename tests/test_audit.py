@@ -9,6 +9,7 @@ from summarizer.audit import (
     AuditArtifact,
     AuditError,
     build_audit_artifact,
+    citation_provenance_for_summary,
     render_citations,
     resolve_citations,
     serialize_audit,
@@ -362,6 +363,62 @@ def test_citations_are_source_ordered_and_unknown_provenance_fails() -> None:
     assert render_citations("Text.", resolve_citations((segment.segment_id,), source_id=document.source_id, segments=(segment,))) == "Text.\n\nSources: D000001"
     with pytest.raises(AuditError, match="unknown"):
         resolve_citations(("S999999",), source_id=document.source_id, segments=(segment,))
+
+
+def test_citation_provenance_prefers_verifier_segments() -> None:
+    from summarizer.verification import (
+        BatchFinding,
+        ClaimAssessment,
+        ClaimVerdict,
+        VerificationPassResult,
+        VerificationResult,
+    )
+
+    pass_result = VerificationPassResult(
+        spans=(),
+        claims=(),
+        assessments=(
+            ClaimAssessment(
+                claim_id="V01C000001",
+                verdict=ClaimVerdict.SUPPORTED,
+                findings=(
+                    BatchFinding(
+                        claim_id="V01C000001",
+                        verdict=ClaimVerdict.SUPPORTED,
+                        evidence_ids=("S000004", "S000001"),
+                        exact_quotes=("quote four", "quote one"),
+                    ),
+                ),
+                pass_index=1,
+                verifier_provider="ollama",
+                verifier_model="test",
+                prompt_version="classification/1",
+            ),
+        ),
+        selections=(),
+        bundles=(),
+        generations=(),
+        phase_generations=(),
+        diagnostic_codes=(),
+        failed=False,
+    )
+    verification = VerificationResult(
+        text="Supported summary.",
+        passes=((),),
+        selections=((),),
+        repairs=(),
+        generations=(),
+        diagnostic_codes=(),
+        exhausted=False,
+        failed=False,
+        pass_results=(pass_result,),
+    )
+    provenance = citation_provenance_for_summary(
+        ("D000001",),
+        verification,
+        verification_enabled=True,
+    )
+    assert provenance == ("S000004", "S000001")
 
 
 def test_audit_accepts_openai_completed_finish_status() -> None:

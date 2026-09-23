@@ -215,10 +215,23 @@ def get_node_detail(run_id: str, node_id: str) -> NodeDetailResponse:
     )
 
 
+def _published_summary_body(text: str) -> str:
+    return text.split("\n\nSources:", 1)[0].strip()
+
+
+def _published_word_count(text: str) -> int:
+    body = _published_summary_body(text)
+    return len(body.split()) if body else 0
+
+
 def get_final_summary(run_id: str) -> FinalSummaryResponse:
     summary_path = load_paths().runs / run_id / "summary.txt"
     verification_path = load_paths().runs / run_id / "verification.json"
-    row = get_database().fetchone("SELECT state FROM runs WHERE run_id = ?", (run_id,))
+    audit_path = load_paths().runs / run_id / "audit.json"
+    row = get_database().fetchone(
+        "SELECT state, config_json FROM runs WHERE run_id = ?",
+        (run_id,),
+    )
     if row is None:
         raise HTTPException(status_code=404, detail="Run not found")
     if row["state"] != "completed" or not summary_path.exists():
@@ -227,6 +240,13 @@ def get_final_summary(run_id: str) -> FinalSummaryResponse:
             verification_state = "in_progress"
         return FinalSummaryResponse(available=False, verification_state=verification_state)
     text = summary_path.read_text(encoding="utf-8")
+    config = RunConfig.model_validate_json(row["config_json"])
+    word_count = _published_word_count(text)
+    target_words = config.target_words
+    audit_warnings: list[str] = []
+    if audit_path.exists():
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        audit_warnings = list(audit.get("warnings") or [])
     verification = None
     verification_state = "not_run"
     if verification_path.exists():
@@ -235,6 +255,10 @@ def get_final_summary(run_id: str) -> FinalSummaryResponse:
     return FinalSummaryResponse(
         available=True,
         text=text,
+        word_count=word_count,
+        target_words=target_words,
+        short_of_target=word_count < target_words,
+        audit_warnings=audit_warnings,
         verification_state=verification_state,
         verification=verification,
     )

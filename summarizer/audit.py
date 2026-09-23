@@ -26,6 +26,7 @@ from summarizer.hierarchy import TreeNode
 from summarizer.providers.base import GenerationResult
 from summarizer.safety import redact_text
 from summarizer.segmentation import SourceSegment
+from summarizer.verification import ClaimVerdict
 
 if TYPE_CHECKING:
     from summarizer.verification import VerificationResult
@@ -816,6 +817,41 @@ def resolve_citations(
         for segment in sorted(segments, key=lambda item: item.order)
         if segment.segment_id in cited
     )
+
+
+def citation_provenance_for_summary(
+    root_provenance: Sequence[str],
+    verification: VerificationResult | None,
+    *,
+    verification_enabled: bool,
+) -> Sequence[str]:
+    """Prefer verifier evidence segments over whole-document provenance when available."""
+    if not verification_enabled or verification is None or verification.failed:
+        return root_provenance
+    if not verification.pass_results:
+        return root_provenance
+    final_pass = verification.pass_results[-1]
+    if final_pass.failed:
+        return root_provenance
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for assessment in final_pass.assessments:
+        if assessment.verdict is not ClaimVerdict.SUPPORTED:
+            continue
+        for finding in assessment.findings:
+            if finding.verdict is not ClaimVerdict.SUPPORTED:
+                continue
+            for evidence_id in finding.evidence_ids:
+                if evidence_id in seen:
+                    continue
+                seen.add(evidence_id)
+                ordered.append(evidence_id)
+    if not ordered:
+        return root_provenance
+    sub_segments = [segment_id for segment_id in ordered if segment_id.startswith("S")]
+    if sub_segments:
+        return tuple(sub_segments)
+    return tuple(ordered)
 
 
 def render_citations(text: str, citations: Sequence[Citation]) -> str:

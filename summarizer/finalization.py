@@ -15,6 +15,7 @@ from summarizer.audit import (
     AuditArtifact,
     Citation,
     build_audit_artifact,
+    citation_provenance_for_summary,
     render_citations,
     resolve_citations,
     serialize_audit,
@@ -606,7 +607,13 @@ def _finalize_summary(
             )
 
     citations = resolve_citations(
-        root.provenance, source_id=source_id, segments=segments
+        citation_provenance_for_summary(
+            root.provenance,
+            verification_result,
+            verification_enabled=verification.enabled,
+        ),
+        source_id=source_id,
+        segments=audit_segments,
     )
     text = render_citations(final_text, citations) if include_citations else final_text
 
