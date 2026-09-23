@@ -9,6 +9,8 @@
 		summaryPreview = '',
 		finalSummary = '',
 		stages = [],
+		runState = null,
+		runFailure = null,
 		onSummarize
 	}: {
 		activeTab?: WorkspaceTab;
@@ -17,6 +19,8 @@
 		summaryPreview?: string;
 		finalSummary?: string;
 		stages?: ProgressStage[];
+		runState?: string | null;
+		runFailure?: string | null;
 		onSummarize?: () => void;
 	} = $props();
 
@@ -51,6 +55,15 @@
 
 	{#if stages.length}
 		<ProgressStepper {stages} />
+	{/if}
+	{#if runState === 'failed'}
+		<p class="run-error" role="alert">Run failed. No summary was published.{runFailure ? ` ${runFailure}` : ''}</p>
+	{:else if runState === 'cancelled'}
+		<p role="status">Run cancelled.</p>
+	{:else if runState === 'interrupted'}
+		<p role="status">Run interrupted. It can be resumed.</p>
+	{:else if runState === 'completed'}
+		<p role="status">Run completed.</p>
 	{/if}
 
 	{#if activeTab === 'document'}
@@ -109,6 +122,10 @@
 		padding: var(--space-2) var(--space-4);
 		cursor: pointer;
 		font-weight: 600;
+	}
+
+	.run-error {
+		color: var(--color-error, #a7352f);
 	}
 
 	.tablist {

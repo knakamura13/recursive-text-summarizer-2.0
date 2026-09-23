@@ -81,11 +81,35 @@ def test_classification_request_contains_only_selected_authoritative_evidence() 
     assert request.schema_name == "verification_claim_findings"
     assert "supplied selection" in request.instructions
     assert "assessments rather than proof" in request.instructions
+    assert "segment_id only from the supplied evidence" in request.instructions
+    assert "never from span_text" in request.instructions
+    assert "Factual claims remain meaningfully verifiable" in request.instructions
     assert claim.anchor not in request.instructions
     assert request.input_text.count(claim.anchor) == 2
     assert "S000001" in request.input_text
     assert "S000002" not in request.input_text
     assert "The measured value is 42." in request.input_text
+
+
+def test_local_classification_schema_bounds_finding_count_and_ids() -> None:
+    claim = Claim("V01C000001", "V01S000001", 1, "measured value", False)
+    bundle = EvidenceBundle(
+        EvidenceSelection(claim.claim_id, ("S000001",), ("S000001",), (), 1, "lexical-overlap/1", True),
+        (SourcePassage("S000001", "The measured value is 42."),),
+    )
+    request = build_classification_request(
+        (claim,),
+        evidence={claim.claim_id: bundle},
+        spans={claim.span_id: "The measured value is 42."},
+        source_id="a" * 64,
+        runtime=replace(runtime(), provider_identity="ollama"),
+    )
+
+    assert request.response_schema is not None
+    findings = request.response_schema["properties"]["findings"]
+    assert findings["minItems"] == findings["maxItems"] == 1
+    assert request.response_schema["$defs"]["_Finding"]["properties"]["claim_id"]["enum"] == [claim.claim_id]
+    assert request.response_schema["$defs"]["_FindingEvidence"]["properties"]["segment_id"]["enum"] == ["S000001"]
 
 
 def test_classification_request_includes_trusted_enclosing_span_context() -> None:
@@ -105,3 +129,4 @@ def test_classification_request_includes_trusted_enclosing_span_context() -> Non
 
     assert '"span_id":"V01S000001"' in request.input_text
     assert '"span_text":"Alice bought shares."' in request.input_text
+from dataclasses import replace

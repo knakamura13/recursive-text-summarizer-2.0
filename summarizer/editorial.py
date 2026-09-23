@@ -14,7 +14,7 @@ from summarizer.safety import redact_text
 from summarizer.segmentation import CacheCoordinator
 from summarizer.summaries import SummaryNode
 
-EDITORIAL_PROMPT_VERSION = "editorial-prompt/1"
+EDITORIAL_PROMPT_VERSION = "editorial-prompt/2"
 EDITORIAL_SCHEMA_NAME = "final_editorial_draft"
 
 _INSTRUCTIONS = """\
@@ -31,6 +31,13 @@ Follow these rules:
 - Preserve material qualifications, uncertainty, and disagreements. Do not
   resolve a conflict or turn a hedge into a statement.
 - Reorganize and deduplicate only to make the result coherent and readable.
+- State concrete events and outcomes directly. Avoid phrases such as "the
+  document details," "the narrative mentions," or vague references to an
+  experience, history, or geographic features. Each sentence should express
+  specific facts that can be checked against the source.
+- Keep distinct events separate. If mentioning a prior event, name its date or
+  other distinguishing context so its people and outcomes cannot be mistaken
+  for those of the main event.
 - Do not include credentials, authentication data, access tokens, or raw
   secrets, even if they occur in the material.
 

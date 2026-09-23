@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import sys
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 from summarizer.cli import build_counter, build_provider
-from summarizer.config import AppConfig, CacheConfig, ReliabilityConfig, StrategyConfig
+from summarizer.config import AppConfig, CacheConfig, ReliabilityConfig, RetryPolicy, StrategyConfig
 from summarizer.ingestion import SourceDocument
 from summarizer.pipeline import PipelineConfig, run_pipeline
+from summarizer.providers.base import ContextWindowProvider
 from summarizer.providers.retrying import RetryingProvider
 from summarizer.runtime.observers import RuntimeObserver, StageEvent, StageName
 from summarizer.segmentation import SegmentationConfig
@@ -97,14 +99,25 @@ def run_job(run_id: str, *, resume: bool = False) -> None:
         reliability=ReliabilityConfig(
             max_in_flight=config.get("max_concurrency", 1),
             run_mode="resume" if resume else "new",
-            run_id=run_id,
+            run_id=f"run-{run_id}",
         ),
     )
     observer = RuntimeObserver(
         on_stage=lambda event: _emit(run_id, event),
         should_cancel=lambda: _cancel_flag_path(run_id).exists(),
     )
-    provider = RetryingProvider(build_provider(app))
+    raw_provider = build_provider(app)
+    if isinstance(raw_provider, ContextWindowProvider):
+        context_window = raw_provider.configure_context_window(
+            app.model,
+            strategy.context_window,
+            timeout_seconds=app.timeout_seconds,
+        )
+        if context_window is not None:
+            strategy = replace(strategy, context_window=context_window)
+    provider = RetryingProvider(
+        raw_provider, RetryPolicy(max_attempts=config.get("max_retries", 5))
+    )
     counter = build_counter(app)
     result = run_pipeline(
         document,

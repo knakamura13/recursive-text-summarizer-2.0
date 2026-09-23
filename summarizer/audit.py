@@ -57,7 +57,13 @@ _SAFE_MODEL_IDENTITY = re.compile(
 _VERIFICATION_PROMPT_VERSION = frozenset(
     {
         "verification-decomposition/1",
+        "verification-decomposition/2",
         "verification-classification/1",
+        "verification-classification/2",
+        "verification-classification/3",
+        "verification-classification/4",
+        "verification-classification/5",
+        "verification-classification/6",
         "verification-repair/1",
     }
 )

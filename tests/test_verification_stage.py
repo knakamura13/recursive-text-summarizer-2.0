@@ -10,6 +10,7 @@ from summarizer.verification import (
     VerificationConfig,
     VerificationResponseError,
     VerificationRuntime,
+    _redact_finding,
     build_decomposition_request,
     build_source_lexical_index,
     reduce_batch_findings,
@@ -47,6 +48,21 @@ def index():
         provenance_ids=("S000001",),
         source={"S000001": "The measured value is 42."},
     )
+
+
+def test_terminal_redaction_keeps_distinct_quotes_from_one_segment_valid() -> None:
+    finding = BatchFinding(
+        claim_id="V01C000001",
+        verdict=ClaimVerdict.SUPPORTED,
+        evidence_ids=("S000001", "S000001"),
+        exact_quotes=("first source quote", "second source quote"),
+    )
+
+    redacted = _redact_finding(finding)
+
+    assert redacted.evidence_ids == finding.evidence_ids
+    assert redacted.exact_quotes == ("[redacted:1]", "[redacted:2]")
+    assert "source quote" not in repr(redacted)
 
 
 def test_verify_once_decomposes_selects_and_classifies_every_claim() -> None:
@@ -110,7 +126,7 @@ def test_verify_once_is_disabled_without_provider_calls() -> None:
 
 
 def test_verify_once_rejects_malformed_provider_output() -> None:
-    provider = Provider(["not json"])
+    provider = Provider(["not json", "not json"])
 
     with pytest.raises(VerificationResponseError):
         verify_draft_once(
@@ -121,6 +137,140 @@ def test_verify_once_rejects_malformed_provider_output() -> None:
             config=VerificationConfig(enabled=True),
             pass_index=1,
         )
+    assert len(provider.requests) == 2
+
+
+def test_verify_once_retries_invalid_anchor_with_specific_feedback() -> None:
+    provider = Provider(
+        [
+            '{"spans":[{"span_id":"V01S000001","anchors":["wrong value"]}]}',
+            '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
+            '{"findings":[{"claim_id":"V01C000001","verdict":"supported","evidence":[{"segment_id":"S000001","exact_quote":"measured value is 42"}]}]}',
+        ]
+    )
+
+    result = verify_draft_once(
+        "The measured value is 42.",
+        source_id="a" * 64,
+        source_index=index(),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+    )
+
+    assert not result.failed
+    assert len(result.generations) == 3
+    assert [request.operation_id for request in provider.requests] == [
+        "verification-decompose:V01",
+        "verification-decompose:V01",
+        "verification-classify:V01",
+    ]
+    assert "exact substring" in provider.requests[1].instructions
+    assert "wrong value" not in provider.requests[1].instructions
+
+
+def test_verify_once_retries_unselected_evidence_with_specific_feedback() -> None:
+    provider = Provider(
+        [
+            '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
+            '{"findings":[{"claim_id":"V01C000001","verdict":"supported","evidence":[{"segment_id":"V01S000001","exact_quote":"measured value is 42"}]}]}',
+            '{"findings":[{"claim_id":"V01C000001","verdict":"supported","evidence":[{"segment_id":"S000001","exact_quote":"measured value is 42"}]}]}',
+        ]
+    )
+
+    result = verify_draft_once(
+        "The measured value is 42.",
+        source_id="a" * 64,
+        source_index=index(),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+    )
+
+    assert not result.failed
+    assert len(result.generations) == 3
+    assert result.assessments[0].verdict is ClaimVerdict.SUPPORTED
+    assert "segment_id" in provider.requests[2].instructions
+    assert "selected evidence" in provider.requests[2].instructions
+    assert "V01S000001" not in provider.requests[2].instructions
+
+
+def test_verify_once_stops_after_one_invalid_classification_retry() -> None:
+    provider = Provider(
+        [
+            '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
+            '{"findings":[{"claim_id":"V01C000001","verdict":"supported","evidence":[{"segment_id":"V01S000001","exact_quote":"measured value is 42"}]}]}',
+            '{"findings":[{"claim_id":"V01C000001","verdict":"supported","evidence":[{"segment_id":"V01S000001","exact_quote":"measured value is 42"}]}]}',
+        ]
+    )
+
+    result = verify_draft_once(
+        "The measured value is 42.",
+        source_id="a" * 64,
+        source_index=index(),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+        terminalize_errors=True,
+    )
+
+    assert result.failed
+    assert result.diagnostic_codes == ("classification_failed",)
+    assert len(result.generations) == 3
+    assert len(provider.requests) == 3
+    assert result.assessments == ()
+
+
+def test_verify_once_downgrades_nonexact_quotes_after_one_retry() -> None:
+    invalid = ('{"findings":[{"claim_id":"V01C000001","verdict":"supported",'
+               '"evidence":[{"segment_id":"S000001","exact_quote":"the value was 42"}]}]}')
+    provider = Provider([
+        '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
+        invalid,
+        invalid,
+    ])
+
+    result = verify_draft_once(
+        "The measured value is 42.",
+        source_id="a" * 64,
+        source_index=index(),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+        terminalize_errors=True,
+    )
+
+    assert not result.failed
+    assert result.assessments[0].verdict is ClaimVerdict.INSUFFICIENTLY_SUPPORTED
+    assert result.assessments[0].findings[0].evidence_ids == ()
+    assert result.diagnostic_codes == ("invalid_evidence_quotes_downgraded",)
+    assert len(provider.requests) == 3
+
+
+def test_verify_once_omits_invalid_anchors_after_retry_but_checks_entire_span() -> None:
+    provider = Provider(
+        [
+            '{"spans":[{"span_id":"V01S000001","anchors":["a different value"]}]}',
+            '{"spans":[{"span_id":"V01S000001","anchors":["another different value"]}]}',
+            '{"findings":[{"claim_id":"V01C000001","verdict":"supported","evidence":[{"segment_id":"S000001","exact_quote":"measured value is 42"}]}]}',
+        ]
+    )
+
+    result = verify_draft_once(
+        "The measured value is 42.",
+        source_id="a" * 64,
+        source_index=index(),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+    )
+
+    assert not result.failed
+    assert len(result.claims) == 1
+    assert result.claims[0].is_fallback
+    assert result.claims[0].anchor == "The measured value is 42."
+    assert result.assessments[0].verdict is ClaimVerdict.SUPPORTED
+    assert result.diagnostic_codes == ("invalid_anchors_omitted",)
 
 
 def test_verify_once_rejects_an_oversized_decomposition_span_before_calling() -> None:
@@ -171,7 +321,7 @@ def test_verify_once_keeps_provider_provenance_per_classification_batch() -> Non
         source_id="a" * 64,
         source_index=index(),
         runtime=runtime(provider),
-        config=VerificationConfig(enabled=True, request_tokens=1800, output_reserve_tokens=1, safety_margin_tokens=0),
+        config=VerificationConfig(enabled=True, request_tokens=2400, output_reserve_tokens=1, safety_margin_tokens=0),
         pass_index=1,
     )
 
@@ -183,7 +333,7 @@ def test_verify_once_keeps_provider_provenance_per_classification_batch() -> Non
 
 
 def test_verify_once_merges_multiple_decomposition_batches() -> None:
-    sentence = "x" * 1_000 + "."
+    sentence = "x" * 1_300 + "."
     provider = Provider(
         [
             '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
@@ -200,7 +350,7 @@ def test_verify_once_merges_multiple_decomposition_batches() -> None:
             provenance_ids=("S000001",), source={"S000001": "evidence"}
         ),
         runtime=runtime(provider),
-        config=VerificationConfig(enabled=True, request_tokens=2_700, output_reserve_tokens=1, safety_margin_tokens=0),
+        config=VerificationConfig(enabled=True, request_tokens=3_660, output_reserve_tokens=1, safety_margin_tokens=0),
         pass_index=1,
     )
 

@@ -22,6 +22,8 @@
 	let summaryPreview = $state('');
 	let finalSummary = $state('');
 	let runId = $state<string | null>(null);
+	let runState = $state<string | null>(null);
+	let runFailure = $state<string | null>(null);
 	let showHierarchyDrawer = $state(false);
 	let showDocumentsDrawer = $state(false);
 	let summarizeOpen = $state(false);
@@ -61,9 +63,23 @@
 		summaryPreview =
 			hierarchy.find((node) => node.node_id === selectedNodeId)?.label ?? 'Select a node to inspect.';
 		stages = mapStages(run.state);
+		runState = run.state;
+		runFailure = run.failure_reason ?? null;
+	}
+
+	async function pollRun() {
+		if (!runId || !['queued', 'running', 'cancelling'].includes(runState ?? '')) return;
+		const currentRunId = runId;
+		const run = await api.getRun(currentRunId);
+		if (runId !== currentRunId) return;
+		runState = run.state;
+		runFailure = run.failure_reason ?? null;
+		stages = mapStages(run.state);
+		if (!['queued', 'running', 'cancelling'].includes(run.state)) await refreshRun();
 	}
 
 	function mapStages(state: string): ProgressStage[] {
+		if (state === 'failed' || state === 'cancelled' || state === 'interrupted') return [];
 		const base = [
 			{ stage: 'Preparing', state: 'completed' as const },
 			{ stage: 'Segmenting', state: 'completed' as const },
@@ -83,6 +99,19 @@
 		loadAll().catch((loadError) => {
 			error = loadError instanceof Error ? loadError.message : 'Failed to load workspace';
 		});
+		let polling = false;
+		const interval = window.setInterval(async () => {
+			if (polling) return;
+			polling = true;
+			try {
+				await pollRun();
+			} catch (pollError) {
+				error = pollError instanceof Error ? pollError.message : 'Failed to refresh run';
+			} finally {
+				polling = false;
+			}
+		}, 2000);
+		return () => window.clearInterval(interval);
 	});
 
 	async function handleUpload(files: FileList) {
@@ -122,6 +151,8 @@
 			{summaryPreview}
 			{finalSummary}
 			{stages}
+			{runState}
+			{runFailure}
 			onSummarize={() => (summarizeOpen = true)}
 		/>
 	{:else if error}
@@ -188,6 +219,14 @@
 				<option value="direct">Direct</option>
 				<option value="hierarchical">Hierarchical</option>
 			</select>
+		</label>
+		<label>
+			Context window (tokens)
+			<input type="number" min="1" bind:value={runConfig.context_window} placeholder="Model default" />
+		</label>
+		<label>
+			Output limit (tokens)
+			<input type="number" min="256" step="256" bind:value={runConfig.max_output_tokens} />
 		</label>
 		<label>
 			<input type="checkbox" bind:checked={runConfig.verify} />

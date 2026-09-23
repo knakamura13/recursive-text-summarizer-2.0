@@ -141,6 +141,32 @@ def test_finding_parser_requires_one_result_per_claim_and_exact_quotes() -> None
     assert findings[0].evidence_ids == ("S000001",)
 
 
+def test_finding_parser_accepts_distinct_quotes_from_one_selected_segment() -> None:
+    spans = split_draft_spans("The value is 42.", pass_index=1)
+    claims = parse_claim_anchors(
+        '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
+        spans=spans,
+        pass_index=1,
+    )
+    response = json.dumps({"findings": [{
+        "claim_id": claims[0].claim_id,
+        "verdict": "supported",
+        "evidence": [
+            {"segment_id": "S000001", "exact_quote": "measured value"},
+            {"segment_id": "S000001", "exact_quote": "value is 42"},
+        ],
+    }]})
+
+    findings = parse_claim_findings(
+        response,
+        claims=claims,
+        selected={claims[0].claim_id: {"S000001": "The measured value is 42."}},
+    )
+
+    assert findings[0].evidence_ids == ("S000001", "S000001")
+    assert findings[0].exact_quotes == ("measured value", "value is 42")
+
+
 @pytest.mark.parametrize(
     "response",
     (
