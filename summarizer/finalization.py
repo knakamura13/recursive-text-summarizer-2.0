@@ -31,6 +31,7 @@ from summarizer.providers.base import GenerationResult, ModelProvider
 from summarizer.reliability import ReliabilityTracker
 from summarizer.segmentation import CacheCoordinator, SourceSegment
 from summarizer.summaries import SummaryNode
+from summarizer.text import default_sentence_tokenizer
 from summarizer.tokenization import TokenCounter
 from summarizer.verification import (
     ClaimVerdict,
@@ -73,12 +74,25 @@ def _all_claims_supported(result: VerificationPassResult) -> bool:
     )
 
 
+def _original_sentence_spans(text: str) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    cursor = 0
+    for sentence in default_sentence_tokenizer(text):
+        index = text.find(sentence, cursor)
+        if index < 0:
+            return []
+        spans.append((index, index + len(sentence), sentence.strip()))
+        cursor = index + len(sentence)
+    return spans
+
+
 def _supported_fragment_text(result: VerificationPassResult, unit_text: str) -> str | None:
-    """Return unit text that can be rechecked, excluding unsupported fragments.
+    """Return original sentences whose claims are all supported.
 
     A fully supported unit is returned unchanged. A contradicted claim rejects
-    the unit. Mixed support keeps only the supported non-fallback anchors, in
-    source order, so an unsupported fragment is not published with them.
+    the unit. Mixed support keeps an original sentence only when every claim
+    in that sentence is supported. Supported anchors are not joined into a new
+    sentence.
     """
     if result.failed or not result.assessments:
         return None
@@ -92,23 +106,36 @@ def _supported_fragment_text(result: VerificationPassResult, unit_text: str) -> 
     verdicts = {
         assessment.claim_id: assessment.verdict for assessment in result.assessments
     }
-    anchors: list[tuple[int, str]] = []
+    sentences = _original_sentence_spans(unit_text)
+    if not sentences:
+        return None
+    located: list[tuple[int, ClaimVerdict]] = []
     cursor = 0
     for claim in result.claims:
-        if claim.is_fallback or verdicts.get(claim.claim_id) is not ClaimVerdict.SUPPORTED:
+        if claim.is_fallback:
             continue
+        verdict = verdicts.get(claim.claim_id)
+        if verdict is None:
+            return None
         index = unit_text.find(claim.anchor, cursor)
         if index < 0:
             index = unit_text.find(claim.anchor)
         if index < 0:
-            continue
-        anchor = claim.anchor.strip()
-        if anchor:
-            anchors.append((index, anchor))
+            return None
+        located.append((index, verdict))
         cursor = index + len(claim.anchor)
-    if not anchors:
+    kept: list[str] = []
+    for start, end, sentence in sentences:
+        in_sentence = [verdict for index, verdict in located if start <= index < end]
+        if not in_sentence:
+            continue
+        if any(verdict is not ClaimVerdict.SUPPORTED for verdict in in_sentence):
+            continue
+        if sentence:
+            kept.append(sentence)
+    if not kept:
         return None
-    reduced = " ".join(anchor for _, anchor in sorted(anchors))
+    reduced = " ".join(kept)
     if reduced == unit_text.strip():
         return None
     return reduced

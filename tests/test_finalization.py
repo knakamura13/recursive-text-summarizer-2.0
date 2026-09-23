@@ -241,7 +241,7 @@ def _verdict(claim_id: str, verdict: ClaimVerdict, *, fallback: bool, anchor: st
     )
 
 
-def test_fallback_keeps_rechecked_supported_fragments(monkeypatch) -> None:
+def test_fallback_drops_a_mixed_sentence_instead_of_joining_fragments(monkeypatch) -> None:
     unit = (
         "Elyse Saugstad, a professional skier, deployed her airbag "
         "but remained conscious."
@@ -258,15 +258,62 @@ def test_fallback_keeps_rechecked_supported_fragments(monkeypatch) -> None:
 
     def verify(text, **kwargs):
         checked.append(text)
+        claims = []
+        assessments = []
+        for claim_id, verdict, fallback, anchor in (
+            ("V01C000001", ClaimVerdict.SUPPORTED, False, "Elyse Saugstad"),
+            ("V01C000002", ClaimVerdict.INSUFFICIENTLY_SUPPORTED, False, "professional skier"),
+            ("V01C000003", ClaimVerdict.SUPPORTED, False, "deployed her airbag"),
+            ("V01C000004", ClaimVerdict.INSUFFICIENTLY_SUPPORTED, False, "conscious"),
+            ("V01C000005", ClaimVerdict.SUPPORTED, True, unit),
+        ):
+            claim, assessment = _verdict(claim_id, verdict, fallback=fallback, anchor=anchor)
+            claims.append(claim)
+            assessments.append(assessment)
+        return SimpleNamespace(
+            failed=False, assessments=tuple(assessments), claims=tuple(claims), generations=()
+        )
+
+    monkeypatch.setattr("summarizer.finalization.verify_draft_once", verify)
+    draft, _ = _verified_content_unit_draft(
+        summary,
+        source_id="a" * 64,
+        source_index=None,
+        runtime=None,
+        config=VerificationConfig(enabled=True),
+        target_words=100,
+    )
+
+    assert draft == ""
+    assert checked == [unit]
+
+
+def test_fallback_keeps_a_supported_sentence_beside_a_mixed_sentence(monkeypatch) -> None:
+    kept = "The avalanche slab was approximately 200 feet wide."
+    mixed = "Elyse Saugstad, a professional skier, deployed her airbag but remained conscious."
+    unit = f"{kept} {mixed}"
+    summary = SummaryNode.model_validate({
+        "summary": unit,
+        "content_units": [
+            {"text": unit, "kind": "fact", "evidence": [], "qualification": None, "uncertain": False}
+        ],
+        "entities": [], "qualifications": [], "contradictions": [],
+        "quotations": [], "provenance": ["D000001"], "level": 0,
+    })
+    checked = []
+
+    def verify(text, **kwargs):
+        checked.append(text)
         if text == unit:
             claims = []
             assessments = []
             for claim_id, verdict, fallback, anchor in (
-                ("V01C000001", ClaimVerdict.SUPPORTED, False, "Elyse Saugstad"),
-                ("V01C000002", ClaimVerdict.INSUFFICIENTLY_SUPPORTED, False, "professional skier"),
-                ("V01C000003", ClaimVerdict.SUPPORTED, False, "deployed her airbag"),
-                ("V01C000004", ClaimVerdict.INSUFFICIENTLY_SUPPORTED, False, "conscious"),
-                ("V01C000005", ClaimVerdict.SUPPORTED, True, unit),
+                ("V01C000001", ClaimVerdict.SUPPORTED, False, "200 feet wide"),
+                ("V01C000002", ClaimVerdict.SUPPORTED, False, "Elyse Saugstad"),
+                ("V01C000003", ClaimVerdict.INSUFFICIENTLY_SUPPORTED, False, "professional skier"),
+                ("V01C000004", ClaimVerdict.SUPPORTED, False, "deployed her airbag"),
+                ("V01C000005", ClaimVerdict.INSUFFICIENTLY_SUPPORTED, False, "conscious"),
+                ("V01C000006", ClaimVerdict.SUPPORTED, True, unit),
             ):
                 claim, assessment = _verdict(claim_id, verdict, fallback=fallback, anchor=anchor)
                 claims.append(claim)
@@ -291,8 +338,8 @@ def test_fallback_keeps_rechecked_supported_fragments(monkeypatch) -> None:
         target_words=100,
     )
 
-    assert draft == "Elyse Saugstad deployed her airbag"
-    assert checked == [unit, "Elyse Saugstad deployed her airbag"]
+    assert draft == kept
+    assert checked == [unit, kept]
 
 
 def test_fallback_drops_a_fragment_that_fails_recheck(monkeypatch) -> None:
