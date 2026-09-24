@@ -1,14 +1,19 @@
-"""SQLite connection and schema initialization."""
+"""SQLite connection, schema initialization, and migrations."""
 
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 
 from summarizer_web.config import AppPaths, load_paths
+from summarizer_web.db.migrations import apply_migrations
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+# The web process, the run worker, and the import worker write concurrently.
+_BUSY_TIMEOUT_SECONDS = 15.0
 _db: Database | None = None
 _init_lock = Lock()
 
@@ -19,7 +24,9 @@ class Database:
         self._lock = Lock()
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, check_same_thread=False)
+        connection = sqlite3.connect(
+            self.path, check_same_thread=False, timeout=_BUSY_TIMEOUT_SECONDS
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
@@ -31,6 +38,15 @@ class Database:
                 cursor = connection.execute(query, params)
                 connection.commit()
                 return cursor
+            finally:
+                connection.close()
+
+    def executemany(self, query: str, rows: Iterable[tuple[object, ...]]) -> None:
+        with self._lock:
+            connection = self.connect()
+            try:
+                connection.executemany(query, rows)
+                connection.commit()
             finally:
                 connection.close()
 
@@ -50,16 +66,35 @@ class Database:
             finally:
                 connection.close()
 
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Run several statements atomically under one write lock."""
+        with self._lock:
+            connection = self.connect()
+            connection.isolation_level = None
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    yield connection
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+                connection.execute("COMMIT")
+            finally:
+                connection.close()
+
 
 def init_database(paths: AppPaths | None = None) -> Database:
     global _db
     app_paths = paths or load_paths()
     schema = _SCHEMA_PATH.read_text(encoding="utf-8")
     with _init_lock:
-        connection = sqlite3.connect(app_paths.database)
+        connection = sqlite3.connect(app_paths.database, timeout=_BUSY_TIMEOUT_SECONDS)
         try:
+            connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(schema)
             connection.commit()
+            apply_migrations(connection)
         finally:
             connection.close()
         _db = Database(app_paths.database)

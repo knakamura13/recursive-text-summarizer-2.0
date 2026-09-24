@@ -11,6 +11,7 @@ from summarizer.direct import (
 )
 from summarizer.ingestion import ingest_text
 from summarizer.leaf import LeafSummaryError, build_leaf_request
+from summarizer.runtime.observers import ItemFailedError
 from summarizer.providers.base import (
     GenerationRequest,
     GenerationResult,
@@ -170,11 +171,12 @@ def test_malformed_direct_response_is_not_cached(tmp_path) -> None:
     first = RecordingProvider("not json")
     second = RecordingProvider()
 
-    with pytest.raises(LeafSummaryError):
+    with pytest.raises(ItemFailedError):
         summarize_direct(document, first, CharacterCounter(), model="m", timeout_seconds=30, coordinator=coordinator(tmp_path, document))
     summarize_direct(document, second, CharacterCounter(), model="m", timeout_seconds=30, coordinator=coordinator(tmp_path, document))
 
-    assert len(first.requests) == 1
+    # The first run spent its two re-asks; none of its answers was cached.
+    assert len(first.requests) == 3
     assert len(second.requests) == 1
 
 
@@ -203,7 +205,7 @@ def test_rejects_a_fabricated_quotation() -> None:
         )
     )
 
-    with pytest.raises(LeafSummaryError, match="quotation"):
+    with pytest.raises(ItemFailedError, match="quotation") as failure:
         summarize_direct(
             ingest_text(DOCUMENT),
             provider,
@@ -212,11 +214,15 @@ def test_rejects_a_fabricated_quotation() -> None:
             timeout_seconds=30,
         )
 
+    assert failure.value.work_id == "L0N0001"
+    assert failure.value.covered_segment_ids == (DOCUMENT_SEGMENT_ID,)
+    assert isinstance(failure.value.__cause__, LeafSummaryError)
+
 
 def test_malformed_output_fails_naming_the_document_identifier() -> None:
     provider = RecordingProvider("I would rather not.")
 
-    with pytest.raises(LeafSummaryError, match=DOCUMENT_SEGMENT_ID):
+    with pytest.raises(ItemFailedError, match=DOCUMENT_SEGMENT_ID):
         summarize_direct(
             ingest_text(DOCUMENT),
             provider,

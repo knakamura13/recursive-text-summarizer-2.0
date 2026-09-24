@@ -9,10 +9,19 @@ from pathlib import Path
 from platformdirs import user_data_dir
 
 APP_NAME = "recursive-text-summarizer"
-EXTRACTION_VERSION = "pdf/1"
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024
-MAX_PDF_PAGES = 2000
-PDF_EXTRACTION_TIMEOUT_SECONDS = 120
+
+# Imports (D3-D5). The version is stored on every source revision so the text
+# of a Document can be traced to the extraction rules that produced it.
+EXTRACTION_VERSION = "import/3"
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+MAX_PASTE_BYTES = 20 * 1024 * 1024
+MAX_IMPORT_PAGES = 5_000
+IMPORT_PROGRESS_INTERVAL_SECONDS = 0.25
+OCR_LANGUAGE = "eng"
+OCR_DPI = 300
+OCR_PAGE_TIMEOUT_SECONDS = 120.0
+# Tesseract runs single-threaded per page; pages are recognized in parallel.
+OCR_WORKERS = max(1, min(4, (os.cpu_count() or 2) // 2))
 
 
 def resolve_data_dir() -> Path:

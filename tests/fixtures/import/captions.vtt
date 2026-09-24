@@ -1,0 +1,20 @@
+WEBVTT - Harbor tour
+Kind: captions
+Language: en
+
+STYLE
+::cue { color: yellow }
+
+NOTE This note is for the editors
+and spans two lines.
+
+intro
+00:00.000 --> 00:02.000 align:start position:10%
+<v Captain>Good morning, everyone.
+
+00:02.000 --> 00:04.000 line:0
+<c.loud>Keep</c> your tickets &amp; bags <00:00:03.000>close.
+
+00:04.000 --> 00:06.000
+Keep your tickets &amp; bags <00:00:03.000>close.
+We depart soon.

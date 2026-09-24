@@ -1,153 +1,162 @@
 <script lang="ts">
-	import type { DocumentSummary } from '$lib/api/client';
+	import { onMount } from 'svelte';
+	import ErrorBanner from '$lib/components/common/ErrorBanner.svelte';
+	import ProgressBar from '$lib/components/common/ProgressBar.svelte';
+	import Spinner from '$lib/components/common/Spinner.svelte';
+	import StateBadge from '$lib/components/common/StateBadge.svelte';
+	import { formatBytes, formatName } from '$lib/format';
+	import { documents } from '$lib/stores/documents.svelte';
+	import ImportDialog from './ImportDialog.svelte';
+	import PasteDialog from './PasteDialog.svelte';
 
-	let {
-		documents = [],
-		selectedId = null,
-		search = $bindable(''),
-		onImport,
-		onSelect,
-		onRename,
-		onDelete
-	}: {
-		documents?: DocumentSummary[];
-		selectedId?: string | null;
-		search?: string;
-		onImport?: () => void;
-		onSelect?: (id: string) => void;
-		onRename?: (id: string, title: string) => void;
-		onDelete?: (id: string) => void;
-	} = $props();
+	// Library list beside the Document workspace on wide screens.
+	let { currentId = null }: { currentId?: string | null } = $props();
 
-	function formatSize(bytes: number): string {
-		if (bytes < 1024) return `${bytes} B`;
-		if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-		return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-	}
+	let importOpen = $state(false);
+	let pasteOpen = $state(false);
+
+	onMount(() => {
+		if (!documents.loaded && !documents.loading) void documents.refresh();
+	});
 </script>
 
-<aside class="documents-sidebar" aria-label="Documents">
-	<div class="header-row">
-		<h2>Documents</h2>
-		<button type="button" class="import-button" aria-label="Import documents" onclick={() => onImport?.()}>
-			+
-		</button>
+<aside class="sidebar" aria-label="Library">
+	<div class="head">
+		<h2><a href="/">Library</a></h2>
+		<button type="button" class="button small" onclick={() => (importOpen = true)}>Import</button>
 	</div>
-	<label class="search-label">
-		<span class="visually-hidden">Search documents</span>
-		<input type="search" placeholder="Search documents..." bind:value={search} />
-	</label>
-	<ul class="document-list" aria-label="Document list">
-		{#each documents as document (document.document_id)}
-			<li>
-				<button
-					type="button"
-					class:selected={document.document_id === selectedId}
-					aria-current={document.document_id === selectedId ? 'true' : undefined}
-					onclick={() => onSelect?.(document.document_id)}
-				>
-					<span class="title">{document.title}</span>
-					<span class="meta">
-						{document.format.toUpperCase()} · {formatSize(document.size_bytes)}
-						{#if document.latest_run_state}
-							· {document.latest_run_state}
-						{/if}
-					</span>
-				</button>
-			</li>
-		{/each}
-	</ul>
+	<input
+		type="search"
+		placeholder="Search Documents"
+		aria-label="Search Documents"
+		bind:value={documents.search}
+	/>
+
+	{#if documents.error && !documents.loaded}
+		<ErrorBanner error={documents.error} onretry={() => documents.refresh()} />
+	{:else if !documents.loaded}
+		<div class="loading"><Spinner label="Loading Documents" /></div>
+	{:else if documents.list.length === 0}
+		<p class="empty">
+			{documents.search.trim() ? 'No Documents match your search.' : 'No Documents yet.'}
+		</p>
+	{:else}
+		<nav aria-label="Documents">
+			<ul>
+				{#each documents.list as document (document.document_id)}
+					<li>
+						<a
+							href="/documents/{encodeURIComponent(document.document_id)}"
+							aria-current={document.document_id === currentId ? 'page' : undefined}
+							title={document.title}
+						>
+							<span class="title">{document.title}</span>
+							<span class="meta">
+								{formatName(document.format)} · {formatBytes(document.size_bytes)}
+							</span>
+							{#if document.import_state !== 'ready'}
+								<StateBadge state={document.import_state} kind="import" size="sm" />
+							{:else if document.latest_run}
+								<StateBadge state={document.latest_run.state} size="sm" />
+							{/if}
+							{#if document.import_state === 'importing'}
+								<ProgressBar
+									size="sm"
+									value={document.import_progress?.done ?? 0}
+									max={document.import_progress?.total ?? null}
+									label="Import progress of {document.title}"
+								/>
+							{/if}
+						</a>
+					</li>
+				{/each}
+			</ul>
+		</nav>
+	{/if}
 </aside>
 
+<ImportDialog bind:open={importOpen} onpaste={() => (pasteOpen = true)} />
+<PasteDialog bind:open={pasteOpen} />
+
 <style>
-	.documents-sidebar {
+	.sidebar {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-4);
-		padding: var(--space-5);
+		gap: var(--space-3);
+		min-height: 0;
+		padding: var(--space-4) var(--space-3);
 		border-right: 1px solid var(--color-border);
 		background: var(--color-surface);
-		min-width: var(--sidebar-left-width);
+		overflow: hidden;
 	}
 
-	.header-row {
+	.head {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
+		gap: var(--space-2);
+		padding: 0 var(--space-1);
 	}
 
-	.header-row h2 {
-		margin: 0;
-		font-size: 0.95rem;
-		font-weight: 600;
+	.head a {
+		color: inherit;
+		text-decoration: none;
 	}
 
-	.import-button {
-		width: 2rem;
-		height: 2rem;
-		border-radius: 999px;
-		border: 1px solid var(--color-border-strong);
-		background: var(--color-bg);
-		font-size: 1.25rem;
-		line-height: 1;
-		cursor: pointer;
+	nav {
+		flex: 1;
+		min-height: 0;
+		overflow-y: auto;
+		margin: 0 calc(-1 * var(--space-1));
+		padding: 0 var(--space-1);
 	}
 
-	.search-label input {
-		width: 100%;
-		padding: var(--space-2) var(--space-3);
-		border: 1px solid var(--color-border);
-		border-radius: var(--radius-sm);
-		background: var(--color-bg);
-	}
-
-	.document-list {
+	ul {
 		list-style: none;
 		margin: 0;
 		padding: 0;
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-2);
-		overflow: auto;
+		gap: var(--space-1);
 	}
 
-	.document-list button {
-		width: 100%;
-		text-align: left;
+	li a {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: var(--space-1);
+		padding: var(--space-2) var(--space-3);
 		border: 1px solid transparent;
-		background: transparent;
 		border-radius: var(--radius-md);
-		padding: var(--space-3);
-		cursor: pointer;
+		color: inherit;
+		text-decoration: none;
 	}
 
-	.document-list button.selected {
+	li a:hover {
+		background: var(--color-bg);
+	}
+
+	li a[aria-current='page'] {
 		background: var(--color-sage-soft);
 		border-color: var(--color-sage-border);
 	}
 
 	.title {
-		display: block;
+		max-width: 100%;
 		font-weight: 600;
-		color: var(--color-text);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.meta {
-		display: block;
-		margin-top: var(--space-1);
-		font-size: 0.8rem;
+		font-size: 0.8125rem;
 		color: var(--color-text-muted);
 	}
 
-	.visually-hidden {
-		position: absolute;
-		width: 1px;
-		height: 1px;
-		padding: 0;
-		margin: -1px;
-		overflow: hidden;
-		clip: rect(0, 0, 0, 0);
-		white-space: nowrap;
-		border: 0;
+	.loading,
+	.empty {
+		padding: var(--space-4) var(--space-1);
+		color: var(--color-text-muted);
 	}
 </style>

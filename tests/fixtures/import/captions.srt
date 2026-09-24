@@ -1,0 +1,12 @@
+1
+00:00:01,000 --> 00:00:03,500
+<i>Welcome to the harbor.</i>
+
+2
+00:00:03,600 --> 00:00:06,000 X1:40 X2:600 Y1:20 Y2:50
+The ferry leaves at nine,
+and returns at noon.
+
+3
+00:00:06,100 --> 00:00:08,000
+{\an8}<font color="#ffff00">Mind the gap.</font>

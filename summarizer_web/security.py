@@ -7,10 +7,12 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from fastapi import HTTPException, Request, Response
+from fastapi import HTTPException, Request
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from summarizer_web.db.connection import get_database
+from summarizer_web.errors import error_body
 
 SESSION_COOKIE = "summarizer_session"
 CSRF_HEADER = "X-CSRF-Token"
@@ -55,33 +57,52 @@ class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
         host = request.headers.get("host", "").split(":")[0]
         if host not in ALLOWED_HOSTS:
-            return Response("Invalid host", status_code=400)
+            return JSONResponse(
+                error_body("invalid_host", "Requests must use 127.0.0.1 or localhost."),
+                status_code=400,
+            )
 
         origin = request.headers.get("origin")
         if origin and origin not in ALLOWED_ORIGINS:
-            return Response("Invalid origin", status_code=403)
+            return JSONResponse(
+                error_body("invalid_origin", "Requests from this origin are not allowed."),
+                status_code=403,
+            )
 
         session, created = _load_or_create_session(request)
 
         if request.method in {"POST", "PATCH", "PUT", "DELETE"} and request.url.path.startswith("/api/"):
             token = request.headers.get(CSRF_HEADER)
             if token != session.csrf_token:
-                return Response("Invalid CSRF token", status_code=403)
+                response = JSONResponse(
+                    error_body(
+                        "csrf_invalid",
+                        "The session token is missing or stale. Retry the request.",
+                        retryable=True,
+                    ),
+                    status_code=403,
+                )
+                self._attach_session(response, session, created)
+                return response
 
         response = await call_next(request)
 
         if request.url.path.startswith("/api/"):
-            if created:
-                response.set_cookie(
-                    SESSION_COOKIE,
-                    session.session_id,
-                    httponly=True,
-                    samesite="strict",
-                    secure=False,
-                )
-            response.headers["X-CSRF-Token"] = session.csrf_token
+            self._attach_session(response, session, created)
 
         return response
+
+    @staticmethod
+    def _attach_session(response, session: SessionContext, created: bool) -> None:
+        if created:
+            response.set_cookie(
+                SESSION_COOKIE,
+                session.session_id,
+                httponly=True,
+                samesite="strict",
+                secure=False,
+            )
+        response.headers[CSRF_HEADER] = session.csrf_token
 
 
 def get_session(request: Request) -> SessionContext:

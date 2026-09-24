@@ -13,3 +13,7 @@ python-multipart>=0.0.20,<1
 sse-starlette>=2.2,<3
 pypdf>=5.4,<6
 platformdirs>=4.3,<5
+pypdfium2>=5.0,<6
+charset-normalizer>=3.3,<4
+striprtf>=0.0.29,<0.1
+cryptography>=42,<47

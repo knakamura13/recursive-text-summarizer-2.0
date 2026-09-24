@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from threading import Lock
 
 from summarizer.budget import BudgetError
 from summarizer.cache import CacheDescriptor
@@ -22,8 +23,14 @@ from summarizer.merge import (
     serialize_child,
     serialize_source_passage_block,
 )
-from summarizer.providers.base import GenerationRequest, ModelProvider
-from summarizer.scheduler import BoundedScheduler, ScheduledWork
+from summarizer.providers.base import (
+    GenerationRequest,
+    GenerationResult,
+    ModelProvider,
+)
+from summarizer.runtime.items import ObservedItem, generate_observed, tree_node_id
+from summarizer.runtime.observers import RuntimeObserver, StageName, get_observer
+from summarizer.scheduler import BoundedScheduler, ScheduledResult, ScheduledWork
 from summarizer.segmentation import CacheCoordinator
 from summarizer.summaries import LEAF_SCHEMA_VERSION, SummaryNode
 from summarizer.tokenization import TokenCounter
@@ -71,9 +78,9 @@ class _PreparedMerge:
     grounding: MergeGrounding
     descriptor: CacheDescriptor | None
 
-    def decode(self, payload: object) -> SummaryNode:
+    def parse(self, text: str) -> SummaryNode:
         return parse_merged_summary(
-            json.dumps(payload),
+            text,
             legal=self.legal,
             quotation_sources=self.quotation_sources,
             preserved_provenance=self.preserved_provenance,
@@ -81,6 +88,12 @@ class _PreparedMerge:
             subject=self.node_id,
             level=self.level,
         )
+
+    def decode(self, payload: object) -> SummaryNode:
+        return self.parse(json.dumps(payload))
+
+    def validate(self, payload: object) -> object:
+        return self.decode(payload).model_dump(mode="json")
 
     def node(self, payload: object) -> TreeNode:
         return TreeNode(
@@ -243,6 +256,7 @@ def build_hierarchy(
     grounding_policy: GroundingPolicy | None = None,
     coordinator: CacheCoordinator | None = None,
     provider_schema_reserve: int = 0,
+    observer: RuntimeObserver | None = None,
 ) -> tuple[TreeNode, tuple[TreeNode, ...], HierarchyReport]:
     """Reduce ordered leaves to a single root through as many levels as needed.
 
@@ -260,6 +274,14 @@ def build_hierarchy(
     guarantees by refusing a capacity that cannot hold a pair. The node count
     is additionally asserted to fall at each level, as a defensive invariant
     rather than the proof.
+
+    Each level reports to `observer` once its groups are frozen: `planned` for
+    every node of the level, with its children and covered segments, then
+    `completed` for each passthrough at once and `reused` or `active`,
+    `retrying`, and `completed` for each merge. A merge response that fails
+    validation is re-asked with the validator's reason, up to twice, before
+    `ItemFailedError` names the node. A stop request is honoured between
+    merges.
     """
     if not leaves:
         raise ValueError("a hierarchy requires at least one leaf")
@@ -267,13 +289,15 @@ def build_hierarchy(
         raise ValueError("each leaf needs its covered segment identifiers")
     if provider_schema_reserve < 0:
         raise ValueError("provider schema reserve must not be negative")
+    runtime = get_observer(observer)
+    calls = _CountingProvider(provider)
     configured_policy = (
         grounding_policy if grounding_policy is not None else DEFAULT_GROUNDING_POLICY
     )
     adaptive_grounding = grounding_policy is None
     prepared_leaves: list[SummaryNode] = []
     prepared_covered: list[tuple[str, ...]] = []
-    for index, (leaf, identifiers) in enumerate(zip(leaves, covered), start=1):
+    for index, (leaf, identifiers) in enumerate(zip(leaves, covered)):
         local_covered = tuple(identifiers)
         missing = [
             identifier for identifier in local_covered if identifier not in attributable
@@ -283,7 +307,7 @@ def build_hierarchy(
                 "attributable text is missing for segments " + ", ".join(missing)
             )
         legal = {identifier: attributable[identifier] for identifier in local_covered}
-        subject = f"L0N{index:04d}"
+        subject = tree_node_id(0, index)
         validate_provenance(leaf, legal=legal, subject=subject)
         prepared_leaves.append(
             leaf.model_copy(
@@ -295,7 +319,7 @@ def build_hierarchy(
     all_nodes: list[TreeNode] = []
     current = [
         TreeNode(
-            node_id=f"L0N{index + 1:04d}",
+            node_id=tree_node_id(0, index),
             level=0,
             order=index,
             summary=leaf,
@@ -309,7 +333,6 @@ def build_hierarchy(
     all_nodes.extend(current)
 
     levels: list[LevelReport] = []
-    provider_calls = 0
     level = 0
     planned_merge_ids: list[str] = []
     if coordinator is not None and coordinator.session is not None:
@@ -323,6 +346,7 @@ def build_hierarchy(
         merge_prefix = ()
 
     while len(current) > 1:
+        runtime.raise_if_stopped("during merging")
         level += 1
         overhead = measure_merge_overhead(
             counter,
@@ -366,7 +390,7 @@ def build_hierarchy(
                         # still falls because other groups merged.
                         only = members[0]
                         passthrough[order] = TreeNode(
-                            node_id=f"L{level}N{order + 1:04d}",
+                            node_id=tree_node_id(level, order),
                             level=level,
                             order=order,
                             # Restamped: the merged path asserts that a
@@ -409,6 +433,33 @@ def build_hierarchy(
                 continue
             break
 
+        by_order = {item.order: item for item in prepared}
+        level_items = {
+            order: ObservedItem(
+                kind="passthrough" if order in passthrough else "merge",
+                work_id=tree_node_id(level, order),
+                stage=StageName.MERGING,
+                level=level,
+                order=order,
+                total=len(groups),
+                child_ids=tuple(current[index].node_id for index in indices),
+                covered_segment_ids=(
+                    passthrough[order].covered_segments
+                    if order in passthrough
+                    else by_order[order].covered_segments
+                ),
+            )
+            for order, indices in enumerate(groups)
+        }
+        for order in range(len(groups)):
+            runtime.emit_item(level_items[order].event("planned"))
+        for order, node in sorted(passthrough.items()):
+            runtime.emit_item(
+                level_items[order].event(
+                    "completed", summary=node.summary.model_dump(mode="json")
+                )
+            )
+
         # Every request, descriptor, and legal grounding scope is frozen before
         # a sibling can call the provider. The manifest therefore witnesses the
         # entire level before its first externally visible side effect.
@@ -420,44 +471,51 @@ def build_hierarchy(
             values = coordinator.reusable_batch(
                 work_ids=tuple(item.node_id for item in prepared),
                 descriptors=descriptors,
-                validators={
-                    item.node_id: (
-                        lambda payload, item=item: item.decode(payload).model_dump(
-                            mode="json"
+                validators={item.node_id: item.validate for item in prepared},
+            )
+            for item in prepared:
+                if item.node_id in values:
+                    runtime.emit_item(
+                        level_items[item.order].event(
+                            "reused", summary=values[item.node_id]
                         )
                     )
-                    for item in prepared
-                },
-            )
-            misses = tuple(item for item in prepared if item.node_id not in values)
             scheduled = BoundedScheduler(
                 max_in_flight=coordinator.max_in_flight,
                 cache=coordinator.store,
+                should_stop=runtime.should_stop,
+                on_complete=_completion_reporter(
+                    runtime,
+                    {item.node_id: level_items[item.order] for item in prepared},
+                ),
             ).run(
                 tuple(
                     ScheduledWork(
                         descriptor=item.descriptor,
-                        operation=lambda item=item: _execute_prepared_merge(
-                            item, provider
-                        ),
-                        validate=lambda payload, item=item: item.decode(
-                            payload
-                        ).model_dump(mode="json"),
+                        operation=lambda item=item, observed=level_items[
+                            item.order
+                        ]: _execute_prepared_merge(item, calls, observed, runtime),
+                        validate=item.validate,
                     )
-                    for item in misses
+                    for item in prepared
+                    if item.node_id not in values
                 ),
                 coordinator.session,
             )
             values.update({result.work_id: result.payload for result in scheduled})
-            provider_calls += len(misses)
         else:
             values = {}
             for item in prepared:
-                values[item.node_id] = _execute_prepared_merge(item, provider)
-            provider_calls += len(prepared)
+                runtime.raise_if_stopped("during merging")
+                observed = level_items[item.order]
+                values[item.node_id] = _execute_prepared_merge(
+                    item, calls, observed, runtime
+                )
+                runtime.emit_item(
+                    observed.event("completed", summary=values[item.node_id])
+                )
 
         produced = []
-        by_order = {item.order: item for item in prepared}
         for order in range(len(groups)):
             if order in passthrough:
                 produced.append(passthrough[order])
@@ -486,10 +544,35 @@ def build_hierarchy(
     report = HierarchyReport(
         leaf_count=len(leaves),
         level_count=level,
-        provider_calls=provider_calls,
+        provider_calls=calls.count,
         levels=tuple(levels),
     )
     return current[0], tuple(all_nodes), report
+
+
+class _CountingProvider:
+    """Count every merge call, re-asks included, across scheduler threads."""
+
+    def __init__(self, delegate: ModelProvider) -> None:
+        self._delegate = delegate
+        self._lock = Lock()
+        self.count = 0
+
+    def generate(self, request: GenerationRequest) -> GenerationResult:
+        with self._lock:
+            self.count += 1
+        return self._delegate.generate(request)
+
+
+def _completion_reporter(
+    observer: RuntimeObserver, items: Mapping[str, ObservedItem]
+) -> Callable[[ScheduledResult], None]:
+    def report(result: ScheduledResult) -> None:
+        observer.emit_item(
+            items[result.work_id].event("completed", summary=result.payload)
+        )
+
+    return report
 
 
 def _prepare_merge(
@@ -510,7 +593,7 @@ def _prepare_merge(
     adaptive_grounding: bool,
     provider_schema_reserve: int,
 ) -> _PreparedMerge:
-    node_id = f"L{level}N{order + 1:04d}"
+    node_id = tree_node_id(level, order)
     # A union in document order: deduplicated, first occurrence wins. Three
     # documents call this a union, and a caller supplying overlapping coverage
     # would otherwise store duplicates for issue #8 to narrow.
@@ -647,16 +730,16 @@ def _prepare_merge(
 
 
 def _execute_prepared_merge(
-    prepared: _PreparedMerge, provider: ModelProvider
+    prepared: _PreparedMerge,
+    provider: ModelProvider,
+    item: ObservedItem,
+    observer: RuntimeObserver,
 ) -> object:
-    """Perform only the provider call and pre-existing response validation."""
-    result = provider.generate(prepared.request)
-    return parse_merged_summary(
-        result.text,
-        legal=prepared.legal,
-        quotation_sources=prepared.quotation_sources,
-        preserved_provenance=prepared.preserved_provenance,
-        source_order=prepared.covered_segments,
-        subject=prepared.node_id,
-        level=prepared.level,
-    ).model_dump(mode="json")
+    """Make the merge call, re-asking a response that fails validation."""
+    return generate_observed(
+        item,
+        provider,
+        prepared.request,
+        lambda result: prepared.parse(result.text).model_dump(mode="json"),
+        observer=observer,
+    )

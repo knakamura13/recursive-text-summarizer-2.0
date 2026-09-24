@@ -3,24 +3,33 @@
 	--color-surface: #f8f8f7;
 	--color-surface-elevated: #ffffff;
 	--color-border: #e4e4e2;
-	--color-border-strong: #d0d0cd;
+	/* Control outlines (inputs, buttons): 3:1 against the background. */
+	--color-border-strong: #8d8d87;
 
 	--color-text: #2b2b28;
-	--color-text-muted: #6b6b66;
-	--color-text-subtle: #8a8a84;
+	--color-text-muted: #5f5f5a;
+	/* 4.6:1 on white: the lightest gray still legible as small text. */
+	--color-text-subtle: #73736d;
 
-	--color-sage: #5a7d5c;
+	--color-sage: #4f7351;
 	--color-sage-soft: #e8f0e9;
 	--color-sage-border: #b8d4ba;
 
 	--color-amber: #c9922e;
+	--color-amber-strong: #85590f;
 	--color-amber-soft: #fdf6e8;
 	--color-amber-border: #e8c878;
 
 	--color-danger: #b44a3a;
 	--color-danger-soft: #fceeed;
+	--color-danger-border: #eab8b0;
+
+	--color-info: #3f6397;
+	--color-info-soft: #eaf0f8;
+	--color-info-border: #b9cbe4;
 
 	--color-focus: #4a6fa5;
+	--color-overlay: rgba(43, 43, 40, 0.4);
 
 	--sidebar-left-width: 280px;
 	--sidebar-right-width: 320px;
@@ -34,6 +43,7 @@
 
 	--shadow-sm: 0 1px 2px rgba(43, 43, 40, 0.06);
 	--shadow-md: 0 4px 12px rgba(43, 43, 40, 0.08);
+	--shadow-lg: 0 12px 32px rgba(43, 43, 40, 0.18);
 
 	--space-1: 0.25rem;
 	--space-2: 0.5rem;
@@ -42,6 +52,9 @@
 	--space-5: 1.25rem;
 	--space-6: 1.5rem;
 	--space-8: 2rem;
+
+	/* Minimum size of anything tapped or clicked. */
+	--touch-target: 2.75rem;
 }
 
 @media (prefers-reduced-motion: reduce) {

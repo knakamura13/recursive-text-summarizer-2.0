@@ -6,7 +6,7 @@ The project supports OpenAI and locally served Ollama models through the same pi
 
 ## Supported input
 
-The application reads one non-empty UTF-8 text file. Markdown is supported as text; headings, paragraphs, lists, indentation, and internal blank lines remain meaningful to segmentation. Ingestion removes a leading BOM, normalizes CRLF/CR to LF, removes trailing spaces and tabs on each line, and trims blank lines at the document edges. It does not OCR images, transcribe audio, fetch external facts, or interpret a document as a lecture, textbook, or other special domain.
+The CLI reads one non-empty UTF-8 text file. Markdown is supported as text; headings, paragraphs, lists, indentation, and internal blank lines remain meaningful to segmentation. Ingestion removes a leading BOM, normalizes CRLF/CR to LF, removes trailing spaces and tabs on each line, and trims blank lines at the document edges. The web app supports additional formats and OCR as described below; the CLI does not.
 
 Source text is treated as untrusted data. Instructions inside the source cannot replace the summarization instructions. An empty file, an invalid UTF-8 file, or an unreadable path fails before a final output is published.
 
@@ -149,7 +149,7 @@ Caching is opt-in. `--cache-dir` enables a JSON object store and run manifests; 
 
 Only parsed and locally validated terminal results are reusable. Raw provider responses, exceptions, failed work items, and failed verification do not become cache references. Cache directories are created with restrictive permissions, but the cache is not encrypted. Do not commit it.
 
-Retryable timeout, rate-limit, connection, and server failures use bounded exponential backoff; non-retryable authentication, request, response, and configuration errors fail immediately. `--max-retries` controls the attempt limit. Concurrent independent work is bounded by `--max-concurrency` when cache reliability is enabled, while manifest order, source order, merge-level barriers, and audit entries remain deterministic. Final paired publication (summary plus reliable audit/3 or audit/4) uses a manifest witness so an incomplete run is not accepted as complete; separate processes must not publish different runs to the same output pair.
+Retryable timeout, rate-limit, connection, and server failures use bounded exponential backoff; non-retryable authentication, request, and configuration errors fail immediately. `--max-retries` controls the attempt limit. A leaf, merge, or editorial response that fails validation, including an incomplete or malformed response, is re-asked up to twice with the validator's one-line reason; if the third answer is still invalid, the run fails naming that item. Concurrent independent work is bounded by `--max-concurrency` when cache reliability is enabled, while manifest order, source order, merge-level barriers, and audit entries remain deterministic. Each leaf and merge is recorded in the run manifest as soon as it finishes, so `--resume` after an interrupted or failed run recomputes only the work that had not finished. Final paired publication (summary plus reliable audit/3 or audit/4) uses a manifest witness so an incomplete run is not accepted as complete; separate processes must not publish different runs to the same output pair.
 
 ## Verification limitations
 
@@ -234,9 +234,11 @@ Vite serves the SPA at `http://127.0.0.1:5173` and proxies `/api` to the backend
 ### Production
 
 ```sh
-cd frontend && pnpm install && pnpm build && cd ..
+cd frontend && pnpm install --frozen-lockfile && pnpm build && cd ..
 uvicorn summarizer_web.main:app --host 127.0.0.1 --port 8000
 ```
+
+The web app is for one local user. Keep it on loopback: it has no authentication and only allows local Hosts and Origins. Imports run in the background with progress and an Import report; one Run may be active at a time. Stop keeps completed work, and Resume starts a new Attempt. Turn on Verify to check summary sentences against source evidence. When Verify is off, sentences are explicitly marked unchecked.
 
 ### Application data
 
@@ -255,15 +257,15 @@ ollama serve
 ollama pull gemma3:4b
 ```
 
-Select the model explicitly in Settings or the Summarize panel. The application does not pull models automatically.
+Choose a model in the Run form. Settings stores the default model and Ollama host; Test connection checks the typed host without saving it. The application does not pull models automatically.
 
 ### Supported imports in the web UI
 
-- UTF-8 `.txt` and `.md`
-- `.pdf` with bounded extraction (50 MiB, 2,000 pages, 120-second timeout)
+- Text and Markdown in common encodings, pasted text, SRT/VTT subtitles, HTML, PDF, DOCX, ODT, RTF, and EPUB.
+- PNG, JPEG, and TIFF images through Tesseract OCR. PDF pages with sparse text layers are OCR'd when Tesseract is installed.
 
-PDF imports require preview acceptance before summarization. Encrypted or textless PDFs are rejected.
+Uploads are streamed to disk (500 MiB limit); paged Documents are limited to 5,000 pages. File type is detected from content. Imports with no usable text fail instead of entering the library as ready. Install Tesseract with English language data to import scanned images and OCR sparse PDF pages.
 
 ## Limitations
 
-The system is an orchestration and grounding implementation, not a guarantee of model truth. Conservative token estimates can reduce packing efficiency; context-window tables are maintained metadata and may require `--context-window`; large or unusual blocks can be split at a hard fallback boundary. Ollama and OpenAI differ in transport behavior, so provider errors remain possible. Verification is best effort and bounded. OCR, audio, external research, GUI operation, and cross-process shared publication are outside the supported scope.
+The system is an orchestration and grounding implementation, not a guarantee of model truth. Conservative token estimates can reduce packing efficiency; context-window tables are maintained metadata and may require an explicit context window; large or unusual blocks can be split at a hard fallback boundary. Ollama and OpenAI differ in transport behavior, so provider errors remain possible. Verification is best effort and bounded. Audio, external research, and multi-user or network-hosted operation are outside the supported scope.

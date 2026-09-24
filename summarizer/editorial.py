@@ -10,12 +10,22 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from summarizer.leaf import _describe, _extract_json_object, _sanitize
 from summarizer.providers.base import GenerationRequest, GenerationResult, ModelProvider
+from summarizer.reask import INVALID_OUTPUT_ERRORS, generate_validated, rejection_reason
+from summarizer.runtime.observers import (
+    ItemEvent,
+    ItemFailedError,
+    ItemState,
+    RuntimeObserver,
+    StageName,
+    get_observer,
+)
 from summarizer.safety import redact_text
 from summarizer.segmentation import CacheCoordinator
 from summarizer.summaries import SummaryNode
 
 EDITORIAL_PROMPT_VERSION = "editorial-prompt/2"
 EDITORIAL_SCHEMA_NAME = "final_editorial_draft"
+EDITORIAL_WORK_ID = "editorial-final"
 
 _INSTRUCTIONS = """\
 Write one standalone final summary from the grounded summary record supplied as
@@ -106,14 +116,14 @@ def build_editorial_request(
         ),
         input_text=f"{begin}\n{payload}\n{end}",
         timeout_seconds=timeout_seconds,
-        operation_id="editorial-final",
+        operation_id=EDITORIAL_WORK_ID,
         response_schema=final_draft_schema(),
         schema_name=EDITORIAL_SCHEMA_NAME,
         max_output_tokens=max_output_tokens,
     )
 
 
-def parse_final_draft(text: str, *, subject: str = "editorial-final") -> FinalDraft:
+def parse_final_draft(text: str, *, subject: str = EDITORIAL_WORK_ID) -> FinalDraft:
     try:
         payload = json.loads(_extract_json_object(text))
     except (ValueError, json.JSONDecodeError) as error:
@@ -137,7 +147,14 @@ def write_editorial(
     timeout_seconds: float,
     target_words: int,
     max_output_tokens: int | None = None,
+    observer: RuntimeObserver | None = None,
 ) -> EditorialResult:
+    """Write the final draft, re-asking while the model's answer is invalid.
+
+    The call reports to `observer` as the `editorial-final` WRITING item. An
+    answer still invalid after the re-asks raises `ItemFailedError`; a result
+    obtained on a re-ask is cached under the original request's descriptor.
+    """
     request = build_editorial_request(
         root,
         source_id=source_id,
@@ -149,21 +166,58 @@ def write_editorial(
     coordinator = getattr(provider, "cache_coordinator", None)
     if coordinator is not None and not isinstance(coordinator, CacheCoordinator):
         raise TypeError("cache_coordinator must be a CacheCoordinator")
+    runtime = get_observer(observer)
+
+    def report(state: ItemState, *, attempt: int | None = None, message: str | None = None) -> None:
+        runtime.emit_item(
+            ItemEvent(
+                kind="editorial",
+                work_id=EDITORIAL_WORK_ID,
+                state=state,
+                stage=StageName.WRITING,
+                attempt=attempt,
+                message=message,
+            )
+        )
 
     def decode(payload: object) -> str:
         return redact_text(FinalDraft.model_validate(payload).text).strip()
+
+    def parse(result: GenerationResult) -> tuple[GenerationResult, str]:
+        return result, redact_text(parse_final_draft(result.text).text).strip()
+
+    def before_reask(attempt: int, reason: str) -> None:
+        runtime.raise_if_stopped(f"before re-asking {EDITORIAL_WORK_ID}")
+        report("retrying", attempt=attempt, message=reason)
 
     generation: GenerationResult | None = None
 
     def compute() -> str:
         nonlocal generation
-        generation = provider.generate(request)
-        return redact_text(parse_final_draft(generation.text).text).strip()
+        report("active")
+        try:
+            generation, text = generate_validated(
+                provider, request, parse, on_retry=before_reask
+            )
+        except INVALID_OUTPUT_ERRORS as error:
+            runtime.raise_if_stopped(f"while writing {EDITORIAL_WORK_ID}")
+            reason = rejection_reason(error)
+            report("failed", message=reason)
+            raise ItemFailedError(
+                reason,
+                stage=StageName.WRITING,
+                kind="editorial",
+                work_id=EDITORIAL_WORK_ID,
+            ) from error
+        report("completed")
+        return text
 
-    if coordinator is not None:
+    if coordinator is None:
+        text = compute()
+    else:
         text = coordinator.resolve(
             stage="editorial",
-            work_id="editorial-final",
+            work_id=EDITORIAL_WORK_ID,
             prompt_version=EDITORIAL_PROMPT_VERSION,
             schema_version="editorial/1",
             input_value={
@@ -177,14 +231,12 @@ def write_editorial(
             encode=lambda value: {"text": value},
             compute=compute,
         )
-        if generation is not None:
-            return EditorialResult(text=text, generation=generation)
+    if generation is None:
+        report("reused")
         return EditorialResult(
             text=text,
             generation=GenerationResult(
                 text="[cached editorial result]", provider="cache", model=model
             ),
         )
-    generation = provider.generate(request)
-    draft = parse_final_draft(generation.text)
-    return EditorialResult(text=redact_text(draft.text).strip(), generation=generation)
+    return EditorialResult(text=text, generation=generation)

@@ -14,6 +14,11 @@ from summarizer.checkpoint import (
     NonReusableReason,
     NonReusableRef,
 )
+from summarizer.runtime.observers import PipelineStopped
+
+# How often a scheduler waiting on in-flight work checks for a stop request.
+# Only a scheduler given a stop check waits in slices; others block outright.
+STOP_POLL_SECONDS = 0.2
 
 
 @dataclass(frozen=True)
@@ -36,7 +41,19 @@ class ScheduledResult:
 
 
 class BoundedScheduler:
-    """Run independent work locally without changing result or level order."""
+    """Run independent work locally without changing result or level order.
+
+    Every item is recorded in the checkpoint manifest the moment it finishes,
+    so a kill at any point loses only work that was still in flight, and a
+    resumed run reuses everything that finished. `on_complete` then receives
+    the durable result on the calling thread.
+
+    `should_stop` is polled before each submission and after each completion,
+    and at least every `STOP_POLL_SECONDS` while waiting. Once it returns true
+    the scheduler submits nothing more, cancels work that has not started,
+    keeps what already finished, and raises `PipelineStopped` without waiting
+    for in-flight calls; their results are discarded and recomputed on resume.
+    """
 
     def __init__(
         self,
@@ -44,6 +61,8 @@ class BoundedScheduler:
         max_in_flight: int,
         cache: CacheStore,
         executor_factory: Callable[[int], Executor] = ThreadPoolExecutor,
+        should_stop: Callable[[], bool] | None = None,
+        on_complete: Callable[[ScheduledResult], None] | None = None,
     ) -> None:
         if not isinstance(max_in_flight, int) or isinstance(max_in_flight, bool):
             raise TypeError("max_in_flight must be an integer")
@@ -52,6 +71,8 @@ class BoundedScheduler:
         self._max_in_flight = max_in_flight
         self._cache = cache
         self._executor_factory = executor_factory
+        self._should_stop = should_stop
+        self._on_complete = on_complete
 
     def run(
         self,
@@ -65,8 +86,6 @@ class BoundedScheduler:
         positions = {
             work_id: index for index, work_id in enumerate(session.manifest.work_ids)
         }
-        descriptors = {item.work_id: item.descriptor for item in work}
-        completed: dict[str, CompletedRef] = {}
         results: dict[str, ScheduledResult] = {}
         non_reusable: dict[str, NonReusableReason] = {}
         pending: dict[Future[object], ScheduledWork] = {}
@@ -75,17 +94,24 @@ class BoundedScheduler:
         terminal_error: Exception | None = None
         terminal_work_id: str | None = None
         cleanup_error: Exception | None = None
+        stopped = False
         executor: Executor | None = None
 
         def record_non_reusable(work_id: str, reason: NonReusableReason) -> None:
             non_reusable.setdefault(work_id, reason)
 
         def collect(future: Future[object], item: ScheduledWork) -> Exception | None:
+            nonlocal stopped
             try:
                 payload = future.result()
             except CancelledError as error:
                 record_non_reusable(item.work_id, NonReusableReason.CANCELLED)
                 return error
+            except PipelineStopped:
+                # The operation saw the stop request before its next call.
+                record_non_reusable(item.work_id, NonReusableReason.CANCELLED)
+                stopped = True
+                return None
             except Exception as error:  # noqa: BLE001 - checkpoint all worker failures
                 record_non_reusable(item.work_id, NonReusableReason.FAILED)
                 return error
@@ -94,29 +120,35 @@ class BoundedScheduler:
                     item.descriptor, payload, item.validate
                 )
                 self._cache.record_descriptor_projection(item.descriptor)
+                session.checkpoint_scheduler_state(
+                    completed=(
+                        CompletedRef(
+                            work_id=item.work_id,
+                            cache_key=item.descriptor.key,
+                        ),
+                    ),
+                    descriptors={item.work_id: item.descriptor},
+                )
             except Exception as error:  # noqa: BLE001 - preserve validation failures
                 record_non_reusable(item.work_id, NonReusableReason.FAILED)
                 return error
-            completed[item.work_id] = CompletedRef(
-                work_id=item.work_id,
-                cache_key=item.descriptor.key,
-            )
-            results[item.work_id] = ScheduledResult(item.work_id, validated)
+            result = ScheduledResult(item.work_id, validated)
+            results[item.work_id] = result
+            if self._on_complete is not None:
+                self._on_complete(result)
             return None
 
-        def completed_futures() -> set[Future[object]]:
-            done: set[Future[object]] = set()
-            while not done:
-                future = completions.get()
-                if future in pending:
-                    done.add(future)
-            while True:
-                try:
-                    future = completions.get_nowait()
-                except Empty:
-                    return done
-                if future in pending:
-                    done.add(future)
+        def collect_finished(finished: Iterable[Future[object]]) -> None:
+            nonlocal terminal_error, terminal_work_id
+            for future in finished:
+                item = pending.pop(future)
+                error = collect(future, item)
+                if terminal_error is None and error is not None:
+                    terminal_error = error
+                    terminal_work_id = item.work_id
+
+        def in_plan_order(futures: Iterable[Future[object]]) -> list[Future[object]]:
+            return sorted(futures, key=lambda future: positions[pending[future].work_id])
 
         try:
             try:
@@ -124,14 +156,16 @@ class BoundedScheduler:
             except Exception as error:  # noqa: BLE001 - no executor was observable
                 terminal_error = error
 
-            while executor is not None and (
-                pending or (next_index < len(work) and terminal_error is None)
+            while (
+                executor is not None
+                and terminal_error is None
+                and not stopped
+                and (pending or next_index < len(work))
             ):
-                while (
-                    terminal_error is None
-                    and next_index < len(work)
-                    and len(pending) < self._max_in_flight
-                ):
+                while next_index < len(work) and len(pending) < self._max_in_flight:
+                    if self._stop_requested():
+                        stopped = True
+                        break
                     item = work[next_index]
                     next_index += 1
                     try:
@@ -145,43 +179,59 @@ class BoundedScheduler:
                         break
                     pending[future] = item
                     future.add_done_callback(completions.put)
-
-                if not pending:
-                    continue
-
-                done = completed_futures()
-                for future in sorted(
-                    done, key=lambda item: positions[pending[item].work_id]
-                ):
-                    item = pending.pop(future)
-                    error = collect(future, item)
-                    if terminal_error is None and error is not None:
-                        terminal_error = error
-                        terminal_work_id = item.work_id
-
-                if terminal_error is not None:
-                    for future, item in tuple(pending.items()):
-                        if future.cancel():
-                            pending.pop(future)
-                            collect(future, item)
+                if stopped or terminal_error is not None:
                     break
+                collect_finished(in_plan_order(self._finished(completions, pending)))
+                if self._stop_requested():
+                    stopped = True
 
-            while executor is not None and pending:
-                done = completed_futures()
-                for future in sorted(
-                    done, key=lambda item: positions[pending[item].work_id]
-                ):
-                    item = pending.pop(future)
-                    error = collect(future, item)
-                    if terminal_error is None and error is not None:
-                        terminal_error = error
-                        terminal_work_id = item.work_id
+            if terminal_error is not None and not stopped:
+                # Drain started siblings so their successes stay reusable.
+                for future, item in tuple(pending.items()):
+                    if future.cancel():
+                        pending.pop(future)
+                        collect(future, item)
+                while pending and not stopped:
+                    collect_finished(
+                        in_plan_order(self._finished(completions, pending))
+                    )
+                    if self._stop_requested():
+                        stopped = True
+
+            if stopped:
+                # Keep whatever already finished, then abandon the rest.
+                collect_finished(
+                    in_plan_order(future for future in pending if future.done())
+                )
+                for future, item in tuple(pending.items()):
+                    future.cancel()
+                    record_non_reusable(item.work_id, NonReusableReason.CANCELLED)
+                pending.clear()
         finally:
             try:
                 if executor is not None:
-                    executor.shutdown(wait=True)
+                    if stopped:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    else:
+                        executor.shutdown(wait=True)
             except Exception as error:  # noqa: BLE001 - retain cleanup failure as cause
                 cleanup_error = error
+
+        if stopped and terminal_error is None:
+            for item in work[next_index:]:
+                record_non_reusable(item.work_id, NonReusableReason.CANCELLED)
+            checkpoint_error = self._checkpoint(
+                session,
+                non_reusable,
+                positions,
+                terminal_failure=None,
+                terminal_work_id=None,
+            )
+            stop = PipelineStopped("stopped between scheduled items")
+            cause = checkpoint_error or cleanup_error
+            if cause is not None:
+                raise stop from cause
+            raise stop
 
         if terminal_error is None and cleanup_error is not None:
             terminal_error = cleanup_error
@@ -191,12 +241,10 @@ class BoundedScheduler:
                 record_non_reusable(item.work_id, NonReusableReason.UNKNOWN)
             checkpoint_error = self._checkpoint(
                 session,
-                completed,
-                descriptors,
                 non_reusable,
-                terminal_work_id,
                 positions,
                 terminal_failure=True,
+                terminal_work_id=terminal_work_id,
             )
             if checkpoint_error is not None:
                 raise terminal_error from checkpoint_error
@@ -204,17 +252,19 @@ class BoundedScheduler:
                 raise terminal_error from cleanup_error
             raise terminal_error
 
-        checkpoint_error = self._checkpoint(
-            session,
-            completed,
-            descriptors,
-            non_reusable,
-            None,
-            positions,
-            terminal_failure=False,
-        )
-        if checkpoint_error is not None:
-            raise checkpoint_error
+        if (
+            session.manifest.terminal_failure
+            or session.manifest.terminal_failure_work_id is not None
+        ):
+            checkpoint_error = self._checkpoint(
+                session,
+                non_reusable,
+                positions,
+                terminal_failure=False,
+                terminal_work_id=None,
+            )
+            if checkpoint_error is not None:
+                raise checkpoint_error
         return tuple(
             results[work_id] for work_id in sorted(results, key=positions.__getitem__)
         )
@@ -231,6 +281,34 @@ class BoundedScheduler:
             work_id: index for index, work_id in enumerate(session.manifest.work_ids)
         }
         return tuple(sorted(results, key=lambda item: positions[item.work_id]))
+
+    def _stop_requested(self) -> bool:
+        return self._should_stop is not None and self._should_stop()
+
+    def _finished(
+        self,
+        completions: SimpleQueue[Future[object]],
+        pending: Mapping[Future[object], ScheduledWork],
+    ) -> set[Future[object]]:
+        """Wait until pending work finishes, or return early for a stop."""
+        timeout = None if self._should_stop is None else STOP_POLL_SECONDS
+        done: set[Future[object]] = set()
+        while not done:
+            try:
+                future = completions.get(timeout=timeout)
+            except Empty:
+                if self._stop_requested():
+                    break
+                continue
+            if future in pending:
+                done.add(future)
+        while True:
+            try:
+                future = completions.get_nowait()
+            except Empty:
+                return done
+            if future in pending:
+                done.add(future)
 
     @staticmethod
     def _validate_work(
@@ -249,28 +327,24 @@ class BoundedScheduler:
     @staticmethod
     def _checkpoint(
         session: CheckpointSession,
-        completed: Mapping[str, CompletedRef],
-        descriptors: Mapping[str, CacheDescriptor],
         non_reusable: Mapping[str, NonReusableReason],
-        terminal_work_id: str | None,
         positions: Mapping[str, int],
         *,
-        terminal_failure: bool,
+        terminal_failure: bool | None,
+        terminal_work_id: str | None,
     ) -> Exception | None:
+        """Record the batch outcome; completed work was recorded as it finished."""
         try:
             session.checkpoint_scheduler_state(
-                completed=tuple(
-                    completed[work_id]
-                    for work_id in sorted(completed, key=positions.__getitem__)
-                ),
-                descriptors=descriptors,
                 non_reusable=tuple(
                     NonReusableRef(work_id=work_id, reason=non_reusable[work_id])
                     for work_id in sorted(non_reusable, key=positions.__getitem__)
                 ),
                 terminal_failure=terminal_failure,
                 terminal_failure_work_id=terminal_work_id,
-                clear_terminal_failure=terminal_work_id is None,
+                clear_terminal_failure=(
+                    terminal_failure is not None and terminal_work_id is None
+                ),
             )
         except Exception as error:  # noqa: BLE001 - caller receives the terminal work error
             return error

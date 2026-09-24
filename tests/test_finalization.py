@@ -6,7 +6,7 @@ import pytest
 from summarizer.direct import whole_document_segment
 from summarizer.finalization import (
     FinalizationVerificationError,
-    _recheck_fallback_draft,
+    _drop_failing_sentences,
     _verified_content_unit_draft,
     finalize_summary,
 )
@@ -151,20 +151,32 @@ def test_failed_editorial_uses_only_reverified_content_units(tmp_path) -> None:
     assert result.text == "The source fact is correct."
     assert result.audit is not None
     assert "verified_content_unit_fallback" in result.audit.warnings
+    assert result.audit.publication is not None
+    publication = result.audit.publication
+    assert publication.kind == "content_unit_fallback"
+    assert [
+        (removed.text, removed.verdict) for removed in publication.removed_sentences
+    ] == [("An unsupported outcome occurred.", "insufficiently_supported")]
+    assert publication.sentences[0].evidence[0].quote == "source fact"
     assert len(provider.requests) == 7  # editorial, then three two-call checks
 
 
-def test_failed_editorial_without_supported_units_stays_unpublished() -> None:
+def test_failed_editorial_without_supported_units_stays_unpublished(tmp_path) -> None:
     class RejectingProvider(ScriptedProvider):
         def generate(self, request):
+            self.requests.append(request)
             if request.operation_id == "editorial-final":
-                return GenerationResult('{"text":"Unsupported."}', "fake", request.model)
-            if request.operation_id == "verification-decompose:V01":
-                return GenerationResult('{"spans":[{"span_id":"V01S000001","anchors":[]}]}', "fake", request.model)
-            return GenerationResult(
-                '{"findings":[{"claim_id":"V01C000001","verdict":"insufficiently_supported","evidence":[]}]}',
-                "fake", request.model,
-            )
+                payload = {"text": "Unsupported. Also unsupported."}
+            elif request.operation_id.startswith("verification-decompose:"):
+                spans = json.loads(request.input_text.splitlines()[1])
+                payload = {"spans": [{"span_id": span["span_id"], "anchors": []} for span in spans]}
+            else:
+                claims = json.loads(request.input_text.splitlines()[1])["claims"]
+                payload = {"findings": [
+                    {"claim_id": claim["claim_id"], "verdict": "insufficiently_supported", "evidence": []}
+                    for claim in claims
+                ]}
+            return GenerationResult(json.dumps(payload), "fake", request.model)
 
     counter = ConservativeUtf8TokenCounter()
     document = ingest_text("The source fact is correct.")
@@ -176,6 +188,7 @@ def test_failed_editorial_without_supported_units_stays_unpublished() -> None:
         "quotations": [], "provenance": [segment.segment_id], "level": 0,
     })
     root = TreeNode("L0N0001", 0, 0, summary, (), (segment.segment_id,))
+    audit_path = tmp_path / "audit.json"
     with pytest.raises(FinalizationVerificationError):
         finalize_summary(
             summary, RejectingProvider(),
@@ -187,11 +200,18 @@ def test_failed_editorial_without_supported_units_stays_unpublished() -> None:
             segments=(segment,),
             nodes=(root,),
             root_node_id=root.node_id,
+            audit_path=audit_path,
             counter=counter,
             source_cores={segment.segment_id: segment.text},
             verification=VerificationConfig(enabled=True),
             verification_context_window_tokens=10_000,
         )
+
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert "publication" not in audit
+    assert audit["verification"]["failed"] is True
+    assert audit["warnings"] == ["verified_content_unit_fallback_failed"]
+    assert audit["citations"] == []
 
 
 def test_fallback_skips_unit_that_breaks_combined_verification(monkeypatch) -> None:
@@ -475,6 +495,63 @@ def _units(*texts: str) -> SummaryNode:
     })
 
 
+def test_fallback_uses_later_units_without_exceeding_target_words(monkeypatch) -> None:
+    def verify(text, **kwargs):
+        return SimpleNamespace(
+            failed=False,
+            assessments=(SimpleNamespace(verdict=ClaimVerdict.SUPPORTED),),
+            claims=(),
+            spans=(),
+            generations=(),
+        )
+
+    monkeypatch.setattr("summarizer.finalization.verify_draft_once", verify)
+    draft, _ = _verified_content_unit_draft(
+        _units(
+            "One two three four.",
+            "Five six.",
+            "Seven eight.",
+            "Nine.",
+        ),
+        source_id="a" * 64,
+        source_index=None,
+        runtime=None,
+        config=VerificationConfig(enabled=True),
+        target_words=3,
+    )
+
+    assert draft == "Five six. Nine."
+    assert len(draft.split()) == 3
+
+
+def test_fallback_considers_root_units_after_the_first_eight(monkeypatch) -> None:
+    last = "Ninth fact."
+
+    def verify(text, **kwargs):
+        verdict = (
+            ClaimVerdict.SUPPORTED if text == last else ClaimVerdict.INSUFFICIENTLY_SUPPORTED
+        )
+        return SimpleNamespace(
+            failed=text != last,
+            assessments=(SimpleNamespace(verdict=verdict),),
+            claims=(),
+            spans=(),
+            generations=(),
+        )
+
+    monkeypatch.setattr("summarizer.finalization.verify_draft_once", verify)
+    draft, _ = _verified_content_unit_draft(
+        _units(*(f"{ordinal}th fact." for ordinal in range(1, 9)), last),
+        source_id="a" * 64,
+        source_index=None,
+        runtime=None,
+        config=VerificationConfig(enabled=True),
+        target_words=100,
+    )
+
+    assert draft == last
+
+
 def _pass_result(rows: tuple[tuple[str, ClaimVerdict, bool, str, str], ...]):
     claims = []
     assessments = []
@@ -622,7 +699,7 @@ def test_recheck_publishes_sentences_that_still_pass() -> None:
             )
         return SimpleNamespace(failed=False, text=text, pass_results=())
 
-    result = _recheck_fallback_draft(draft, verify=verify)
+    result = _drop_failing_sentences(verify(draft), verify=verify)
 
     assert result.failed is False
     assert result.text == "Keep this sentence."
@@ -643,7 +720,7 @@ def test_recheck_stops_when_every_sentence_fails() -> None:
             ),
         )
 
-    result = _recheck_fallback_draft(draft, verify=verify)
+    result = _drop_failing_sentences(verify(draft), verify=verify)
 
     assert result.failed is True
     assert checked == [draft]
@@ -660,7 +737,7 @@ def test_recheck_does_not_salvage_a_contract_failure() -> None:
             pass_results=(SimpleNamespace(failed=True, spans=(), claims=(), assessments=()),),
         )
 
-    result = _recheck_fallback_draft("Keep this sentence.", verify=verify)
+    result = _drop_failing_sentences(verify("Keep this sentence."), verify=verify)
 
     assert result.failed is True
     assert checked == ["Keep this sentence."]

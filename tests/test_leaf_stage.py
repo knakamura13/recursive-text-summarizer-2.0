@@ -5,6 +5,7 @@ import pytest
 
 from summarizer.ingestion import ingest_text
 from summarizer.leaf import LeafSummaryError, summarize_segments
+from summarizer.runtime.observers import ItemFailedError, StageName
 from summarizer.providers.base import (
     GenerationRequest,
     GenerationResult,
@@ -100,20 +101,30 @@ def test_calls_the_provider_once_per_segment() -> None:
 
 
 def test_fails_on_the_first_invalid_segment_without_partial_output() -> None:
-    """A schema violation is not retried and does not yield partial results.
+    """A segment still invalid after its re-asks fails the stage, whole.
 
-    The retry decorator only re-attempts transient transport failures, and a
-    half-populated hierarchy reaching the merge stage is worse than a clear
-    failure.
+    It is asked three times in all, then the stage fails naming the leaf and
+    its segment rather than working through the rest: a half-populated
+    hierarchy reaching the merge stage is worse than a clear failure.
     """
     all_segments = segments()
-    provider = RecordingProvider(broken={all_segments[1].segment_id})
+    broken = all_segments[1].segment_id
+    provider = RecordingProvider(broken={broken})
 
-    with pytest.raises(LeafSummaryError, match=all_segments[1].segment_id):
+    with pytest.raises(ItemFailedError, match=broken) as failure:
         summarize(provider)
 
-    # Stopped at the bad segment rather than working through the rest.
-    assert len(provider.requests) == 2
+    assert failure.value.work_id == "L0N0002"
+    assert failure.value.kind == "leaf"
+    assert failure.value.stage is StageName.SUMMARIZING
+    assert failure.value.covered_segment_ids == (broken,)
+    assert isinstance(failure.value.__cause__, LeafSummaryError)
+    assert [request.operation_id for request in provider.requests] == [
+        all_segments[0].segment_id,
+        broken,
+        broken,
+        broken,
+    ]
 
 
 class FailingProvider:
@@ -173,10 +184,12 @@ def test_a_payload_obeying_injected_instructions_fails_validation() -> None:
                 model=request.model,
             )
 
-    with pytest.raises(LeafSummaryError, match="S999999"):
+    with pytest.raises(ItemFailedError, match="S999999") as failure:
         summarize_segments(
             all_segments, ObedientProvider(), model="m", timeout_seconds=30
         )
+
+    assert isinstance(failure.value.__cause__, LeafSummaryError)
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
