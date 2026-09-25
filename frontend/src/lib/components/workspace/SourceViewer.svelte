@@ -92,9 +92,16 @@
 		if (!layout || !total) return null;
 		void rendered;
 		const offset = layout.offsetAt(scrollTop + TOP_INSET);
+		// Scroll progress, not the offset at the top: the last screen of text starts before 100%.
+		const scrollable = layout.totalHeight - viewportHeight;
+		const atEnd = scrollable <= 0 || scrollTop >= scrollable - 1;
+		const percent = atEnd ? 100 : Math.min(99, Math.max(0, Math.round((scrollTop / scrollable) * 100)));
 		const marked = pageAtTop();
-		const page = (marked !== null && pages.find((item) => item.page === marked)) || pageAtOffset(pages, offset);
-		return { offset, percent: Math.min(100, Math.round((offset / total) * 100)), page };
+		const page =
+			(atEnd && pages.length > 0 ? pages[pages.length - 1] : null) ||
+			(marked !== null && pages.find((item) => item.page === marked)) ||
+			pageAtOffset(pages, offset);
+		return { offset, percent, page };
 	});
 
 	/** The page whose marker is the last one at or above the viewport top; the offset estimate is
