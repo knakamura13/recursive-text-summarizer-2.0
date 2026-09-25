@@ -3,7 +3,7 @@ from summarizer.compression import (
     RETENTION_RATIO,
     build_compression_request,
     compress_to_target,
-    prepend_document_lead,
+    retain_sentences_with_missing_literals,
     word_count,
     _above_ceiling,
     _in_band,
@@ -88,18 +88,31 @@ def test_above_ceiling_helper() -> None:
     assert not _above_ceiling(105, 100)
 
 
-def test_prepend_document_lead_restores_opening_headcount() -> None:
+def test_compression_keeps_a_dropped_number_from_any_sentence() -> None:
     source = (
-        "The very thing the 16 skiers and snowboarders had sought became the enemy. "
-        "Gravity did the rest."
+        "Alpha reviewed the harbour plan without figures. "
+        "The council approved 42 units in March. "
+        "Beta closed the meeting."
     )
-    body = "Later paragraphs only describe the gorge and survival tactics."
-    merged = prepend_document_lead(body, source)
-    assert "16 skiers and snowboarders" in merged
-    assert merged.startswith("The very thing the 16 skiers")
+    result = compress_to_target(
+        source,
+        Provider(['{"text":"Alpha reviewed the harbour plan. Beta closed the meeting."}']),
+        source_id="a" * 64,
+        model="m",
+        timeout_seconds=30,
+        target_words=4,
+    )
+    assert "approved 42 units in March" in result.text
+    assert result.text.index("Beta closed") < result.text.index("approved 42")
 
 
-def test_prepend_document_lead_skips_when_lead_already_present() -> None:
-    source = "The 16 skiers continued down the slope."
-    body = "The 16 skiers continued down the slope. More detail here."
-    assert prepend_document_lead(body, source) == body
+def test_compression_may_drop_sentences_without_names_or_numbers() -> None:
+    source = "Alpha reviewed the harbour plan. Beta closed the meeting after a long debate."
+    shortened = "Alpha reviewed the harbour plan."
+    assert retain_sentences_with_missing_literals(source, shortened) == shortened
+
+
+def test_compression_does_not_duplicate_a_kept_literal() -> None:
+    source = "The council approved 42 units in March. Beta closed the meeting."
+    shortened = "The council approved 42 units in March."
+    assert retain_sentences_with_missing_literals(source, shortened) == shortened
