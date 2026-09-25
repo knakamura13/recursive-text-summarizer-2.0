@@ -11,6 +11,7 @@ from summarizer.verification import (
     build_source_lexical_index,
     claim_drop_blocked_by_omitted_required,
     pack_work_items,
+    required_segment_ids,
     select_claim_evidence,
 )
 
@@ -157,7 +158,7 @@ def test_index_is_immutable_and_reused_for_multiple_claims() -> None:
     )
 
     assert first.passages == second.passages
-    assert first.selection.retrieval_method == "lexical-overlap-required/2"
+    assert first.selection.retrieval_method == "lexical-overlap-required/3"
 
 
 def runtime(*, context_window_tokens: int = 100) -> VerificationRuntime:
@@ -259,6 +260,46 @@ def test_evidence_packs_low_overlap_segment_when_claim_number_is_present() -> No
         max_tokens=250,
     )
     assert "S000002" in bundle.selection.selected_ids
+
+
+def test_required_segments_ignore_bare_single_digits() -> None:
+    source = {
+        "S000001": "Chapter 4 discusses unrelated zoning.",
+        "S000002": "The only contested seat is for Ward 4.",
+    }
+    index = build_source_lexical_index(
+        provenance_ids=("S000001", "S000002"), source=source
+    )
+    claim_text = "only the Ward 4 position is contested"
+    required = required_segment_ids(claim(claim_text), index)
+    assert "S000002" in required
+    assert "S000001" not in required
+
+
+def test_drop_blocked_when_insufficient_but_literals_are_in_evidence() -> None:
+    source = {
+        "S000001": (
+            "In Seaside, the only contested seat is for Ward 4. "
+            "Candidates are Padraig Ansbro and Patrick Barker."
+        ),
+    }
+    index = build_source_lexical_index(provenance_ids=("S000001",), source=source)
+    bundle = select_claim_evidence(
+        claim(
+            "Ward 4 is the only contested race between Padraig Ansbro and Patrick Barker."
+        ),
+        source_index=index,
+        counter=ConservativeUtf8TokenCounter(),
+        max_tokens=1000,
+    )
+    assert claim_drop_blocked_by_omitted_required(
+        claim(
+            "Ward 4 is the only contested race between Padraig Ansbro and Patrick Barker."
+        ),
+        bundle,
+        index,
+        ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+    )
 
 
 def test_drop_blocked_when_required_segment_was_omitted() -> None:

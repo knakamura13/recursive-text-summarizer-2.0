@@ -3,6 +3,7 @@ from summarizer.compression import (
     RETENTION_RATIO,
     build_compression_request,
     compress_to_target,
+    prepend_document_lead,
     word_count,
     _above_ceiling,
     _in_band,
@@ -85,3 +86,20 @@ def test_retention_ratio_constant() -> None:
 def test_above_ceiling_helper() -> None:
     assert _above_ceiling(120, 100)
     assert not _above_ceiling(105, 100)
+
+
+def test_prepend_document_lead_restores_opening_headcount() -> None:
+    source = (
+        "The very thing the 16 skiers and snowboarders had sought became the enemy. "
+        "Gravity did the rest."
+    )
+    body = "Later paragraphs only describe the gorge and survival tactics."
+    merged = prepend_document_lead(body, source)
+    assert "16 skiers and snowboarders" in merged
+    assert merged.startswith("The very thing the 16 skiers")
+
+
+def test_prepend_document_lead_skips_when_lead_already_present() -> None:
+    source = "The 16 skiers continued down the slope."
+    body = "The 16 skiers continued down the slope. More detail here."
+    assert prepend_document_lead(body, source) == body
