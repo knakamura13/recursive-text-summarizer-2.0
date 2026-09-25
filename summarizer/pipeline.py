@@ -19,6 +19,7 @@ from summarizer.budget import (
 )
 from summarizer.cache import CacheStore
 from summarizer.checkpoint import CheckpointStore, RunPlan
+from summarizer.compression import compression_work_ids_for_text
 from summarizer.config import AppConfig, CacheConfig, ReliabilityConfig, StrategyConfig
 from summarizer.direct import DIRECT_NODE_ID, summarize_direct, whole_document_segment
 from summarizer.finalization import (
@@ -509,23 +510,23 @@ def _run_pipeline(
     observer.raise_if_stopped("before finalization")
     completed_before_editorial = tuple(recording.generations)
     if coordinator is not None and coordinator.session is not None:
-        coordinator.session.ensure_work_prefix(
-            (
-                *coordinator.session.manifest.work_ids[
-                    : next(
-                        (
-                            index
-                            for index, work_id in enumerate(
-                                coordinator.session.manifest.work_ids
-                            )
-                            if work_id == "editorial-final"
-                        ),
-                        len(coordinator.session.manifest.work_ids),
-                    )
-                ],
-                "editorial-final",
+        work_ids = coordinator.session.manifest.work_ids
+        if not any(work_id.startswith("C") for work_id in work_ids):
+            editorial_index = next(
+                (
+                    index
+                    for index, work_id in enumerate(work_ids)
+                    if work_id == "editorial-final"
+                ),
+                len(work_ids),
             )
-        )
+            coordinator.session.ensure_work_prefix(
+                (
+                    *work_ids[:editorial_index],
+                    *compression_work_ids_for_text(document.text),
+                    "editorial-final",
+                )
+            )
     verifier_runtime = config.verification_runtime
     if config.verification.enabled and verifier_runtime is None:
         verifier_runtime = VerificationRuntime(

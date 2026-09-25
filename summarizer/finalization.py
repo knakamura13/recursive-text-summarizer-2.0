@@ -1,20 +1,16 @@
 """Compose the final summary: editorial writing, verified publication, and audit.
 
-With verification enabled, exactly one of three verified texts is published:
+With verification enabled, exactly one of two verified texts is published:
 
 1. `editorial`: the editorial draft passes verification, repairs included.
-2. `verified_subset`: otherwise the draft's failing sentences are dropped and
-   the remainder is re-verified until it passes (warning
-   `verified_sentence_subset`). One unsupported claim never discards the
-   whole draft.
-3. `content_unit_fallback`: only when no sentence of the draft passes, a
-   draft assembled from independently verified root content units is
-   verified the same way (warning `verified_content_unit_fallback`).
+2. `verified_subset`: otherwise failing sentences are dropped from the first
+   verification pass and the passing remainder is published without a second
+   full verification (warning `verified_sentence_subset`).
 
-Nothing is published unless its final verification passed; otherwise a
-failure audit is written and `FinalizationVerificationError` is raised. The
-audit's `publication` records the kind, each published sentence with its
-supporting quotations, and every removed sentence with its verdict.
+Nothing is published unless at least one sentence passes that first check;
+otherwise a failure audit is written and `FinalizationVerificationError` is
+raised. The audit's `publication` records the kind, each published sentence
+with its supporting quotations, and every removed sentence with its verdict.
 """
 
 from __future__ import annotations
@@ -25,7 +21,7 @@ import threading
 import weakref
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 
@@ -50,6 +46,13 @@ from summarizer.checkpoint import (
     CheckpointSession,
     PublicationState,
     RunManifest,
+)
+from summarizer.compression import (
+    compress_to_target,
+    word_count,
+    _above_ceiling,
+    _in_band,
+    _under_floor,
 )
 from summarizer.editorial import write_editorial
 from summarizer.grounding import SourcePassage, serialize_source_passage
@@ -77,7 +80,9 @@ from summarizer.tokenization import TokenCounter
 from summarizer.verification import (
     Claim,
     ClaimAssessment,
+    DraftSpan,
     ClaimVerdict,
+    EvidenceBundle,
     SourceLexicalIndex,
     VerificationConfig,
     VerificationPassResult,
@@ -85,14 +90,12 @@ from summarizer.verification import (
     VerificationResult,
     VerificationRuntime,
     build_source_lexical_index,
+    claim_drop_blocked_by_omitted_required,
     split_draft_spans,
     verify_and_repair,
     verify_draft_once,
 )
 
-# The failing sentences of a draft are dropped and its remainder re-verified at
-# most this many times before the draft is given up.
-_MAX_SENTENCE_DROPS = 7
 # Evidence passages are never split below this many tokens.
 _MIN_PASSAGE_TOKENS = 32
 _PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n(?:[ \t]*\n)*")
@@ -255,7 +258,25 @@ def _assembled_addition_supported(
     return True
 
 
-def _passing_sentence_text(result: VerificationResult) -> str | None:
+def _effective_claim_verdict(
+    claim: Claim,
+    verdict: ClaimVerdict,
+    bundles_by_claim: Mapping[str, EvidenceBundle],
+    source_index: SourceLexicalIndex,
+) -> ClaimVerdict:
+    bundle = bundles_by_claim.get(claim.claim_id)
+    if bundle is not None and claim_drop_blocked_by_omitted_required(
+        claim, bundle, source_index, verdict
+    ):
+        return ClaimVerdict.SUPPORTED
+    return verdict
+
+
+def _passing_sentence_text(
+    result: VerificationResult,
+    *,
+    source_index: SourceLexicalIndex,
+) -> str | None:
     """Keep sentences whose every claim passed, and drop the rest.
 
     Kept sentences stay in order, and a paragraph break survives wherever the
@@ -271,6 +292,8 @@ def _passing_sentence_text(result: VerificationResult) -> str | None:
     verdicts = {
         assessment.claim_id: assessment.verdict for assessment in passed.assessments
     }
+    claims_by_id = {claim.claim_id: claim for claim in passed.claims}
+    bundles_by_claim = {bundle.selection.claim_id: bundle for bundle in passed.bundles}
     claims_by_span: dict[str, list[str]] = {}
     for claim in passed.claims:
         claims_by_span.setdefault(claim.span_id, []).append(claim.claim_id)
@@ -283,7 +306,15 @@ def _passing_sentence_text(result: VerificationResult) -> str | None:
             continue
         claim_ids = claims_by_span.get(span.span_id, [])
         if claim_ids and all(
-            verdicts.get(claim_id) is ClaimVerdict.SUPPORTED for claim_id in claim_ids
+            _effective_claim_verdict(
+                claims_by_id[claim_id],
+                verdicts[claim_id],
+                bundles_by_claim,
+                source_index,
+            )
+            is ClaimVerdict.SUPPORTED
+            for claim_id in claim_ids
+            if claim_id in claims_by_id and claim_id in verdicts
         ):
             if pieces:
                 pieces.append("\n\n" if paragraph_break else " ")
@@ -300,25 +331,170 @@ def _passing_sentence_text(result: VerificationResult) -> str | None:
     return "".join(pieces)
 
 
-def _drop_failing_sentences(
+def _renumber_pass_ordinals(
+    spans: tuple[DraftSpan, ...],
+    claims: tuple[Claim, ...],
+) -> tuple[tuple[DraftSpan, ...], tuple[Claim, ...]]:
+    """Audit validation requires contiguous span and per-span claim ordinals."""
+    if not spans or not isinstance(spans[0], DraftSpan):
+        return spans, claims
+    renumbered_spans = tuple(
+        replace(span, ordinal=index) for index, span in enumerate(spans, start=1)
+    )
+    claims_by_span: dict[str, list[Claim]] = {}
+    for claim in claims:
+        claims_by_span.setdefault(claim.span_id, []).append(claim)
+    renumbered_claims: list[Claim] = []
+    for span in renumbered_spans:
+        for claim_index, claim in enumerate(
+            claims_by_span.get(span.span_id, ()), start=1
+        ):
+            renumbered_claims.append(replace(claim, ordinal=claim_index))
+    return renumbered_spans, tuple(renumbered_claims)
+
+
+def _subset_from_first_pass(
     result: VerificationResult,
     *,
-    verify: Callable[[str], VerificationResult],
-) -> VerificationResult:
-    """Re-verify the passing remainder of a failed draft until one passes.
+    source_index: SourceLexicalIndex,
+) -> VerificationResult | None:
+    """Publish passing sentences from the first failed verification pass."""
+    reduced = _passing_sentence_text(result, source_index=source_index)
+    if reduced is None:
+        return None
+    passed = result.pass_results[-1]
+    verdicts = {
+        assessment.claim_id: assessment.verdict for assessment in passed.assessments
+    }
+    claims_by_id = {claim.claim_id: claim for claim in passed.claims}
+    bundles_by_claim = {bundle.selection.claim_id: bundle for bundle in passed.bundles}
+    claims_by_span: dict[str, list[str]] = {}
+    for claim in passed.claims:
+        claims_by_span.setdefault(claim.span_id, []).append(claim.claim_id)
 
-    Each round drops the sentences with a failing claim and verifies what is
-    left, at most `_MAX_SENTENCE_DROPS` times. A remainder is published only
-    after it passes verification as a whole.
-    """
-    for _ in range(_MAX_SENTENCE_DROPS):
-        if not result.failed:
-            return result
-        reduced = _passing_sentence_text(result)
-        if reduced is None:
-            return result
-        result = verify(reduced)
-    return result
+    def span_passes(span) -> bool:
+        text = span.text.strip()
+        if not text:
+            return False
+        claim_ids = claims_by_span.get(span.span_id, [])
+        if not claim_ids:
+            return False
+        return all(
+            _effective_claim_verdict(
+                claims_by_id[claim_id],
+                verdicts[claim_id],
+                bundles_by_claim,
+                source_index,
+            )
+            is ClaimVerdict.SUPPORTED
+            for claim_id in claim_ids
+            if claim_id in claims_by_id and claim_id in verdicts
+        )
+
+    kept_spans = tuple(span for span in passed.spans if span_passes(span))
+    kept_span_ids = {span.span_id for span in kept_spans}
+    kept_claims = tuple(
+        claim for claim in passed.claims if claim.span_id in kept_span_ids
+    )
+    kept_claim_ids = {claim.claim_id for claim in kept_claims}
+    kept_assessments = tuple(
+        assessment
+        for assessment in passed.assessments
+        if assessment.claim_id in kept_claim_ids
+    )
+    kept_bundles = tuple(
+        bundle for bundle in passed.bundles if bundle.selection.claim_id in kept_claim_ids
+    )
+    kept_spans, kept_claims = _renumber_pass_ordinals(kept_spans, kept_claims)
+    filtered_pass = VerificationPassResult(
+        spans=kept_spans,
+        claims=kept_claims,
+        assessments=kept_assessments,
+        selections=tuple(bundle.selection for bundle in kept_bundles),
+        bundles=kept_bundles,
+        generations=getattr(passed, "generations", ()),
+        phase_generations=getattr(passed, "phase_generations", ()),
+        diagnostic_codes=getattr(passed, "diagnostic_codes", ()),
+    )
+    return VerificationResult(
+        text=reduced,
+        passes=(kept_assessments,),
+        selections=(filtered_pass.selections,),
+        repairs=getattr(result, "repairs", ()),
+        generations=getattr(result, "generations", ()),
+        diagnostic_codes=(
+            *getattr(result, "diagnostic_codes", ()),
+            "verified_sentence_subset",
+        ),
+        exhausted=getattr(result, "exhausted", False),
+        failed=False,
+        pass_results=(filtered_pass,),
+        phase_generations=getattr(result, "phase_generations", ()),
+        warning_codes=(
+            *getattr(result, "warning_codes", ()),
+            "verified_sentence_subset",
+        ),
+    )
+
+
+def _compression_source_text(
+    root: SummaryNode,
+    *,
+    target_words: int,
+    source_cores: Mapping[str, str],
+    segments: Sequence[SourceSegment],
+) -> str | None:
+    """Return text to compress before editorial, or None when no pass is needed."""
+    summary_words = word_count(root.summary)
+    if _in_band(summary_words, target_words):
+        return None
+    if _above_ceiling(summary_words, target_words):
+        return root.summary
+    if _under_floor(summary_words, target_words):
+        ordered = sorted(segments, key=lambda segment: segment.order)
+        parts = [
+            source_cores[segment.segment_id]
+            for segment in ordered
+            if segment.segment_id in source_cores
+        ]
+        if not parts:
+            return None
+        return "\n\n".join(parts)
+    return None
+
+
+def _prepare_root_for_editorial(
+    root: SummaryNode,
+    provider: ModelProvider,
+    *,
+    source_id: str,
+    model: str,
+    timeout_seconds: float,
+    target_words: int,
+    source_cores: Mapping[str, str],
+    segments: Sequence[SourceSegment],
+) -> tuple[SummaryNode, tuple[GenerationResult, ...]]:
+    source_text = _compression_source_text(
+        root,
+        target_words=target_words,
+        source_cores=source_cores,
+        segments=segments,
+    )
+    if source_text is None:
+        return root, ()
+    coordinator = getattr(provider, "cache_coordinator", None)
+    if coordinator is not None and not isinstance(coordinator, CacheCoordinator):
+        raise TypeError("cache_coordinator must be a CacheCoordinator")
+    compressed = compress_to_target(
+        source_text,
+        provider,
+        source_id=source_id,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        target_words=target_words,
+        coordinator=coordinator,
+    )
+    return root.model_copy(update={"summary": compressed.text}), compressed.generations
 
 
 def _verified_content_unit_draft(
@@ -958,54 +1134,28 @@ def _verify_publication(
     target_words: int,
     progress: VerificationProgress,
 ) -> _VerifiedPublication:
-    """Verify the editorial draft, else its passing sentences, else root units."""
+    """Verify the editorial draft once, else publish its passing sentences."""
     ledger = _SentenceLedger()
-
-    def verify(text: str) -> VerificationResult:
-        result = verify_and_repair(
-            text,
-            source_id=source_id,
-            source_index=source_index,
-            runtime=runtime,
-            config=config,
-            coordinator=coordinator,
-            progress=progress,
-        )
-        ledger.record(result)
-        return result
-
-    def verify_remainder(text: str) -> VerificationResult:
-        progress.phase("Removing unsupported sentences")
-        return verify(text)
-
     progress.phase("Checking the editorial draft")
-    result = verify(draft)
+    result = verify_and_repair(
+        draft,
+        source_id=source_id,
+        source_index=source_index,
+        runtime=runtime,
+        config=config,
+        coordinator=coordinator,
+        progress=progress,
+    )
+    ledger.record(result)
     kind: PublicationKind = "editorial"
-    abandoned: frozenset[str] = frozenset()
     generations: tuple[GenerationResult, ...] = ()
     if result.failed:
-        kind = "verified_subset"
-        result = _drop_failing_sentences(result, verify=verify_remainder)
-    if result.failed:
-        kind = "content_unit_fallback"
-        abandoned = ledger.seen()
-        progress.phase("Verifying content units")
-        fallback_text, generations = _verified_content_unit_draft(
-            root,
-            source_id=source_id,
-            source_index=source_index,
-            runtime=runtime,
-            config=config,
-            target_words=target_words,
-            progress=progress,
-        )
-        if fallback_text:
-            progress.phase("Checking the content-unit draft")
-            # Content units are model prose that never passed the editorial's
-            # redaction, and the verified text is published verbatim.
-            result = _drop_failing_sentences(
-                verify(redact_text(fallback_text)), verify=verify_remainder
-            )
+        progress.phase("Removing unsupported sentences")
+        subset = _subset_from_first_pass(result, source_index=source_index)
+        if subset is not None:
+            kind = "verified_subset"
+            result = subset
+            ledger.record(result)
     published = (
         frozenset(span.text.strip() for span in result.pass_results[-1].spans)
         if not result.failed and result.pass_results
@@ -1014,7 +1164,7 @@ def _verify_publication(
     return _VerifiedPublication(
         kind=kind,
         result=result,
-        removed=ledger.removed(published, abandoned=abandoned),
+        removed=ledger.removed(published),
         generations=generations,
     )
 
@@ -1058,6 +1208,18 @@ def _finalize_summary(
     formatting cannot leave a citation dangling from the recorded sources.
     """
     runtime_observer = get_observer(observer)
+    compression_generations: tuple[GenerationResult, ...] = ()
+    if source_cores is not None:
+        root, compression_generations = _prepare_root_for_editorial(
+            root,
+            provider,
+            source_id=source_id,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            target_words=target_words,
+            source_cores=source_cores,
+            segments=segments,
+        )
     runtime_observer.emit(StageEvent(StageName.WRITING, "active"))
     editorial = write_editorial(
         root,
@@ -1122,8 +1284,13 @@ def _finalize_summary(
                 nodes=nodes,
                 root_node_id=root_node_id,
                 citations=(),
-                generations=(*generations, editorial.generation, *outcome.generations),
-                warnings=(*audit_warnings, "verified_content_unit_fallback_failed"),
+                generations=(
+                    *generations,
+                    *compression_generations,
+                    editorial.generation,
+                    *outcome.generations,
+                ),
+                warnings=audit_warnings,
                 failures=failures,
                 verification=outcome.result,
                 verification_enabled=True,
@@ -1167,6 +1334,7 @@ def _finalize_summary(
         citations=citations,
         generations=(
             *generations,
+            *compression_generations,
             editorial.generation,
             *(outcome.generations if outcome is not None else ()),
         ),

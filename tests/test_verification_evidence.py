@@ -4,10 +4,12 @@ from summarizer.grounding import SourcePassage
 from summarizer.tokenization import ConservativeUtf8TokenCounter
 from summarizer.verification import (
     Claim,
+    ClaimVerdict,
     SourceLexicalIndex,
     VerificationConfig,
     VerificationRuntime,
     build_source_lexical_index,
+    claim_drop_blocked_by_omitted_required,
     pack_work_items,
     select_claim_evidence,
 )
@@ -155,7 +157,7 @@ def test_index_is_immutable_and_reused_for_multiple_claims() -> None:
     )
 
     assert first.passages == second.passages
-    assert first.selection.retrieval_method == "lexical-overlap/1"
+    assert first.selection.retrieval_method == "lexical-overlap-required/2"
 
 
 def runtime(*, context_window_tokens: int = 100) -> VerificationRuntime:
@@ -239,6 +241,46 @@ def test_evidence_selection_records_exact_serialized_token_cost() -> None:
 
     assert bundle.selection.token_cost == counter.count(
         '{"segment_id":"S000001","text":"Alpha evidence."}'
+    )
+
+
+def test_evidence_packs_low_overlap_segment_when_claim_number_is_present() -> None:
+    source = {
+        "S000001": "Unrelated introductory material about the region.",
+        "S000002": "The party included 16 skiers and snowboarders on the slope.",
+    }
+    index = build_source_lexical_index(
+        provenance_ids=("S000001", "S000002"), source=source
+    )
+    bundle = select_claim_evidence(
+        claim("The incident involved 16 skiers and snowboarders"),
+        source_index=index,
+        counter=ConservativeUtf8TokenCounter(),
+        max_tokens=250,
+    )
+    assert "S000002" in bundle.selection.selected_ids
+
+
+def test_drop_blocked_when_required_segment_was_omitted() -> None:
+    source = {
+        "S000001": "Alpha evidence only.",
+        "S000002": "Ward 4 is contested between Ansbro and Barker.",
+    }
+    index = build_source_lexical_index(
+        provenance_ids=("S000001", "S000002"), source=source
+    )
+    bundle = select_claim_evidence(
+        claim("only the Ward 4 position is contested"),
+        source_index=index,
+        counter=ConservativeUtf8TokenCounter(),
+        max_tokens=60,
+    )
+    assert "S000002" in bundle.selection.omitted_ids
+    assert claim_drop_blocked_by_omitted_required(
+        claim("only the Ward 4 position is contested"),
+        bundle,
+        index,
+        ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
     )
 
 

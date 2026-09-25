@@ -28,6 +28,7 @@ from summarizer.runtime.observers import (
     StageName,
 )
 from summarizer.segmentation import SegmentationConfig
+from tests.support.compression_provider import compression_generation_payload
 
 TEXT = "one two three four five six seven eight nine ten " * 12
 RUN_ID = "runtime-events"
@@ -91,6 +92,8 @@ class ScriptedProvider:
             return GenerationResult("I would rather not.", "fake", request.model)
         if work_id == "editorial-final":
             payload: dict[str, object] = {"text": "A concise final summary."}
+        elif work_id.startswith("compression:"):
+            payload = compression_generation_payload(request)
         elif work_id.startswith(("S", "D")):
             payload = _summary(0, work_id)
         else:

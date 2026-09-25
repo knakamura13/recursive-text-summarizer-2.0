@@ -423,9 +423,14 @@ def _terminal_result(
     failure_codes: Sequence[str],
     exhausted: bool,
     limitation_codes: Sequence[str] = (),
+    redact_passes: bool = True,
 ) -> VerificationResult:
     """Return a failure result with source passages removed from all pass snapshots."""
-    redacted_passes = tuple(_redact_terminal_pass(item) for item in pass_results)
+    redacted_passes = (
+        tuple(_redact_terminal_pass(item) for item in pass_results)
+        if redact_passes
+        else tuple(pass_results)
+    )
     return VerificationResult(
         text=text,
         passes=tuple(item.assessments for item in redacted_passes),
@@ -562,6 +567,51 @@ def _terms(text: str) -> frozenset[str]:
     return frozenset(match.group() for match in _TERM.finditer(normalized))
 
 
+_PROPER_NAME = re.compile(
+    r"(?:[A-Z][a-z]+(?:['-][A-Za-z]+)?)"
+    r"(?:\s+(?:[A-Z][a-z]+(?:['-][A-Za-z]+)?))+"
+)
+_NUMBER = re.compile(r"\d+")
+_EVIDENCE_RETRIEVAL_METHOD = "lexical-overlap-required/2"
+
+
+def _literal_hits_claim(claim: Claim, entry_text: str) -> bool:
+    for number in _NUMBER.findall(claim.anchor):
+        if number in entry_text:
+            return True
+    for name in _PROPER_NAME.findall(claim.anchor):
+        if name in entry_text:
+            return True
+    return False
+
+
+def required_segment_ids(
+    claim: Claim, source_index: SourceLexicalIndex
+) -> frozenset[str]:
+    """Source segments that literally contain a claim number or multi-word name."""
+    return frozenset(
+        entry.segment_id
+        for entry in source_index.entries
+        if _literal_hits_claim(claim, entry.text)
+    )
+
+
+def claim_drop_blocked_by_omitted_required(
+    claim: Claim,
+    bundle: EvidenceBundle,
+    source_index: SourceLexicalIndex,
+    verdict: ClaimVerdict,
+) -> bool:
+    """A negative verdict must not drop a sentence when required text was omitted."""
+    if verdict is ClaimVerdict.SUPPORTED:
+        return False
+    required = required_segment_ids(claim, source_index)
+    if not required:
+        return False
+    omitted = set(bundle.selection.omitted_ids)
+    return bool(required & omitted)
+
+
 def build_source_lexical_index(
     *,
     provenance_ids: Sequence[str],
@@ -599,20 +649,45 @@ def select_claim_evidence(
     if max_tokens <= 0:
         raise VerificationCapacityError("evidence max_tokens must be positive")
     claim_terms = _terms(claim.anchor)
+    required_ids = required_segment_ids(claim, source_index)
     ranked = sorted(
         source_index.entries,
         key=lambda entry: (
+            0 if entry.segment_id in required_ids else 1,
             -len(claim_terms & entry.terms),
             entry.source_order,
         ),
     )
     passages: list[SourcePassage] = []
-    for entry in ranked:
+    selected_ids: set[str] = set()
+
+    def _try_add(entry: SourceLexicalEntry) -> bool:
+        if entry.segment_id in selected_ids:
+            return True
         candidate = SourcePassage(entry.segment_id, entry.text)
         tentative = (*passages, candidate)
         serialized = "\n".join(serialize_source_passage(item) for item in tentative)
         if counter.count(serialized) <= max_tokens:
             passages.append(candidate)
+            selected_ids.add(entry.segment_id)
+            return True
+        if entry.segment_id in required_ids and not passages:
+            single = (candidate,)
+            serialized_single = "\n".join(
+                serialize_source_passage(item) for item in single
+            )
+            if counter.count(serialized_single) <= max_tokens:
+                passages.append(candidate)
+                selected_ids.add(entry.segment_id)
+                return True
+        return False
+
+    for entry in ranked:
+        if entry.segment_id in required_ids:
+            _try_add(entry)
+    for entry in ranked:
+        if entry.segment_id not in selected_ids:
+            _try_add(entry)
 
     if not passages:
         raise VerificationCapacityError("evidence budget cannot hold a source passage")
@@ -631,7 +706,7 @@ def select_claim_evidence(
             examined_ids=selected_ids,
             omitted_ids=omitted_ids,
             token_cost=token_cost,
-            retrieval_method="lexical-overlap/1",
+            retrieval_method=_EVIDENCE_RETRIEVAL_METHOD,
             retrieval_complete=not omitted_ids,
         ),
         passages=tuple(passages),
@@ -1543,8 +1618,11 @@ def verify_draft_once(
         )
 
     def escalates(claim: Claim) -> bool:
-        """A raw contradiction is not final while legal provenance is omitted."""
-        return bool(bundles[claim.claim_id].selection.omitted_ids) and any(
+        """Escalate omitted cores before accepting a negative verdict."""
+        bundle = bundles[claim.claim_id]
+        if required_segment_ids(claim, source_index) & set(bundle.selection.omitted_ids):
+            return True
+        return bool(bundle.selection.omitted_ids) and any(
             finding.verdict is ClaimVerdict.CONTRADICTED
             for finding in findings_by_claim[claim.claim_id]
         )
@@ -1878,7 +1956,7 @@ def _source_index_cache_identity(source_index: SourceLexicalIndex) -> dict[str, 
             for entry in source_index.entries
         ],
         "retrieval": {
-            "algorithm": "lexical-overlap-source-order/1",
+            "algorithm": "lexical-overlap-required/2",
             "term_normalization": "unicode-nfc-casefold/1",
             "passage_unit": "source-core/1",
         },
@@ -1948,6 +2026,7 @@ def _verify_and_repair(
                 diagnostic_codes=(*first.diagnostic_codes, "insufficient_support"),
                 failure_codes=("insufficient_support",),
                 exhausted=False,
+                redact_passes=False,
             )
         return VerificationResult(
             text=draft,

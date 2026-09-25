@@ -25,7 +25,9 @@ from summarizer.cache import (
 CHECKPOINT_FORMAT_VERSION = "run/1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RUN_ID = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
-_WORK_ID = re.compile(r"^(?:[DSLVM][A-Za-z0-9:_-]*|editorial-final|segmentation)$")
+_WORK_ID = re.compile(
+    r"^(?:[DSLVM][A-Za-z0-9:_-]*|editorial-final|segmentation|C\d{2}K\d{6})$"
+)
 _METADATA_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _MANIFEST_FIELDS = frozenset(
     {

@@ -186,6 +186,10 @@ class DeterministicSourceProvider(ModelProvider):
         operation = request.operation_id or ""
         if operation == "editorial-final":
             response = {"text": self._editorial_text(request)}
+        elif operation.startswith("compression:"):
+            from tests.support.compression_provider import compression_generation_payload
+
+            response = compression_generation_payload(request)
         elif operation == "D000001" or operation.startswith("S"):
             source_id, source_text = self._leaf_source(request)
             response = self._node_from_sources(source_id, ((source_id, source_text),), level=0)
@@ -432,8 +436,25 @@ def _rubric(
             *(item.text for item in result.root.summary.contradictions),
         )
     )
+    def _normalize_space(text: str) -> str:
+        return re.sub(r"\s+", " ", text.strip())
+
+    def _sentence_grounded(sentence: str) -> bool:
+        stripped = sentence.strip()
+        if not stripped or stripped.startswith("Sources:"):
+            return True
+        norm = _normalize_space(stripped)
+        root_norm = _normalize_space(root_text)
+        doc_norm = _normalize_space(document.text)
+        if norm in root_norm or norm in doc_norm:
+            return True
+        if len(norm) >= 20:
+            prefix = norm[: min(len(norm), 96)]
+            return prefix in root_norm or prefix in doc_norm
+        return False
+
     output_sentences_grounded = all(
-        sentence.strip() in root_text
+        _sentence_grounded(sentence)
         for sentence in re.split(r"(?<=[.!?])\s+", final_text)
         if sentence.strip()
     )

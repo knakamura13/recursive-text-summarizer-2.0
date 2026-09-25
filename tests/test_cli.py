@@ -14,6 +14,7 @@ from summarizer.providers.base import (
     ProviderConnectionError,
     ProviderRequestError,
 )
+from tests.support.compression_provider import compression_generation_payload
 
 
 class CharacterCounter:
@@ -36,6 +37,8 @@ class RecordingProvider:
             raise self.outcome
         if request.operation_id == "editorial-final":
             text = json.dumps({"text": str(self.outcome)})
+        elif (request.operation_id or "").startswith("compression:"):
+            text = json.dumps(compression_generation_payload(request))
         elif request.operation_id == "D000001":
             text = json.dumps(
                 {
@@ -201,10 +204,13 @@ def test_main_uses_discovered_ollama_context_for_budget_and_requests(
 
     assert exit_code == 0
     assert provider.context_calls == [("local-model", None, 180)]
-    assert [call.operation_id for call in provider.calls] == [
-        "D000001",
-        "editorial-final",
-    ]
+    operation_ids = [call.operation_id for call in provider.calls]
+    assert operation_ids[0] == "D000001"
+    assert operation_ids[-1] == "editorial-final"
+    assert all(
+        operation_id.startswith("compression:")
+        for operation_id in operation_ids[1:-1]
+    )
 
 
 def test_main_reports_provider_failure_and_preserves_output(

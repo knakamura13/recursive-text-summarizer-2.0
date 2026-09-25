@@ -28,7 +28,15 @@ _ENVELOPE_FIELDS = frozenset(
 _PROJECTION_ENVELOPE_FIELDS = frozenset({"descriptor", "format_version"})
 _Payload = TypeVar("_Payload")
 _STAGES = frozenset(
-    {"segmentation", "direct", "leaf", "merge", "editorial", "verification"}
+    {
+        "segmentation",
+        "direct",
+        "leaf",
+        "merge",
+        "compression",
+        "editorial",
+        "verification",
+    }
 )
 _PROVIDERS = frozenset({"openai", "ollama"})
 _VERSION = re.compile(r"^[a-z][a-z0-9-]*/[1-9][0-9]*$")
@@ -47,7 +55,7 @@ _COUNTER = re.compile(
     r"^(?:(?:tiktoken|estimate|test):[a-z0-9][a-z0-9._-]*|utf8-conservative)$"
 )
 _WORK_ID = re.compile(
-    r"^(?:[DSLVM][A-Za-z0-9:_-]*|editorial-final|segmentation)$"
+    r"^(?:[DSLVM][A-Za-z0-9:_-]*|editorial-final|segmentation|C\d{2}K\d{6})$"
 )
 _STRATEGIES = frozenset({"auto", "direct", "hierarchical"})
 _BOOLEAN_FIELDS = frozenset(
@@ -55,12 +63,15 @@ _BOOLEAN_FIELDS = frozenset(
 )
 _POSITIVE_INTEGER_FIELDS = frozenset(
     {
+        "chunk_index",
         "context_window",
         "evidence_tokens",
         "max_in_flight",
         "max_output_tokens",
         "max_tokens",
+        "pass_index",
         "request_tokens",
+        "target_word_count",
         "target_words",
     }
 )
@@ -71,8 +82,18 @@ _NONNEGATIVE_INTEGER_FIELDS = frozenset(
 _NULLABLE_POSITIVE_INTEGER_FIELDS = frozenset(
     {"max_direct_tokens", "max_merge_children"}
 )
-_VERSION_FIELDS = frozenset({"editorial_version", "grounding_policy"})
+_VERSION_FIELDS = frozenset(
+    {"compression_version", "editorial_version", "grounding_policy"}
+)
 _BEHAVIOR_GROUPS = {
+    "compression": frozenset(
+        {
+            "chunk_index",
+            "compression_version",
+            "pass_index",
+            "target_word_count",
+        }
+    ),
     "grounding": frozenset({"max_tokens"}),
     "segmentation": frozenset({"max_tokens", "overlap_tokens"}),
     "strategy_config": frozenset(

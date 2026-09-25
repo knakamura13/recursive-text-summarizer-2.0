@@ -81,6 +81,8 @@ class VerificationPipelineProvider:
             response = {"spans": [{"span_id": "V02S000001", "anchors": []}]}
         elif operation == "verification-classify:V02":
             response = self._findings("V02", "supported", request.input_text)
+        elif operation.startswith("compression:"):
+            response = self._compression(request)
         else:  # pragma: no cover - makes unanticipated pipeline calls visible
             raise AssertionError(f"unexpected operation {operation}")
         if self.verification == "malformed" and operation.startswith("verification-"):
@@ -118,6 +120,14 @@ class VerificationPipelineProvider:
                 for identifier in identifiers
             ]
         }
+
+    @staticmethod
+    def _compression(request: GenerationRequest) -> dict[str, object]:
+        lines = request.input_text.splitlines()
+        chunk = lines[1] if len(lines) > 2 else request.input_text
+        words = chunk.split()
+        keep = max(1, int(len(words) * 0.7))
+        return {"text": " ".join(words[:keep])}
 
     @staticmethod
     def _node(level: int, identifier: str) -> dict[str, object]:
@@ -325,6 +335,8 @@ def test_pipeline_publishes_verified_sentence_subset_with_source_evidence_and_pr
                         }
                     )
                 payload = {"findings": findings}
+            elif operation.startswith("compression:"):
+                payload = VerificationPipelineProvider._compression(request)
             else:  # pragma: no cover - unexpected calls indicate a pipeline regression
                 raise AssertionError(f"unexpected operation {operation}")
             return GenerationResult(json.dumps(payload), "fake", request.model)
