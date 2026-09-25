@@ -40,15 +40,15 @@ def _document(title: str = "Bridge Report") -> SeededDocument:
 
 def _audit(document: SeededDocument) -> dict:
     sha = document.source_sha256
-    page_one, page_two = document.page_map
+    first_end = document.page_map[0]["end"] if document.page_map else document.offset("Cracks appeared")[0]
     deck = document.offset("spans 200 feet across the river")
     pier = document.offset("Cracks appeared in the north pier.")
     deck_evidence = {"segment_id": "S000001", "quote": "spans 200 feet across the river", "start": deck[0], "end": deck[1]}
     return {
         "schema_version": "audit/2",
         "source_segments": [
-            audit_segment("S000001", 0, 0, page_one["end"], sha),
-            audit_segment("S000002", 1, page_one["end"], len(document.text), sha),
+            audit_segment("S000001", 0, 0, first_end, sha),
+            audit_segment("S000002", 1, first_end, len(document.text), sha),
         ],
         "citations": [
             {"segment_id": "S000001", "source_id": sha, "order": 0},
@@ -187,3 +187,16 @@ def test_failed_run_audit_can_still_be_exported(client: TestClient) -> None:
     assert response.status_code == 200
     assert json.loads(response.content) == failure
     assert summary.status_code == 404
+
+
+
+def test_md_export_names_passages_readably_when_the_document_has_no_pages(client: TestClient) -> None:
+    text = " ".join(PAGES)
+    document = seed_document(title="Bridge Report", text=text, page_map=None)
+    seed_run(document, summary=SUMMARY_FILE, audit=_audit(document))
+
+    response = client.get("/api/v1/runs/run-1/export/md")
+
+    footnotes = [line for line in response.text.splitlines() if line.startswith("[^")]
+    assert footnotes[0] == "[^1]: Passage 1: “spans 200 feet across the river”"
+    assert "S000001" not in response.text

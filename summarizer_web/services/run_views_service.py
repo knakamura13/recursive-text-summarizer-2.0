@@ -790,10 +790,18 @@ def _footnote_text(evidence: EvidenceRef) -> str:
 
 def _location(segment_id: str, page_start: int | None, page_end: int | None) -> str:
     if page_start is None:
-        return f"Segment {segment_id}"
+        return _passage_name(segment_id)
     if page_end is None or page_end == page_start:
         return f"p. {page_start}"
     return f"pp. {page_start}–{page_end}"
+
+
+def _passage_name(segment_id: str) -> str:
+    """S000012 reads as Passage 12; the direct strategy's D000001 as Whole document."""
+    match = re.fullmatch(r"([DS])0*(\d+)", segment_id)
+    if match is None:
+        return segment_id
+    return "Whole document" if match.group(1) == "D" else f"Passage {match.group(2)}"
 
 
 def _filename_title(title: str | None) -> str:

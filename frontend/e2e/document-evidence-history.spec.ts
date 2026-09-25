@@ -55,7 +55,7 @@ test('shows verified summary evidence in the Source and exposes all exports', as
 			}
 		]
 	});
-	await MockApi.install(page, {
+	const mock = await MockApi.install(page, {
 		documents: [makeDocument({ document_id: DOC, title: 'Harbour minutes', char_count: SMALL_SOURCE.length, page_count: 1 })],
 		sources: { [DOC]: SMALL_SOURCE },
 		pages: { [DOC]: [{ page: 1, start: 0, end: SMALL_SOURCE.length, ocr: false, blank: false }] },
@@ -66,9 +66,26 @@ test('shows verified summary evidence in the Source and exposes all exports', as
 	await page.goto(`/documents/${DOC}?run=${RUN}&tab=summary`);
 	const article = page.getByRole('article', { name: 'Summary' });
 	await expect(article).toContainText('could not be verified and were removed; the remaining sentences passed verification.');
-	await expect(article.getByRole('link', { name: 'Text' })).toHaveAttribute('href', /\/export\/txt$/);
-	await expect(article.getByRole('link', { name: 'Markdown' })).toHaveAttribute('href', /\/export\/md$/);
-	await expect(article.getByRole('link', { name: 'Audit JSON' })).toHaveAttribute('href', /\/export\/json$/);
+	mock.on('GET', '/runs/:id/export/:format', ({ params }) =>
+		params.format === 'json'
+			? { json: { schema_version: 'audit/4' } }
+			: { body: `${params.format} export`, contentType: 'text/plain; charset=utf-8' }
+	);
+	const downloads: string[] = [];
+	page.on('download', (download) => downloads.push(download.suggestedFilename()));
+	await article.getByRole('button', { name: 'Export…' }).click();
+	const exportDialog = page.getByRole('dialog', { name: 'Export the summary' });
+	const preview = exportDialog.getByTestId('export-preview');
+	await expect(preview).toHaveText('md export');
+	await expect(exportDialog.getByRole('link', { name: 'Download Markdown' })).toHaveAttribute('href', /\/export\/md$/);
+	await exportDialog.getByRole('tab', { name: 'Audit JSON' }).click();
+	await expect(preview).toContainText('"schema_version": "audit/4"');
+	await expect(exportDialog.getByRole('link', { name: 'Download Audit JSON' })).toHaveAttribute('href', /\/export\/json$/);
+	await exportDialog.getByRole('tab', { name: 'Text' }).click();
+	await expect(preview).toHaveText('txt export');
+	expect(downloads).toEqual([]);
+	await page.keyboard.press('Escape');
+	await expect(exportDialog).toBeHidden();
 
 	const removed = article.getByText('1 sentence was removed by verification');
 	await removed.click();

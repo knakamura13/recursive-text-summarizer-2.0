@@ -378,6 +378,12 @@ export const api = {
 		request<FinalSummary>(route('runs', runId, 'summary'), { signal }),
 	exportUrl: (runId: string, format: ExportFormat): string =>
 		`${API_BASE}${route('runs', runId, 'export', format)}`,
+	/** The export's text, for previewing before a download. */
+	async getExport(runId: string, format: ExportFormat, signal?: AbortSignal): Promise<string> {
+		const raw = await send(route('runs', runId, 'export', format), { signal });
+		if (raw.status >= 200 && raw.status < 300) return raw.text;
+		return decode<never>(raw);
+	},
 
 	/** The tab's only SSE endpoint; `after` is the last cursor seen (0 on the first connect). */
 	activityStreamUrl: (after: number): string => `${API_BASE}/activity/stream?after=${after}`

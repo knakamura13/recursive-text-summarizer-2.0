@@ -2,12 +2,12 @@
 	import EmptyState from '$lib/components/common/EmptyState.svelte';
 	import ErrorBanner from '$lib/components/common/ErrorBanner.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
-	import { api } from '$lib/api/client';
 	import type { FinalSummary, Run, SummarySentence } from '$lib/api/types';
 	import { formatCount } from '$lib/format';
 	import type { TextRange } from '$lib/source/sourceModel';
 	import { toasts } from '$lib/stores/toasts.svelte';
 	import EvidenceList from './EvidenceList.svelte';
+	import ExportDialog from './ExportDialog.svelte';
 	import { evidenceLabel } from './runDisplay';
 
 	interface Props {
@@ -33,6 +33,7 @@
 	const passedAsWritten = $derived(summary?.publication === 'editorial' && summary.verification_state === 'completed');
 
 	let selected = $state<number | null>(null);
+	let exportOpen = $state(false);
 
 	const paragraphs = $derived.by(() => {
 		const groups: SummarySentence[][] = [];
@@ -95,9 +96,7 @@
 			</p>
 			<div class="actions">
 				<button type="button" class="button small" onclick={copy}>Copy</button>
-				<a class="button small ghost" href={api.exportUrl(run.run_id, 'txt')} download>Text</a>
-				<a class="button small ghost" href={api.exportUrl(run.run_id, 'md')} download>Markdown</a>
-				<a class="button small ghost" href={api.exportUrl(run.run_id, 'json')} download>Audit JSON</a>
+				<button type="button" class="button small" onclick={() => (exportOpen = true)}>Export…</button>
 			</div>
 		</div>
 
@@ -185,6 +184,7 @@
 			</details>
 		{/if}
 	</article>
+	<ExportDialog bind:open={exportOpen} runId={run.run_id} />
 {/if}
 
 <style>
