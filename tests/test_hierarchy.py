@@ -21,6 +21,7 @@ from summarizer.hierarchy import (
     merge_fanout,
 )
 from summarizer.leaf import LeafSummaryError
+from summarizer.runtime.observers import ItemFailedError, StageName
 from summarizer.merge import (
     child_fence_tokens,
     measure_merge_request_tokens,
@@ -552,8 +553,18 @@ def test_a_lone_trailing_node_passes_through_without_a_call() -> None:
 
 
 def test_a_wrong_level_in_the_response_is_rejected() -> None:
-    with pytest.raises(LeafSummaryError, match="level"):
-        build(4, ceiling=2, provider=MergingProvider(level_override=0))
+    # A merge that stays invalid is re-asked twice, then fails naming its node.
+    provider = MergingProvider(level_override=0)
+
+    with pytest.raises(ItemFailedError, match="level") as failure:
+        build(4, ceiling=2, provider=provider)
+
+    assert failure.value.work_id == "L1N0001"
+    assert failure.value.kind == "merge"
+    assert failure.value.stage is StageName.MERGING
+    assert failure.value.covered_segment_ids == ("S000001", "S000002")
+    assert isinstance(failure.value.__cause__, LeafSummaryError)
+    assert len(provider.requests) == 3
 
 
 def test_an_injected_citation_from_a_child_is_rejected() -> None:
@@ -570,8 +581,10 @@ def test_an_injected_citation_from_a_child_is_rejected() -> None:
         }
     )
 
-    with pytest.raises(LeafSummaryError, match="S999999"):
+    with pytest.raises(ItemFailedError, match="S999999") as failure:
         build(4, ceiling=2, provider=MergingProvider(text=hostile))
+
+    assert isinstance(failure.value.__cause__, LeafSummaryError)
 
 
 def test_provider_failures_propagate() -> None:
@@ -601,6 +614,33 @@ def test_a_single_leaf_is_already_a_root() -> None:
     assert len(nodes) == 1
     assert root.level == 0
     assert provider.requests == []
+
+
+def test_an_invalid_leaf_is_reported_under_its_own_node_id() -> None:
+    """The error names the id the tree gives that leaf, not one below it."""
+    _, valid_nodes, _, _ = build(3)
+    second_leaf_id = [node.node_id for node in valid_nodes if node.level == 0][1]
+    stray = leaves(3)
+    # The second leaf cites the third segment, outside its own coverage.
+    stray[1] = leaf(2, provenance=["S000003"])
+
+    with pytest.raises(
+        LeafSummaryError,
+        match=rf"^{second_leaf_id}: response cited unknown segments S000003$",
+    ):
+        build_hierarchy(
+            stray,
+            MergingProvider(),
+            CharacterCounter(),
+            source_id=SOURCE_ID,
+            covered=covered_for(3),
+            attributable=attributable_for(3),
+            usable_tokens=100_000,
+            model="m",
+            timeout_seconds=30,
+        )
+
+    assert second_leaf_id == "L0N0002"
 
 
 def test_rejects_mismatched_covered_identifiers() -> None:
@@ -680,8 +720,11 @@ def test_the_legal_set_is_narrowed_to_the_group_being_merged() -> None:
         }
     )
 
-    with pytest.raises(LeafSummaryError, match="S000004"):
+    with pytest.raises(ItemFailedError, match="S000004") as failure:
         build(4, ceiling=2, provider=MergingProvider(text=hostile))
+
+    assert failure.value.work_id == "L1N0001"
+    assert isinstance(failure.value.__cause__, LeafSummaryError)
 
 
 def test_every_node_and_edge_is_reported() -> None:

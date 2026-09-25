@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from threading import Lock
@@ -19,13 +20,12 @@ from summarizer.budget import (
 from summarizer.cache import CacheStore
 from summarizer.checkpoint import CheckpointStore, RunPlan
 from summarizer.config import AppConfig, CacheConfig, ReliabilityConfig, StrategyConfig
-from summarizer.direct import summarize_direct, whole_document_segment
+from summarizer.direct import DIRECT_NODE_ID, summarize_direct, whole_document_segment
 from summarizer.finalization import (
     FinalizationResult,
     _finalize_summary,
     publish_final_output,
 )
-from summarizer.grounding import SourcePassage, serialize_source_passage
 from summarizer.hierarchy import TreeNode, build_hierarchy
 from summarizer.ingestion import SourceDocument
 from summarizer.leaf import summarize_segments
@@ -33,18 +33,25 @@ from summarizer.providers.base import (
     GenerationRequest,
     GenerationResult,
     ModelProvider,
+    ProviderResponseError,
     ProviderRetriesExhaustedError,
 )
 from summarizer.reliability import ReliabilityTracker
 from summarizer.segmentation import (
     CacheCoordinator,
     SegmentationConfig,
+    SourceSegment,
     cached_segment_document,
-    segment_document,
 )
 from summarizer.summaries import MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
 from summarizer.tokenization import TokenCounter
-from summarizer.runtime.observers import RuntimeObserver, StageEvent, StageName, get_observer
+from summarizer.runtime.observers import (
+    RuntimeObserver,
+    SegmentInfo,
+    StageEvent,
+    StageName,
+    get_observer,
+)
 from summarizer.verification import VerificationConfig, VerificationRuntime
 
 
@@ -117,6 +124,15 @@ class _RecordingProvider:
                     retry_attempts=error.retry_attempts,
                 )
             raise
+        except ProviderResponseError:
+            # An incomplete or malformed answer is re-asked like one that fails
+            # validation, so the call still counts as one of the work item's
+            # attempts. It carries no transient retry category.
+            if self._reliability_tracker is not None:
+                self._reliability_tracker.record_retry_exhaustion(
+                    request, attempt_count=1, retry_attempts=()
+                )
+            raise
         with self._lock:
             self._generations.append(_RecordedGeneration(work_id, sequence, result))
         if self._reliability_tracker is not None:
@@ -174,6 +190,58 @@ def _hierarchical_capacity(
     )
 
 
+def leaf_segmentation(
+    report: BudgetReport,
+    counter: TokenCounter,
+    *,
+    app: AppConfig,
+    strategy: StrategyConfig,
+    requested: SegmentationConfig | None,
+) -> SegmentationConfig:
+    """Return the segmentation a hierarchical run gives its leaves.
+
+    Unless one is requested, each segment may take a quarter of the usable
+    input capacity. Either way it must fit a leaf request once overlap context
+    is measured, or `BudgetError` is raised before any segment is produced.
+    """
+    segmentation = requested or SegmentationConfig(
+        max_tokens=max(
+            1, report.usable_input_capacity // _DEFAULT_SEGMENT_CAPACITY_DIVISOR
+        )
+    )
+    if segmentation.max_tokens > _hierarchical_capacity(
+        report, counter, app, strategy, segmentation
+    ):
+        raise BudgetError(
+            "segmentation max_tokens exceeds the safely measured leaf capacity"
+        )
+    return segmentation
+
+
+def merge_input_budget(report: BudgetReport) -> int:
+    """Return the whole input budget of one merge request."""
+    return (
+        report.context_window_tokens
+        - report.reserved_output_tokens
+        - report.safety_margin_tokens
+    )
+
+
+def _segment_infos(segments: Sequence[SourceSegment]) -> tuple[SegmentInfo, ...]:
+    return tuple(
+        SegmentInfo(
+            segment_id=segment.segment_id,
+            order=segment.order,
+            start=segment.context_start,
+            end=segment.context_end,
+            core_start=segment.core_start,
+            core_end=segment.core_end,
+            token_count=segment.token_count,
+        )
+        for segment in segments
+    )
+
+
 def run_pipeline(
     document: SourceDocument,
     provider: ModelProvider,
@@ -189,9 +257,10 @@ def run_pipeline(
     report = select_strategy(
         document, counter, provider=app.provider, model=app.model, config=strategy
     )
-    runtime_observer.emit(StageEvent(StageName.PREPARING, "completed"))
-    if runtime_observer.cancelled():
-        raise RuntimeError("cancelled before pipeline execution")
+    runtime_observer.emit(
+        StageEvent(StageName.PREPARING, "completed", detail=report.strategy)
+    )
+    runtime_observer.raise_if_stopped("before pipeline execution")
     if not config.cache.enabled:
         return _run_pipeline(
             document,
@@ -332,6 +401,7 @@ def _run_pipeline(
     if report.strategy == "direct":
         observer.emit(StageEvent(StageName.SEGMENTING, "skipped"))
         segment = whole_document_segment(document, counter)
+        observer.emit_segments(_segment_infos((segment,)))
         observer.emit(StageEvent(StageName.SUMMARIZING, "active", total=1))
         summary = summarize_direct(
             document,
@@ -340,9 +410,10 @@ def _run_pipeline(
             model=app.model,
             timeout_seconds=app.timeout_seconds,
             coordinator=coordinator,
+            observer=observer,
         )
         root = TreeNode(
-            node_id="L0N0001",
+            node_id=DIRECT_NODE_ID,
             level=0,
             order=0,
             summary=summary,
@@ -355,30 +426,19 @@ def _run_pipeline(
         segments = (segment,)
     else:
         observer.emit(StageEvent(StageName.SEGMENTING, "active"))
-        requested_segmentation = config.segmentation or SegmentationConfig(
-            max_tokens=max(
-                1,
-                report.usable_input_capacity
-                // _DEFAULT_SEGMENT_CAPACITY_DIVISOR,
-            )
+        segmentation = leaf_segmentation(
+            report,
+            counter,
+            app=app,
+            strategy=strategy,
+            requested=config.segmentation,
         )
-        leaf_capacity = _hierarchical_capacity(
-            report, counter, app, strategy, requested_segmentation
-        )
-        request_input_budget = (
-            report.context_window_tokens
-            - report.reserved_output_tokens
-            - report.safety_margin_tokens
-        )
-        if requested_segmentation.max_tokens > leaf_capacity:
-            raise BudgetError(
-                "segmentation max_tokens exceeds the safely measured leaf capacity"
-            )
         segments = tuple(
             cached_segment_document(
-                document, counter, requested_segmentation, coordinator=coordinator
+                document, counter, segmentation, coordinator=coordinator
             )
         )
+        observer.emit_segments(_segment_infos(segments))
         observer.emit(
             StageEvent(
                 StageName.SEGMENTING,
@@ -387,8 +447,7 @@ def _run_pipeline(
                 total=len(segments),
             )
         )
-        if observer.cancelled():
-            raise RuntimeError("cancelled during segmentation")
+        observer.raise_if_stopped("during segmentation")
         observer.emit(
             StageEvent(StageName.SUMMARIZING, "active", total=len(segments))
         )
@@ -402,6 +461,7 @@ def _run_pipeline(
             model=app.model,
             timeout_seconds=app.timeout_seconds,
             coordinator=coordinator,
+            observer=observer,
         )
         observer.emit(
             StageEvent(
@@ -411,9 +471,11 @@ def _run_pipeline(
                 total=len(segments),
             )
         )
-        if observer.cancelled():
-            raise RuntimeError("cancelled during summarization")
-        observer.emit(StageEvent(StageName.MERGING, "active"))
+        observer.raise_if_stopped("during summarization")
+        if len(leaves) > 1:
+            observer.emit(StageEvent(StageName.MERGING, "active"))
+        else:
+            observer.emit(StageEvent(StageName.MERGING, "skipped"))
         root, nodes, _ = build_hierarchy(
             leaves,
             recording,
@@ -424,7 +486,7 @@ def _run_pipeline(
                 segment.segment_id: document.text[segment.core_start : segment.core_end]
                 for segment in segments
             },
-            usable_tokens=request_input_budget,
+            usable_tokens=merge_input_budget(report),
             model=app.model,
             timeout_seconds=app.timeout_seconds,
             max_merge_children=config.max_merge_children,
@@ -434,12 +496,17 @@ def _run_pipeline(
                 if app.provider == "ollama"
                 else 0
             ),
+            observer=observer,
         )
-        observer.emit(StageEvent(StageName.MERGING, "completed"))
+        if len(leaves) > 1:
+            merged = sum(1 for node in nodes if node.level > 0)
+            observer.emit(
+                StageEvent(
+                    StageName.MERGING, "completed", completed=merged, total=merged
+                )
+            )
 
-    if observer.cancelled():
-        raise RuntimeError("cancelled before finalization")
-    observer.emit(StageEvent(StageName.WRITING, "active"))
+    observer.raise_if_stopped("before finalization")
     completed_before_editorial = tuple(recording.generations)
     if coordinator is not None and coordinator.session is not None:
         coordinator.session.ensure_work_prefix(
@@ -517,20 +584,6 @@ def _run_pipeline(
                 "V01",
             )
         )
-    if config.verification.enabled:
-        observer.emit(StageEvent(StageName.VERIFYING, "active"))
-    verification_segments = ()
-    if config.verification.enabled and report.strategy == "direct":
-        document_passage = SourcePassage(segment.segment_id, document.text)
-        if counter.count(serialize_source_passage(document_passage)) > config.verification.evidence_tokens:
-            verification_segments = tuple(
-                replace(item, order=item.order + 1)
-                for item in segment_document(
-                    document,
-                    counter,
-                    SegmentationConfig(max_tokens=max(1, config.verification.evidence_tokens // 2)),
-                )
-            )
     final = _finalize_summary(
         root.summary,
         recording,
@@ -561,23 +614,19 @@ def _run_pipeline(
             segment.segment_id: document.text[segment.core_start : segment.core_end]
             for segment in segments
         },
-        verification_segments=verification_segments,
         verification=config.verification,
         verification_runtime=verifier_runtime,
         verification_context_window_tokens=report.context_window_tokens,
         verification_coordinator=verification_coordinator,
         reliability_tracker=reliability_tracker,
+        observer=observer,
         materialize_audit=not (
             config.audit_path is not None
             and coordinator is not None
             and coordinator.session is not None
         ),
     )
-    observer.emit(StageEvent(StageName.WRITING, "completed"))
-    if config.verification.enabled:
-        observer.emit(StageEvent(StageName.VERIFYING, "completed"))
-    if observer.cancelled():
-        raise RuntimeError("cancelled before publication")
+    observer.raise_if_stopped("before publication")
     observer.emit(StageEvent(StageName.PUBLISHING, "active"))
     if (
         config.audit_path is not None

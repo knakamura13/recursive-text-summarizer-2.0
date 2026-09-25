@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Lock, Thread
+from time import monotonic, sleep
 
 import pytest
 
@@ -15,7 +17,10 @@ from summarizer.checkpoint import (
     NonReusableReason,
     RunPlan,
 )
+from summarizer.runtime.observers import PipelineStopped
 from summarizer.scheduler import BoundedScheduler, ScheduledWork
+
+RUN_ID = "run-20260908"
 
 
 def _digest(value: bytes) -> str:
@@ -24,7 +29,7 @@ def _digest(value: bytes) -> str:
 
 def _plan(*work_ids: str) -> RunPlan:
     return RunPlan(
-        run_id="run-20260908",
+        run_id=RUN_ID,
         descriptor_sha256=_digest(b"run descriptor"),
         source_sha256=_digest(b"canonical source"),
         work_ids=work_ids,
@@ -509,3 +514,167 @@ def test_pre_cancelled_future_does_not_block_and_checkpoints_terminal_state(
         ) == (("S000001", NonReusableReason.CANCELLED),)
         assert session.manifest.terminal_failure
         assert session.manifest.terminal_failure_work_id == "S000001"
+
+
+def _completed_on_disk(cache_root: Path) -> tuple[str, ...]:
+    """Read the manifest the way a process started after a kill would."""
+    path = cache_root / "runs" / f"{RUN_ID}.json"
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ()
+    return tuple(reference["work_id"] for reference in manifest["completed"])
+
+
+def test_each_item_is_durable_as_soon_as_it_finishes(tmp_path: Path) -> None:
+    """A kill while one item is in flight must not lose a sibling that finished."""
+    cache_root = tmp_path / "cache"
+    seen_while_in_flight: list[tuple[str, ...]] = []
+
+    def slow_sibling() -> object:
+        deadline = monotonic() + 5
+        while monotonic() < deadline:
+            completed = _completed_on_disk(cache_root)
+            if "S000001" in completed:
+                seen_while_in_flight.append(completed)
+                break
+            sleep(0.01)
+        return {"summary": "slow"}
+
+    scheduler = BoundedScheduler(max_in_flight=2, cache=CacheStore(cache_root))
+    with CheckpointStore(cache_root).open(
+        _plan("S000001", "S000002"), resume=False
+    ) as session:
+        scheduler.run(
+            (
+                _work("S000001", lambda: {"summary": "fast"}),
+                _work("S000002", slow_sibling),
+            ),
+            session,
+        )
+
+    assert seen_while_in_flight == [("S000001",)]
+    assert _completed_on_disk(cache_root) == ("S000001", "S000002")
+
+
+def test_stop_returns_promptly_without_waiting_for_in_flight_work(
+    tmp_path: Path,
+) -> None:
+    cache_root = tmp_path / "cache"
+    stop = Event()
+    blocked_started = Event()
+    blocked_returned = Event()
+    release = Event()
+    started: list[str] = []
+
+    def blocked() -> object:
+        started.append("S000002")
+        blocked_started.set()
+        release.wait(timeout=10)
+        blocked_returned.set()
+        return {"summary": "late"}
+
+    def never_started() -> object:
+        started.append("S000003")
+        return {"summary": "never"}
+
+    scheduler = BoundedScheduler(
+        max_in_flight=1, cache=CacheStore(cache_root), should_stop=stop.is_set
+    )
+    errors: list[BaseException] = []
+    with CheckpointStore(cache_root).open(
+        _plan("S000001", "S000002", "S000003"), resume=False
+    ) as session:
+
+        def run() -> None:
+            try:
+                scheduler.run(
+                    (
+                        _work("S000001", lambda: {"summary": "finished"}),
+                        _work("S000002", blocked),
+                        _work("S000003", never_started),
+                    ),
+                    session,
+                )
+            except BaseException as error:  # noqa: BLE001 - surface the outcome
+                errors.append(error)
+
+        thread = Thread(target=run, daemon=True)
+        thread.start()
+        try:
+            assert blocked_started.wait(timeout=5)
+            stop.set()
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+            # The scheduler returned while the in-flight call was still blocked.
+            assert not blocked_returned.is_set()
+        finally:
+            release.set()
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], PipelineStopped)
+        assert tuple(ref.work_id for ref in session.manifest.completed) == (
+            "S000001",
+        )
+        assert tuple(
+            (entry.work_id, entry.reason) for entry in session.manifest.non_reusable
+        ) == (
+            ("S000002", NonReusableReason.CANCELLED),
+            ("S000003", NonReusableReason.CANCELLED),
+        )
+        assert not session.manifest.terminal_failure
+
+    assert started == ["S000002"]
+
+
+def test_a_stop_requested_before_submission_starts_nothing(tmp_path: Path) -> None:
+    cache_root = tmp_path / "cache"
+    started: list[str] = []
+    scheduler = BoundedScheduler(
+        max_in_flight=2, cache=CacheStore(cache_root), should_stop=lambda: True
+    )
+
+    with CheckpointStore(cache_root).open(_plan("S000001"), resume=False) as session:
+        with pytest.raises(PipelineStopped):
+            scheduler.run(
+                (_work("S000001", lambda: started.append("S000001")),), session
+            )
+
+        assert not session.manifest.completed
+        assert tuple(
+            (entry.work_id, entry.reason) for entry in session.manifest.non_reusable
+        ) == (("S000001", NonReusableReason.CANCELLED),)
+
+    assert started == []
+
+
+def test_work_that_observes_the_stop_ends_the_batch_stopped_not_failed(
+    tmp_path: Path,
+) -> None:
+    """A re-ask that sees the stop request raises `PipelineStopped` in a worker."""
+
+    def sees_the_stop() -> object:
+        raise PipelineStopped("stopped before re-asking L0N0001")
+
+    cache_root = tmp_path / "cache"
+    scheduler = BoundedScheduler(max_in_flight=1, cache=CacheStore(cache_root))
+
+    with CheckpointStore(cache_root).open(
+        _plan("S000001", "S000002"), resume=False
+    ) as session:
+        with pytest.raises(PipelineStopped):
+            scheduler.run(
+                (
+                    _work("S000001", sees_the_stop),
+                    _work("S000002", lambda: {"summary": "not started"}),
+                ),
+                session,
+            )
+
+        assert tuple(
+            (entry.work_id, entry.reason) for entry in session.manifest.non_reusable
+        ) == (
+            ("S000001", NonReusableReason.CANCELLED),
+            ("S000002", NonReusableReason.CANCELLED),
+        )
+        assert not session.manifest.terminal_failure

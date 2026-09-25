@@ -3,6 +3,7 @@ import re
 
 import pytest
 
+from summarizer.audit import serialize_audit
 from summarizer.cache import CacheStore
 from summarizer.checkpoint import (
     CheckpointError,
@@ -16,6 +17,7 @@ from summarizer.ingestion import ingest_text
 from summarizer.pipeline import PipelineConfig, run_pipeline
 from summarizer.providers.base import GenerationRequest, GenerationResult
 from summarizer.segmentation import CacheCoordinator, SegmentationConfig
+from summarizer.runtime.observers import RuntimeObserver, StageName
 from summarizer.verification import (
     SourceLexicalEntry,
     SourceLexicalIndex,
@@ -272,6 +274,131 @@ def test_enabled_hierarchical_verification_uses_default_complete_runtime(tmp_pat
     assert all(request.timeout_seconds == 30 for request in verification_requests)
     assert result.final.audit is not None
     assert result.final.audit.verification.enabled
+
+
+def test_pipeline_publishes_verified_sentence_subset_with_source_evidence_and_progress(
+    tmp_path,
+) -> None:
+    class SubsetProvider(VerificationPipelineProvider):
+        def generate(self, request):
+            self.requests.append(request)
+            operation = request.operation_id or ""
+            if operation == "editorial-final":
+                payload = {"text": "The lake froze in 1910. The lake froze in 1911."}
+            elif operation == "D000001":
+                payload = self._node(0, operation)
+            elif operation.startswith("verification-decompose:"):
+                inputs = json.loads(request.input_text.splitlines()[1])
+                payload = {
+                    "spans": [
+                        {
+                            "span_id": item["span_id"],
+                            "anchors": [
+                                "froze in 1911"
+                                if "1911" in item["text"]
+                                else "froze in 1910"
+                            ],
+                        }
+                        for item in inputs
+                    ]
+                }
+            elif operation.startswith("verification-classify:"):
+                claims = json.loads(request.input_text.splitlines()[1])["claims"]
+                findings = []
+                for claim in claims:
+                    supported = "1911" not in claim["span_text"]
+                    evidence = claim["evidence"]
+                    findings.append(
+                        {
+                            "claim_id": claim["claim_id"],
+                            "verdict": "supported" if supported else "insufficiently_supported",
+                            "evidence": (
+                                [
+                                    {
+                                        "segment_id": evidence[0]["segment_id"],
+                                        "exact_quote": "lake froze in 1910",
+                                    }
+                                ]
+                                if supported
+                                else []
+                            ),
+                        }
+                    )
+                payload = {"findings": findings}
+            else:  # pragma: no cover - unexpected calls indicate a pipeline regression
+                raise AssertionError(f"unexpected operation {operation}")
+            return GenerationResult(json.dumps(payload), "fake", request.model)
+
+    source = "The lake froze in 1910."
+    provider = SubsetProvider(verification="supported")
+    stages = []
+    items = []
+    result = run_pipeline(
+        ingest_text(source),
+        provider,
+        CharacterCounter(),
+        app=app(),
+        strategy=strategy(),
+        config=PipelineConfig(
+            target_words=40,
+            audit_path=tmp_path / "audit.json",
+            verification=VerificationConfig(enabled=True, max_repair_passes=0),
+        ),
+        observer=RuntimeObserver(on_stage=stages.append, on_item=items.append),
+    )
+
+    assert result.final.text == "The lake froze in 1910."
+    assert result.final.audit is not None
+    audit = json.loads(serialize_audit(result.final.audit))
+    publication = audit["publication"]
+    assert publication["kind"] == "verified_subset"
+    assert publication["removed_sentences"] == [
+        {
+            "text": "The lake froze in 1911.",
+            "verdict": "insufficiently_supported",
+            "reason": 'The source does not support "froze in 1911".',
+        }
+    ]
+    sentence = publication["sentences"][0]
+    assert sentence["text"] == result.final.text
+    assert sentence["verdict"] == "supported"
+    assert sentence["evidence"][0]["segment_id"] == "D000001"
+    assert sentence["evidence"][0]["quote"] == "lake froze in 1910"
+    evidence = sentence["evidence"][0]
+    assert source[evidence["start"] : evidence["end"]] == evidence["quote"]
+    assert "verified_sentence_subset" in audit["warnings"]
+
+    writing = [index for index, event in enumerate(stages) if event.stage is StageName.WRITING]
+    verifying = [index for index, event in enumerate(stages) if event.stage is StageName.VERIFYING]
+    publishing = [event for event in stages if event.stage is StageName.PUBLISHING]
+    assert [stages[index].state for index in writing] == ["active", "completed"]
+    assert writing[-1] < verifying[0]
+    verify_details = [stages[index].detail for index in verifying]
+    assert "Checking the editorial draft" in verify_details
+    assert "Decomposing claims" in verify_details
+    assert "Assessing claims" in verify_details
+    assert "Removing unsupported sentences" in verify_details
+    assert stages[verifying[-1]].state == "completed"
+    assert stages[verifying[-1]].detail == "Removed 1 unsupported sentence"
+    assert [(event.state, event.detail) for event in publishing] == [
+        ("active", None),
+        ("completed", None),
+    ]
+
+    claim_events = [event for event in items if event.kind == "claim"]
+    assert claim_events
+    final_claim_ids = {
+        assessment["claim_id"]
+        for verification_pass in audit["verification"]["passes"]
+        for assessment in verification_pass["assessments"]
+    }
+    assert final_claim_ids <= {event.work_id for event in claim_events}
+    assert all(event.stage is StageName.VERIFYING for event in claim_events)
+    assert all(
+        any(event.state == "active" for event in claim_events if event.work_id == claim_id)
+        and any(event.state == "completed" for event in claim_events if event.work_id == claim_id)
+        for claim_id in final_claim_ids
+    )
 
 
 def test_pipeline_uses_an_injected_complete_verifier_runtime() -> None:

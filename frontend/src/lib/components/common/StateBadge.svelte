@@ -1,0 +1,105 @@
+<script lang="ts" module>
+	import type { ImportState, RunState } from '$lib/api/types';
+
+	const TONES: Record<RunState | ImportState, 'active' | 'success' | 'paused' | 'danger'> = {
+		queued: 'active',
+		running: 'active',
+		stopping: 'active',
+		importing: 'active',
+		completed: 'success',
+		ready: 'success',
+		stopped: 'paused',
+		interrupted: 'paused',
+		failed: 'danger'
+	};
+</script>
+
+<script lang="ts">
+	import { importStateLabel, runStateLabel } from '$lib/format';
+
+	// `failed` exists for both Runs and Imports; pass kind="import" for "Import failed".
+	let {
+		state,
+		kind,
+		size = 'md'
+	}: {
+		state: RunState | ImportState;
+		kind?: 'run' | 'import';
+		size?: 'sm' | 'md';
+	} = $props();
+
+	const isImport = $derived(
+		kind === 'import' || (kind === undefined && (state === 'importing' || state === 'ready'))
+	);
+	const label = $derived(
+		isImport ? importStateLabel(state as ImportState) : runStateLabel(state as RunState)
+	);
+	const tone = $derived(TONES[state] ?? 'active');
+	const live = $derived(state === 'running' || state === 'importing' || state === 'stopping');
+</script>
+
+<span class="badge {tone} {size}" data-state={state}>
+	<span class="dot" class:live aria-hidden="true"></span>
+	{label}
+</span>
+
+<style>
+	.badge {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.375rem;
+		padding: 0.0625rem 0.5rem;
+		border-radius: var(--radius-sm);
+		font-size: 0.8125rem;
+		font-weight: 600;
+		line-height: 1.5;
+		white-space: nowrap;
+	}
+
+	.badge.sm {
+		font-size: 0.75rem;
+		padding: 0 0.4375rem;
+	}
+
+	.dot {
+		width: 0.4375rem;
+		height: 0.4375rem;
+		border-radius: 50%;
+		background: currentColor;
+		flex: none;
+	}
+
+	.dot.live {
+		animation: pulse 1.6s ease-in-out infinite;
+	}
+
+	@keyframes pulse {
+		50% {
+			opacity: 0.3;
+		}
+	}
+
+	.active {
+		color: var(--color-amber-strong);
+		background: var(--color-amber-soft);
+	}
+
+	.active .dot {
+		background: var(--color-amber);
+	}
+
+	.success {
+		color: var(--color-success);
+		background: var(--color-success-soft);
+	}
+
+	.paused {
+		color: var(--color-text-muted);
+		background: var(--color-surface);
+	}
+
+	.danger {
+		color: var(--color-danger);
+		background: var(--color-danger-soft);
+	}
+</style>

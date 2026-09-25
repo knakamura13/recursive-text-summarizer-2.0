@@ -1,0 +1,249 @@
+/* Element defaults and the few shared classes every page uses. */
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html {
+	-webkit-text-size-adjust: 100%;
+	text-size-adjust: 100%;
+}
+
+body {
+	margin: 0;
+	font-family: var(--font-sans);
+	font-size: 1rem;
+	line-height: 1.5;
+	color: var(--color-text);
+	background: var(--color-bg);
+	overflow-wrap: anywhere;
+	-webkit-font-smoothing: antialiased;
+}
+
+::selection {
+	background: var(--color-highlight);
+	color: var(--color-text);
+}
+
+[hidden] {
+	display: none !important;
+}
+
+:focus-visible {
+	outline: 2px solid var(--color-focus);
+	outline-offset: 2px;
+}
+
+a {
+	color: var(--color-text);
+	text-decoration-color: var(--color-border-strong);
+	text-underline-offset: 0.18em;
+}
+
+a:hover {
+	text-decoration-color: var(--color-accent);
+}
+
+h1,
+h2,
+h3 {
+	line-height: 1.25;
+	margin: 0;
+}
+
+h1,
+h2 {
+	font-family: var(--font-serif);
+	font-weight: 600;
+	letter-spacing: -0.005em;
+}
+
+h1 {
+	font-size: 1.75rem;
+}
+
+h2 {
+	font-size: 1.25rem;
+}
+
+/* Small uppercase label above a value or a group ("Elapsed", "Summary"). */
+.eyebrow {
+	font-size: 0.72rem;
+	font-weight: 600;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--color-text-subtle);
+}
+
+h3 {
+	font-size: 1rem;
+}
+
+p {
+	margin: 0;
+}
+
+.visually-hidden {
+	position: absolute !important;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
+}
+
+/* --- Buttons ------------------------------------------------------------- */
+
+.button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: var(--space-2);
+	min-height: var(--touch-target);
+	min-width: var(--touch-target);
+	padding: var(--space-2) var(--space-4);
+	border: 1px solid var(--color-border-strong);
+	border-radius: var(--radius-sm);
+	background: var(--color-surface-elevated);
+	color: var(--color-text);
+	font: inherit;
+	font-weight: 500;
+	line-height: 1.2;
+	text-decoration: none;
+	cursor: pointer;
+	touch-action: manipulation;
+	transition:
+		background-color 120ms ease,
+		border-color 120ms ease;
+}
+
+.button:hover:not(:disabled) {
+	background: var(--color-surface);
+	border-color: var(--color-text-muted);
+}
+
+.button:disabled,
+.button[aria-disabled='true'] {
+	cursor: not-allowed;
+	opacity: 0.6;
+}
+
+.button.primary {
+	background: var(--color-ink);
+	border-color: var(--color-ink);
+	color: var(--color-surface-elevated);
+}
+
+.button.primary:hover:not(:disabled) {
+	background: var(--color-ink-hover);
+	border-color: var(--color-ink-hover);
+}
+
+.button.danger {
+	background: var(--color-danger);
+	border-color: var(--color-danger);
+	color: #ffffff;
+}
+
+.button.danger:hover:not(:disabled) {
+	background: #932e22;
+	border-color: #932e22;
+}
+
+/* Stop, Delete in a row of other actions: clearly destructive, not shouting. */
+.button.danger-outline {
+	border-color: var(--color-danger-border);
+	color: var(--color-danger);
+}
+
+.button.danger-outline:hover:not(:disabled) {
+	background: var(--color-danger-soft);
+	border-color: var(--color-danger);
+}
+
+.button.ghost {
+	border-color: transparent;
+	background: transparent;
+}
+
+.button.ghost:hover:not(:disabled) {
+	border-color: transparent;
+}
+
+.button.small {
+	padding: var(--space-1) var(--space-3);
+	font-size: 0.875rem;
+}
+
+.button.icon {
+	padding: 0;
+	font-size: 1.25rem;
+}
+
+/* --- Form controls ------------------------------------------------------- */
+
+input:not([type='checkbox'], [type='radio'], [type='file'], [type='range']),
+select,
+textarea {
+	width: 100%;
+	min-height: var(--touch-target);
+	padding: var(--space-2) var(--space-3);
+	border: 1px solid var(--color-border-strong);
+	border-radius: var(--radius-sm);
+	background: var(--color-surface-elevated);
+	color: var(--color-text);
+	/* 16 px keeps iOS Safari from zooming into focused fields. */
+	font: inherit;
+	font-size: 1rem;
+}
+
+textarea {
+	resize: vertical;
+}
+
+input[aria-invalid='true'],
+select[aria-invalid='true'],
+textarea[aria-invalid='true'] {
+	border-color: var(--color-danger);
+}
+
+input[type='checkbox'] {
+	width: 1.25rem;
+	height: 1.25rem;
+	accent-color: var(--color-ink);
+}
+
+.field {
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-1);
+	min-width: 0;
+}
+
+.field > label,
+.field-label {
+	font-weight: 500;
+}
+
+.field-hint {
+	font-size: 0.875rem;
+	color: var(--color-text-muted);
+}
+
+.field-error {
+	font-size: 0.875rem;
+	color: var(--color-danger);
+}
+
+.checkbox-field {
+	display: flex;
+	align-items: center;
+	gap: var(--space-3);
+	min-height: var(--touch-target);
+	cursor: pointer;
+}

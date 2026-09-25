@@ -25,6 +25,7 @@ from summarizer.providers.base import ContextWindowProvider, ModelProvider, Prov
 from summarizer.providers.openai import OpenAIProvider
 from summarizer.providers.ollama import OllamaProvider
 from summarizer.providers.retrying import RetryingProvider
+from summarizer.runtime.observers import ItemFailedError
 from summarizer.segmentation import SegmentationConfig
 from summarizer.tokenization import TokenCounter, resolve_token_counter
 from summarizer.verification import VerificationConfig
@@ -287,6 +288,7 @@ def main(
         OSError,
         ProviderError,
         ValueError,
+        ItemFailedError,
         FinalizationVerificationError,
         PublicationError,
     ) as error:

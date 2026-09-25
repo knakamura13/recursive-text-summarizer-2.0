@@ -19,6 +19,7 @@
     "@sveltejs/vite-plugin-svelte": "^5.0.3",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/svelte": "^5.2.7",
+    "@types/node": "^20.19.43",
     "axe-core": "^4.10.3",
     "jsdom": "^26.0.0",
     "svelte": "^5.23.0",
@@ -26,8 +27,5 @@
     "typescript": "^5.8.2",
     "vite": "^6.2.0",
     "vitest": "^3.0.8"
-  },
-  "dependencies": {
-    "pdfjs-dist": "^5.0.375"
   }
 }

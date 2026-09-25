@@ -4,6 +4,7 @@ import pytest
 
 from summarizer.editorial import EditorialError, build_editorial_request, write_editorial
 from summarizer.providers.base import GenerationRequest, GenerationResult
+from summarizer.runtime.observers import ItemFailedError, RuntimeObserver, StageName
 from summarizer.summaries import SummaryNode
 
 
@@ -91,11 +92,73 @@ def test_final_writer_redacts_common_provider_credentials(secret: str) -> None:
     assert "[REDACTED]" in result.text
 
 
-@pytest.mark.parametrize("response", ["not json", json.dumps({"text": " "}), "{}"])
-def test_invalid_final_responses_are_rejected_without_echoing_them(response: str) -> None:
-    with pytest.raises(EditorialError) as error:
-        write_editorial(
-            root(), Provider(response), source_id=SOURCE_ID, model="m", timeout_seconds=30, target_words=50
+class ScriptedProvider:
+    def __init__(self, *responses: str) -> None:
+        self.requests: list[GenerationRequest] = []
+        self.responses = list(responses)
+
+    def generate(self, request: GenerationRequest) -> GenerationResult:
+        self.requests.append(request)
+        return GenerationResult(
+            text=self.responses.pop(0), provider="fake", model=request.model
         )
 
+
+def _recording_observer() -> tuple[RuntimeObserver, list[tuple[str, int | None, str | None]]]:
+    events: list[tuple[str, int | None, str | None]] = []
+    observer = RuntimeObserver(
+        on_item=lambda event: events.append((event.state, event.attempt, event.message))
+        if event.kind == "editorial" and event.work_id == "editorial-final"
+        else None
+    )
+    return observer, events
+
+
+def test_invalid_draft_is_reasked_with_the_validation_error_then_accepted() -> None:
+    provider = ScriptedProvider("not json", '{"text":"A coherent final summary."}')
+    observer, events = _recording_observer()
+
+    result = write_editorial(
+        root(),
+        provider,
+        source_id=SOURCE_ID,
+        model="m",
+        timeout_seconds=30,
+        target_words=50,
+        observer=observer,
+    )
+
+    assert result.text == "A coherent final summary."
+    first, second = provider.requests
+    assert second.operation_id == first.operation_id == "editorial-final"
+    assert second.input_text == first.input_text
+    assert "rejected" in second.instructions
+    assert "not json" not in second.instructions
+    assert [state for state, _, _ in events] == ["active", "retrying", "completed"]
+    assert events[1][1] == 1
+    assert events[1][2]
+
+
+@pytest.mark.parametrize("response", ["not json", json.dumps({"text": " "}), "{}"])
+def test_draft_still_invalid_after_reasks_fails_the_editorial_item(response: str) -> None:
+    provider = ScriptedProvider(response, response, response)
+    observer, events = _recording_observer()
+
+    with pytest.raises(ItemFailedError) as error:
+        write_editorial(
+            root(),
+            provider,
+            source_id=SOURCE_ID,
+            model="m",
+            timeout_seconds=30,
+            target_words=50,
+            observer=observer,
+        )
+
+    assert len(provider.requests) == 3
+    assert error.value.stage is StageName.WRITING
+    assert (error.value.kind, error.value.work_id) == ("editorial", "editorial-final")
+    assert isinstance(error.value.__cause__, EditorialError)
     assert response not in str(error.value)
+    assert [state for state, _, _ in events] == ["active", "retrying", "retrying", "failed"]
+    assert events[-1][2] == str(error.value)

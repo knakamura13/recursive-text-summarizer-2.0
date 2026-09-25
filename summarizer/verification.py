@@ -28,6 +28,15 @@ from summarizer.providers.base import (
     ModelProvider,
     ProviderError,
 )
+from summarizer.runtime.observers import (
+    ItemEvent,
+    ItemState,
+    RuntimeObserver,
+    StageEvent,
+    StageName,
+    get_observer,
+)
+from summarizer.safety import redact_text
 from summarizer.segmentation import CacheCoordinator
 from summarizer.tokenization import TokenCounter
 
@@ -1240,6 +1249,72 @@ def reduce_batch_findings(
     return ClaimVerdict.INSUFFICIENTLY_SUPPORTED, ()
 
 
+class VerificationProgress:
+    """Report verification phases and claim verdicts, and poll for Stop.
+
+    Claim item events use the claim's own audit id (`V01C000003`) as their
+    work id, so they join the verdicts recorded in audit.json. Each
+    `verify_and_repair` call numbers its passes from `V01` again; a pass
+    begins with the `active` event of its first claim (`order` 0), and
+    `order`/`total` count the claims of that one pass. Without an observer
+    every report is a no-op.
+    """
+
+    def __init__(self, observer: RuntimeObserver | None = None) -> None:
+        self._observer = get_observer(observer)
+        self._detail: str | None = None
+
+    def phase(self, detail: str) -> None:
+        """Mark the VERIFYING stage active with a new phase description."""
+        if detail == self._detail:
+            return
+        self._detail = detail
+        self._observer.emit(StageEvent(StageName.VERIFYING, "active", detail=detail))
+
+    def raise_if_stopped(self, where: str) -> None:
+        self._observer.raise_if_stopped(where)
+
+    def begin_pass(self, claims: Sequence[Claim]) -> _ClaimProgress:
+        return _ClaimProgress(self._observer, claims)
+
+
+class _ClaimProgress:
+    """Claim item events of one verification pass."""
+
+    def __init__(self, observer: RuntimeObserver, claims: Sequence[Claim]) -> None:
+        self._observer = observer
+        self._order = {claim.claim_id: index for index, claim in enumerate(claims)}
+        self._open: dict[str, None] = {}
+
+    def _emit(self, claim_id: str, state: ItemState, message: str | None = None) -> None:
+        self._observer.emit_item(
+            ItemEvent(
+                kind="claim",
+                work_id=claim_id,
+                state=state,
+                stage=StageName.VERIFYING,
+                order=self._order[claim_id],
+                total=len(self._order),
+                message=message,
+            )
+        )
+
+    def active(self, claims: Sequence[Claim]) -> None:
+        for claim in claims:
+            self._open[claim.claim_id] = None
+            self._emit(claim.claim_id, "active")
+
+    def completed(self, claim_id: str, verdict: ClaimVerdict) -> None:
+        self._open.pop(claim_id, None)
+        self._emit(claim_id, "completed", verdict.value)
+
+    def fail_open(self, code: str) -> None:
+        """End every still-active claim when its pass fails."""
+        for claim_id in tuple(self._open):
+            del self._open[claim_id]
+            self._emit(claim_id, "failed", code)
+
+
 def verify_draft_once(
     draft: str,
     *,
@@ -1249,10 +1324,17 @@ def verify_draft_once(
     config: VerificationConfig,
     pass_index: int,
     terminalize_errors: bool = False,
+    progress: VerificationProgress | None = None,
 ) -> VerificationPassResult:
-    """Run one bounded decomposition and classification pass over a draft."""
+    """Run one bounded decomposition and classification pass over a draft.
+
+    `progress` receives one claim item event pair per assessed claim and is
+    polled for Stop before every model call.
+    """
     if not config.enabled:
         return VerificationPassResult((), (), (), (), (), (), (), ())
+    progress = progress or VerificationProgress()
+    progress.phase("Decomposing claims")
     spans = split_draft_spans(draft, pass_index=pass_index)
     def render_decomposition(items: tuple[DraftSpan, ...]) -> str:
         request = build_decomposition_request(items, source_id=source_id, runtime=runtime)
@@ -1291,6 +1373,7 @@ def verify_draft_once(
     for batch in decomposition_batches:
         request = build_decomposition_request(batch, source_id=source_id, runtime=runtime)
         for attempt in range(2):
+            progress.raise_if_stopped("before claim decomposition")
             try:
                 generation = runtime.provider.generate(request)
             except (ProviderError, VerificationResponseError):
@@ -1374,6 +1457,7 @@ def verify_draft_once(
             pass_index=pass_index, code="anchor_failed",
         )
     span_texts = {span.span_id: span.text for span in spans}
+    progress.phase("Selecting evidence")
     bundles: dict[str, EvidenceBundle] = {}
     for claim in claims:
         try:
@@ -1396,6 +1480,7 @@ def verify_draft_once(
                 code="evidence_capacity_failed",
                 failed_phase=GenerationPhase.CLASSIFICATION,
             )
+    progress.phase("Assessing claims")
     work_items = tuple((claim, bundles[claim.claim_id]) for claim in claims)
 
     def render_request(items: tuple[tuple[Claim, EvidenceBundle], ...]) -> str:
@@ -1436,10 +1521,34 @@ def verify_draft_once(
             code="classification_capacity_failed",
             failed_phase=GenerationPhase.CLASSIFICATION,
         )
+    claim_progress = progress.begin_pass(claims)
     findings_by_claim: dict[str, list[BatchFinding]] = {claim.claim_id: [] for claim in claims}
     finding_generations: dict[str, GenerationResult] = {}
     classification_diagnostics: list[str] = []
     generations = list(decomposition_generations)
+
+    def classification_failure(
+        code: str, *, failed_phase: GenerationPhase | None = None
+    ) -> VerificationPassResult:
+        claim_progress.fail_open(code)
+        return _failed_verification_pass(
+            spans=spans,
+            claims=claims,
+            bundles=bundles,
+            generations=generations,
+            decomposition_generation_count=len(decomposition_generations),
+            pass_index=pass_index,
+            code=code,
+            failed_phase=failed_phase,
+        )
+
+    def escalates(claim: Claim) -> bool:
+        """A raw contradiction is not final while legal provenance is omitted."""
+        return bool(bundles[claim.claim_id].selection.omitted_ids) and any(
+            finding.verdict is ClaimVerdict.CONTRADICTED
+            for finding in findings_by_claim[claim.claim_id]
+        )
+
     for batch in batches:
         batch_claims = tuple(item[0] for item in batch)
         request = build_classification_request(
@@ -1455,18 +1564,18 @@ def verify_draft_once(
             }
             for item in batch
         }
+        progress.raise_if_stopped("before claim verification")
+        claim_progress.active(batch_claims)
         for attempt in range(2):
+            if attempt:
+                progress.raise_if_stopped("before re-asking claim verification")
             try:
                 generation = runtime.provider.generate(request)
             except (ProviderError, VerificationResponseError):
                 if not terminalize_errors:
                     raise
-                return _failed_verification_pass(
-                    spans=spans, claims=claims, bundles=bundles,
-                    generations=generations,
-                    decomposition_generation_count=len(decomposition_generations),
-                    pass_index=pass_index,
-                    code="classification_provider_failed",
+                return classification_failure(
+                    "classification_provider_failed",
                     failed_phase=GenerationPhase.CLASSIFICATION,
                 )
             generations.append(generation)
@@ -1484,12 +1593,8 @@ def verify_draft_once(
                     except VerificationCapacityError:
                         if not terminalize_errors:
                             raise
-                        return _failed_verification_pass(
-                            spans=spans, claims=claims, bundles=bundles,
-                            generations=generations,
-                            decomposition_generation_count=len(decomposition_generations),
-                            pass_index=pass_index,
-                            code="classification_capacity_failed",
+                        return classification_failure(
+                            "classification_capacity_failed",
                             failed_phase=GenerationPhase.CLASSIFICATION,
                         )
                     continue
@@ -1504,40 +1609,39 @@ def verify_draft_once(
                     except VerificationResponseError:
                         if not terminalize_errors:
                             raise
-                        return _failed_verification_pass(
-                            spans=spans, claims=claims, bundles=bundles,
-                            generations=generations,
-                            decomposition_generation_count=len(decomposition_generations),
-                            pass_index=pass_index, code="classification_failed",
-                        )
+                        return classification_failure("classification_failed")
                     classification_diagnostics.append(
                         "invalid_evidence_quotes_downgraded"
                     )
                     break
                 if not terminalize_errors:
                     raise
-                return _failed_verification_pass(
-                    spans=spans, claims=claims, bundles=bundles,
-                    generations=generations,
-                    decomposition_generation_count=len(decomposition_generations),
-                    pass_index=pass_index, code="classification_failed",
-                )
+                return classification_failure("classification_failed")
             break
         for finding in parsed:
             findings_by_claim[finding.claim_id].append(finding)
             finding_generations[finding.claim_id] = generation
+        for claim in batch_claims:
+            if not escalates(claim):
+                claim_progress.completed(
+                    claim.claim_id,
+                    reduce_batch_findings(
+                        claim.claim_id,
+                        findings_by_claim[claim.claim_id],
+                        retrieval_complete=bundles[
+                            claim.claim_id
+                        ].selection.retrieval_complete,
+                    )[0],
+                )
 
-    # A raw contradiction is not final while legal provenance remains omitted.
     # Re-check each omitted complete core under the same bounded request contract
-    # before reducing the claim's findings.
+    # before reducing a contradicted claim's findings.
     source_by_id = {entry.segment_id: entry.text for entry in source_index.entries}
     for claim in claims:
-        initial_bundle = bundles[claim.claim_id]
-        if not initial_bundle.selection.omitted_ids or not any(
-            finding.verdict is ClaimVerdict.CONTRADICTED
-            for finding in findings_by_claim[claim.claim_id]
-        ):
+        if not escalates(claim):
             continue
+        progress.phase("Escalating evidence")
+        initial_bundle = bundles[claim.claim_id]
         extra_passages: list[SourcePassage] = []
         escalation_items = tuple(
             (claim, SourcePassage(segment_id, source_by_id[segment_id]))
@@ -1587,14 +1691,8 @@ def verify_draft_once(
         except VerificationCapacityError:
             if not terminalize_errors:
                 raise
-            return _failed_verification_pass(
-                spans=spans,
-                claims=claims,
-                bundles=bundles,
-                generations=generations,
-                decomposition_generation_count=len(decomposition_generations),
-                pass_index=pass_index,
-                code="classification_capacity_failed",
+            return classification_failure(
+                "classification_capacity_failed",
                 failed_phase=GenerationPhase.CLASSIFICATION,
             )
         for batch in escalation_batches:
@@ -1603,19 +1701,14 @@ def verify_draft_once(
                 (claim,), evidence={claim.claim_id: extra_bundle}, spans=span_texts,
                 source_id=source_id, runtime=runtime,
             )
+            progress.raise_if_stopped("before evidence escalation")
             try:
                 generation = runtime.provider.generate(request)
             except (ProviderError, VerificationResponseError):
                 if not terminalize_errors:
                     raise
-                return _failed_verification_pass(
-                    spans=spans,
-                    claims=claims,
-                    bundles=bundles,
-                    generations=generations,
-                    decomposition_generation_count=len(decomposition_generations),
-                    pass_index=pass_index,
-                    code="classification_provider_failed",
+                return classification_failure(
+                    "classification_provider_failed",
                     failed_phase=GenerationPhase.CLASSIFICATION,
                 )
             generations.append(generation)
@@ -1635,15 +1728,7 @@ def verify_draft_once(
             except VerificationResponseError:
                 if not terminalize_errors:
                     raise
-                return _failed_verification_pass(
-                    spans=spans,
-                    claims=claims,
-                    bundles=bundles,
-                    generations=generations,
-                    decomposition_generation_count=len(decomposition_generations),
-                    pass_index=pass_index,
-                    code="classification_failed",
-            )
+                return classification_failure("classification_failed")
             finding_generations[claim.claim_id] = generation
             extra_passages.extend(extra_bundle.passages)
         combined_passages = (*initial_bundle.passages, *extra_passages)
@@ -1660,6 +1745,14 @@ def verify_draft_once(
                 retrieval_complete=True,
             ),
             passages=combined_passages,
+        )
+        claim_progress.completed(
+            claim.claim_id,
+            reduce_batch_findings(
+                claim.claim_id,
+                findings_by_claim[claim.claim_id],
+                retrieval_complete=True,
+            )[0],
         )
 
     assessments: list[ClaimAssessment] = []
@@ -1714,8 +1807,13 @@ def verify_and_repair(
     runtime: VerificationRuntime,
     config: VerificationConfig,
     coordinator: CacheCoordinator | None = None,
+    progress: VerificationProgress | None = None,
 ) -> VerificationResult:
-    """Reuse only a fully successful terminal verification result."""
+    """Reuse only a fully successful terminal verification result.
+
+    `progress` reports claims and repair passes and is polled for Stop before
+    every model call; it never affects the result or its cache identity.
+    """
     if coordinator is None or not config.enabled:
         return _verify_and_repair(
             draft,
@@ -1723,6 +1821,7 @@ def verify_and_repair(
             source_index=source_index,
             runtime=runtime,
             config=config,
+            progress=progress,
         )
     adapter = TypeAdapter(VerificationResult)
     return coordinator.resolve(
@@ -1753,6 +1852,7 @@ def verify_and_repair(
             source_index=source_index,
             runtime=runtime,
             config=config,
+            progress=progress,
         ),
         cache_if=lambda result: not result.failed,
     )
@@ -1792,6 +1892,7 @@ def _verify_and_repair(
     source_index: SourceLexicalIndex,
     runtime: VerificationRuntime,
     config: VerificationConfig,
+    progress: VerificationProgress | None = None,
     _pass_index: int = 1,
 ) -> VerificationResult:
     """Run finite verification/repair orchestration; disabled mode is zero-call."""
@@ -1806,6 +1907,7 @@ def _verify_and_repair(
             exhausted=False,
             failed=False,
         )
+    progress = progress or VerificationProgress()
     first = verify_draft_once(
         draft,
         source_id=source_id,
@@ -1814,6 +1916,7 @@ def _verify_and_repair(
         config=config,
         pass_index=_pass_index,
         terminalize_errors=True,
+        progress=progress,
     )
     if first.failed:
         return _terminal_result(
@@ -2024,8 +2127,10 @@ def _verify_and_repair(
             ),
         )
 
+    progress.phase(f"Repair pass {(_pass_index + 1) // 2}")
     try:
         for batch in batches:
+            progress.raise_if_stopped("before repair")
             try:
                 generation = runtime.provider.generate(
                     build_repair_request(batch, source_id=source_id, runtime=runtime)
@@ -2041,6 +2146,9 @@ def _verify_and_repair(
         )
     except VerificationResponseError:
         return repair_failure("repair_failed")
+    # Repair prose is reader-facing like the redacted draft it changes, so it is
+    # redacted the same way before the repaired draft is verified.
+    repaired = redact_text(repaired)
     second = verify_draft_once(
         repaired,
         source_id=source_id,
@@ -2049,6 +2157,7 @@ def _verify_and_repair(
         config=config,
         pass_index=_pass_index + 1,
         terminalize_errors=True,
+        progress=progress,
     )
     if second.failed:
         # Re-verification of the repair errored, so the repair is rejected and
@@ -2086,6 +2195,7 @@ def _verify_and_repair(
             source_index=source_index,
             runtime=runtime,
             config=replace(config, max_repair_passes=config.max_repair_passes - 1),
+            progress=progress,
             _pass_index=_pass_index + 2,
         )
         combined_passes = (first, second, *continued.pass_results)

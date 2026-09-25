@@ -1,4 +1,50 @@
-"""Versioned, secret-safe audit artifacts for completed summary runs."""
+"""Versioned, secret-safe audit artifacts for completed summary runs.
+
+An audit records structure, identifiers, verdicts, and usage, never request
+prompts or provider responses. Reader-facing prose appears only under
+`publication`: published sentences repeat the credential-redacted summary,
+and quotations and removed sentences are credential-redacted on the way in.
+
+JSON paths read by the web application (offsets are code points, i.e. Python
+`str` indices):
+
+- `source_segments[]`: every source segment and verification passage, with
+  `segment_id`, `order`, and `core_start`/`core_end` plus
+  `context_start`/`context_end` into the canonical document text. When a
+  segment's core cannot fit one evidence bundle, verification splits it into
+  passages numbered after the last leaf segment (`S000087`, `S000088`, ...;
+  `S000001`, ... for the direct strategy's `D000001`). A passage carries
+  `parent_segment_id`, the leaf segment it lies in; leaf segments have no
+  `parent_segment_id` key, and only leaf segments appear in `tree_nodes`.
+- `publication`, absent when nothing was published and in older audits:
+  - `kind`: `editorial` (the editorial draft passed verification, or
+    verification was off), `verified_subset` (the editorial draft with its
+    failing sentences removed; warning `verified_sentence_subset`), or
+    `content_unit_fallback` (verified root content units; warning
+    `verified_content_unit_fallback`).
+  - `sentences[]`: the published text in order, with `index`, `paragraph`
+    (0-based, blank-line separated), `start`/`end` into the published summary
+    (`summary.txt` without its `Sources:` trailer), `text`, `verdict`
+    (`supported`, `not_meaningfully_verifiable`, or `unchecked` when
+    verification was off), and `evidence[]` with `segment_id` (a
+    `source_segments[]` id), the verifier's `quote`, and `start`/`end` of that
+    quote in the canonical document text (null when it cannot be located).
+  - Sentence evidence is the direct mapping for each published sentence: each
+    entry comes from a supported verifier finding for that sentence; its
+    `segment_id` joins to `source_segments[]`, and its quote offsets locate the
+    source text. WebViews can render evidence from this field without trying to
+    reconstruct sentence-to-claim links.
+  - `removed_sentences[]`: sentences dropped from the published candidate, in
+    the order verification first saw them, with `text`, `verdict`
+    (`contradicted`, `insufficiently_supported`, `not_meaningfully_verifiable`,
+    or `unverified`), and a readable `reason`.
+- `warnings[]`: `verified_sentence_subset`, `verified_content_unit_fallback`,
+  or, in a failure audit written without a publication,
+  `verified_content_unit_fallback_failed`.
+- `verification.passes[]`: the claim verdicts (`assessments[].claim_id`, the
+  work id of the claim item events) and evidence identifiers of the check
+  that produced the published text.
+"""
 
 from __future__ import annotations
 
@@ -17,8 +63,10 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     TypeAdapter,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -144,6 +192,26 @@ def _audit_segment_ids(values: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(_audit_segment_id(value) for value in values)
 
 
+def _audit_optional_segment_id(value: str | None) -> str | None:
+    return None if value is None else _audit_segment_id(value)
+
+
+def _audit_prose(value: object) -> str:
+    """Keep reader-facing text with any credential-like substring replaced."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("audit publication text must be nonblank text")
+    return redact_text(value)
+
+
+def _audit_published_prose(value: object) -> str:
+    """Accept published summary text only when it is already credential-free."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("audit publication text must be nonblank text")
+    if redact_text(value) != value:
+        raise ValueError("published summary text must be credential-redacted")
+    return value
+
+
 def _audit_node_id(value: str) -> str:
     if _NODE_ID.fullmatch(value):
         return value
@@ -181,6 +249,12 @@ class _AuditRecord(BaseModel):
 
 
 class AuditSegment(_AuditRecord):
+    """A source segment, or a verification passage split from one.
+
+    A passage names the leaf segment it lies in with `parent_segment_id`;
+    the key is omitted for leaf segments.
+    """
+
     segment_id: str
     source_id: str
     order: int
@@ -195,9 +269,18 @@ class AuditSegment(_AuditRecord):
     boundary_kind: Literal[
         "heading", "paragraph", "list", "sentence", "hard", "document", "code_fence"
     ]
+    parent_segment_id: str | None = None
 
     _valid_segment_id = field_validator("segment_id")(_audit_segment_id)
     _valid_source_id = field_validator("source_id")(_audit_source_id)
+    _valid_parent = field_validator("parent_segment_id")(_audit_optional_segment_id)
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_parent(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        if data.get("parent_segment_id") is None:
+            data.pop("parent_segment_id", None)
+        return data
 
 
 class AuditCitation(_AuditRecord):
@@ -467,6 +550,93 @@ class AuditNodeV4(AuditNode):
     grounding: AuditGroundingSelection | None
 
 
+PublicationKind = Literal["editorial", "verified_subset", "content_unit_fallback"]
+PUBLICATION_WARNINGS: Mapping[str, str] = {
+    "verified_subset": "verified_sentence_subset",
+    "content_unit_fallback": "verified_content_unit_fallback",
+}
+
+
+class AuditSentenceEvidence(_AuditRecord):
+    """One verifier quotation that supports a published sentence."""
+
+    segment_id: str
+    quote: str
+    start: int | None = None
+    end: int | None = None
+
+    _valid_segment_id = field_validator("segment_id")(_audit_segment_id)
+    _valid_quote = field_validator("quote", mode="before")(_audit_prose)
+
+    @model_validator(mode="after")
+    def _offsets_are_a_range(self) -> AuditSentenceEvidence:
+        if (self.start is None) != (self.end is None) or (
+            self.start is not None
+            and self.end is not None
+            and not 0 <= self.start < self.end
+        ):
+            raise ValueError("evidence offsets must be an ordered pair or absent")
+        return self
+
+
+class AuditPublishedSentence(_AuditRecord):
+    index: int = Field(ge=0)
+    paragraph: int = Field(ge=0)
+    start: int = Field(ge=0)
+    end: int
+    text: str
+    verdict: Literal["supported", "not_meaningfully_verifiable", "unchecked"]
+    evidence: tuple[AuditSentenceEvidence, ...]
+
+    _valid_text = field_validator("text", mode="before")(_audit_published_prose)
+
+    @model_validator(mode="after")
+    def _range_matches_text(self) -> AuditPublishedSentence:
+        if self.end - self.start != len(self.text):
+            raise ValueError("published sentence range must match its text")
+        if self.verdict == "unchecked" and self.evidence:
+            raise ValueError("an unchecked sentence cannot cite evidence")
+        if self.verdict == "supported" and not self.evidence:
+            raise ValueError("a supported sentence must cite evidence")
+        return self
+
+
+class AuditRemovedSentence(_AuditRecord):
+    text: str
+    verdict: Literal[
+        "contradicted",
+        "insufficiently_supported",
+        "not_meaningfully_verifiable",
+        "unverified",
+    ]
+    reason: str
+
+    _valid_text = field_validator("text", "reason", mode="before")(_audit_prose)
+
+
+class AuditPublication(_AuditRecord):
+    """How the published summary was chosen and what supports each sentence."""
+
+    kind: PublicationKind
+    sentences: tuple[AuditPublishedSentence, ...]
+    removed_sentences: tuple[AuditRemovedSentence, ...]
+
+    @model_validator(mode="after")
+    def _sentences_are_ordered(self) -> AuditPublication:
+        if not self.sentences:
+            raise ValueError("a publication must contain sentences")
+        previous: AuditPublishedSentence | None = None
+        for index, sentence in enumerate(self.sentences):
+            if sentence.index != index:
+                raise ValueError("published sentences must be numbered in order")
+            if previous is not None and (
+                sentence.start < previous.end or sentence.paragraph < previous.paragraph
+            ):
+                raise ValueError("published sentences must be ordered and disjoint")
+            previous = sentence
+        return self
+
+
 class _AuditArtifactBase(_AuditRecord):
     source_id: str
     strategy: Literal["auto", "direct", "hierarchical"]
@@ -480,6 +650,16 @@ class _AuditArtifactBase(_AuditRecord):
     warnings: tuple[str, ...]
     failures: tuple[str, ...]
     verification: AuditVerification
+    publication: AuditPublication | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_publication(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        data = handler(self)
+        if data.get("publication") is None:
+            data.pop("publication", None)
+        return data
 
     @field_validator("configuration", mode="before")
     @classmethod
@@ -506,6 +686,19 @@ class _AuditArtifactBase(_AuditRecord):
             raise ValueError("source segments must be in source order")
         if any(segment.source_id != self.source_id for segment in self.source_segments):
             raise ValueError("every source segment must belong to the audit source")
+        passage_ids: set[str] = set()
+        for segment in self.source_segments:
+            if segment.parent_segment_id is None:
+                continue
+            parent = segments.get(segment.parent_segment_id)
+            if parent is None or parent.parent_segment_id is not None:
+                raise ValueError("a verification passage parent must be a leaf segment")
+            if (
+                segment.core_start < parent.context_start
+                or segment.core_end > parent.context_end
+            ):
+                raise ValueError("a verification passage must lie within its parent segment")
+            passage_ids.add(segment.segment_id)
 
         nodes = {node.node_id: node for node in self.tree_nodes}
         if len(nodes) != len(self.tree_nodes):
@@ -515,9 +708,9 @@ class _AuditArtifactBase(_AuditRecord):
             raise ValueError("root_node_id must resolve to a tree node")
 
         for node in self.tree_nodes:
-            unknown_covered = set(node.covered_segments) - set(segments)
+            unknown_covered = set(node.covered_segments) - (set(segments) - passage_ids)
             if unknown_covered:
-                raise ValueError("tree coverage must resolve to source segments")
+                raise ValueError("tree coverage must resolve to leaf source segments")
             grounding = getattr(node, "grounding", None)
             if isinstance(node, AuditNodeV4):
                 if len(node.children) > 1 and grounding is None:
@@ -574,6 +767,13 @@ class _AuditArtifactBase(_AuditRecord):
         ):
             raise ValueError("audit diagnostics must be closed identifiers")
         _verification_links_resolve(self.verification, set(segments))
+        if self.publication is not None:
+            _publication_links_resolve(
+                self.publication,
+                verification=self.verification,
+                warnings=self.warnings,
+                segment_ids=set(segments),
+            )
         return self
 
 
@@ -776,6 +976,30 @@ def _verification_links_resolve(
         raise ValueError("verification usage must resolve to a pass")
 
 
+def _publication_links_resolve(
+    publication: AuditPublication,
+    *,
+    verification: AuditVerification,
+    warnings: Sequence[str],
+    segment_ids: set[str],
+) -> None:
+    """Tie the publication to its verification outcome, warning, and sources."""
+    if verification.failed:
+        raise ValueError("a failed verification cannot record a publication")
+    for kind, code in PUBLICATION_WARNINGS.items():
+        if (code in warnings) != (publication.kind == kind):
+            raise ValueError("publication kind must match its audit warning")
+    for sentence in publication.sentences:
+        if (sentence.verdict == "unchecked") == verification.enabled:
+            raise ValueError("published sentence verdicts must match verification")
+        if any(evidence.segment_id not in segment_ids for evidence in sentence.evidence):
+            raise ValueError("sentence evidence must resolve to source segments")
+    if not verification.enabled and (
+        publication.kind != "editorial" or publication.removed_sentences
+    ):
+        raise ValueError("an unverified publication must be the unchanged editorial draft")
+
+
 @dataclass(frozen=True)
 class Citation:
     segment_id: str
@@ -862,7 +1086,7 @@ def render_citations(text: str, citations: Sequence[Citation]) -> str:
     return f"{text}\n\nSources: {identifiers}"
 
 
-def _audit_segment(segment: SourceSegment) -> AuditSegment:
+def _audit_segment(segment: SourceSegment, *, parent_segment_id: str | None) -> AuditSegment:
     return AuditSegment(
         segment_id=segment.segment_id,
         source_id=segment.source_id,
@@ -876,6 +1100,7 @@ def _audit_segment(segment: SourceSegment) -> AuditSegment:
         leading_overlap_tokens=segment.leading_overlap_tokens,
         trailing_overlap_tokens=segment.trailing_overlap_tokens,
         boundary_kind=segment.boundary_kind.value,
+        parent_segment_id=parent_segment_id,
     )
 
 
@@ -1356,11 +1581,18 @@ def build_audit_artifact(
     failures: Sequence[str] = (),
     verification: VerificationResult | None = None,
     verification_enabled: bool = False,
+    publication: AuditPublication | None = None,
+    segment_parents: Mapping[str, str] | None = None,
     reliability_cache: Mapping[str, Sequence[str]] | None = None,
     reliability_resume: Mapping[str, object] | None = None,
     reliability_attempts: Sequence[Mapping[str, object]] | None = None,
 ) -> AuditArtifactV2 | AuditArtifactV3 | AuditArtifactV4:
-    """Build a validated artifact without retaining source text or request data."""
+    """Build a validated artifact without retaining source text or request data.
+
+    Only `publication` holds reader-facing prose. `segment_parents` maps each
+    verification passage in `segments` to the leaf segment it lies in.
+    """
+    parents = segment_parents or {}
     # Determine if we have reliability metadata
     has_reliability = (
         reliability_cache is not None
@@ -1412,7 +1644,10 @@ def build_audit_artifact(
         "strategy": strategy,
         "model": redact_text(model),
         "configuration": _allowlisted_configuration(configuration),
-        "source_segments": tuple(_audit_segment(segment) for segment in segments),
+        "source_segments": tuple(
+            _audit_segment(segment, parent_segment_id=parents.get(segment.segment_id))
+            for segment in segments
+        ),
         "tree_nodes": tuple(
             _audit_node(node, include_grounding=uses_audit_v4) for node in nodes
         ),
@@ -1441,6 +1676,7 @@ def build_audit_artifact(
                 )
             ),
         ),
+        "publication": publication,
     }
     if uses_audit_v4:
         return AuditArtifactV4(

@@ -3,11 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 from pydantic import ValidationError
 
 from summarizer.providers.base import GenerationRequest, ModelProvider
-from summarizer.scheduler import BoundedScheduler, ScheduledWork
+from summarizer.runtime.items import ObservedItem, generate_observed, tree_node_id
+from summarizer.runtime.observers import RuntimeObserver, StageName, get_observer
+from summarizer.scheduler import BoundedScheduler, ScheduledResult, ScheduledWork
 from summarizer.segmentation import BoundaryKind, CacheCoordinator, SourceSegment
 from summarizer.summaries import (
     LEAF_SCHEMA_VERSION,
@@ -415,6 +418,50 @@ def derive_provenance(node: SummaryNode, *, source_order: Sequence[str]) -> tupl
     return tuple(identifier for identifier in source_order if identifier in referenced)
 
 
+@dataclass(frozen=True)
+class _PreparedLeaf:
+    """One segment's frozen request and the tree identity it reports under."""
+
+    segment: SourceSegment
+    request: GenerationRequest
+    item: ObservedItem
+
+    @property
+    def work_id(self) -> str:
+        return self.segment.segment_id
+
+    def cache_input(self) -> dict[str, object]:
+        return {
+            "instructions": self.request.instructions,
+            "input_text": self.request.input_text,
+            "schema": self.request.response_schema,
+            "max_output_tokens": self.request.max_output_tokens,
+        }
+
+    def decode(self, payload: object) -> SummaryNode:
+        node = SummaryNode.model_validate(payload)
+        validate_provenance(
+            node,
+            legal={self.segment.segment_id: core_text(self.segment)},
+            subject=self.segment.segment_id,
+        )
+        return node
+
+    def validate(self, payload: object) -> object:
+        return self.decode(payload).model_dump(mode="json")
+
+    def generate(
+        self, provider: ModelProvider, observer: RuntimeObserver
+    ) -> SummaryNode:
+        return generate_observed(
+            self.item,
+            provider,
+            self.request,
+            lambda result: parse_leaf_summary(result.text, segment=self.segment),
+            observer=observer,
+        )
+
+
 def summarize_segments(
     segments: Sequence[SourceSegment],
     provider: ModelProvider,
@@ -423,92 +470,152 @@ def summarize_segments(
     timeout_seconds: float,
     max_output_tokens: int | None = None,
     coordinator: CacheCoordinator | None = None,
+    observer: RuntimeObserver | None = None,
 ) -> tuple[SummaryNode, ...]:
     """Summarize every segment into a validated leaf record, in source order.
 
-    Fails on the first segment whose response cannot be validated. Nothing here
-    requires surviving a bad segment, provider failures are never converted
-    into output, and a half-populated hierarchy reaching the merge stage is
-    worse than a clear failure.
+    A response that fails validation is re-asked with the validator's reason,
+    up to twice. A segment still invalid after that fails the stage with
+    `ItemFailedError` naming its leaf, and nothing partial is returned: a
+    half-populated hierarchy reaching the merge stage is worse than a clear
+    failure. Provider failures are never converted into output and propagate
+    unchanged.
 
-    A schema violation is not retried. `ProviderResponseError` is deliberately
-    not transient, so the retry decorator will not re-ask, and a bounded
-    re-ask would be new machinery.
-
-    Returns an immutable sequence rather than a mapping, so per-segment
-    outcomes can be added later without changing the success path.
+    Each leaf reports to `observer` under the tree node identifier the
+    hierarchy gives it, `L0N0001` onwards in source order: `planned` for every
+    leaf up front, then `reused` for a checkpointed or cached result, or
+    `active`, `retrying`, and `completed` for a computed one. A stop request is
+    honoured between leaves.
     """
     if not segments:
         raise ValueError("summarization requires at least one segment")
 
-    nodes = []
-    if coordinator is not None and coordinator.session is not None:
-        prepared = []
-        for segment in sorted(segments, key=lambda candidate: candidate.order):
-            request = build_leaf_request(
+    runtime = get_observer(observer)
+    ordered = sorted(segments, key=lambda candidate: candidate.order)
+    leaves = tuple(
+        _PreparedLeaf(
+            segment=segment,
+            request=build_leaf_request(
                 segment,
                 model=model,
                 timeout_seconds=timeout_seconds,
                 max_output_tokens=max_output_tokens,
-            )
-            def decode(payload: object, segment: SourceSegment = segment) -> SummaryNode:
-                node = SummaryNode.model_validate(payload)
-                validate_provenance(node, legal={segment.segment_id: core_text(segment)}, subject=segment.segment_id)
-                return node
-            descriptor = coordinator.descriptor_for(stage="leaf", work_id=segment.segment_id, prompt_version=LEAF_PROMPT_VERSION, schema_version=LEAF_SCHEMA_VERSION, input_value={"instructions": request.instructions, "input_text": request.input_text, "schema": request.response_schema, "max_output_tokens": request.max_output_tokens}, behavior={})
-            prepared.append((segment, request, descriptor, decode))
-        hit_by_id = coordinator.reusable_batch(
-            work_ids=tuple(item[0].segment_id for item in prepared),
-            descriptors={item[0].segment_id: item[2] for item in prepared},
-            validators={
-                item[0].segment_id: (
-                    lambda payload, decode=item[3]: decode(payload).model_dump(
-                        mode="json"
-                    )
-                )
-                for item in prepared
-            },
+            ),
+            item=ObservedItem(
+                kind="leaf",
+                work_id=tree_node_id(0, order),
+                stage=StageName.SUMMARIZING,
+                level=0,
+                order=order,
+                total=len(ordered),
+                covered_segment_ids=(segment.segment_id,),
+            ),
         )
-        work = tuple(ScheduledWork(item[2], lambda request=item[1], segment=item[0]: parse_leaf_summary(provider.generate(request).text, segment=segment).model_dump(mode="json"), lambda payload, decode=item[3]: decode(payload).model_dump(mode="json")) for item in prepared if item[0].segment_id not in hit_by_id)
-        scheduled = BoundedScheduler(max_in_flight=coordinator.max_in_flight, cache=coordinator.store).run(work, coordinator.session)
-        values = {result.work_id: result.payload for result in scheduled} | hit_by_id
-        return tuple(item[3](values[item[0].segment_id]) for item in prepared)
-    for segment in sorted(segments, key=lambda candidate: candidate.order):
-        request = build_leaf_request(
-            segment,
-            model=model,
-            timeout_seconds=timeout_seconds,
-            max_output_tokens=max_output_tokens,
-        )
-        def decode(payload: object, segment: SourceSegment = segment) -> SummaryNode:
-            node = SummaryNode.model_validate(payload)
-            validate_provenance(
-                node, legal={segment.segment_id: core_text(segment)}, subject=segment.segment_id
-            )
-            return node
+        for order, segment in enumerate(ordered)
+    )
+    for leaf in leaves:
+        runtime.emit_item(leaf.item.event("planned"))
 
-        if coordinator is None:
-            result = provider.generate(request)
-            nodes.append(parse_leaf_summary(result.text, segment=segment))
-        else:
-            nodes.append(
-                coordinator.resolve(
-                    stage="leaf",
-                    work_id=segment.segment_id,
-                    prompt_version=LEAF_PROMPT_VERSION,
-                    schema_version=LEAF_SCHEMA_VERSION,
-                    input_value={
-                        "instructions": request.instructions,
-                        "input_text": request.input_text,
-                        "schema": request.response_schema,
-                        "max_output_tokens": request.max_output_tokens,
-                    },
-                    behavior={},
-                    decode=decode,
-                    encode=lambda node: node.model_dump(mode="json"),
-                    compute=lambda request=request, segment=segment: parse_leaf_summary(
-                        provider.generate(request).text, segment=segment
-                    ),
-                )
-            )
+    if coordinator is not None and coordinator.session is not None:
+        return _summarize_scheduled(leaves, provider, coordinator, runtime)
+    nodes = []
+    for leaf in leaves:
+        runtime.raise_if_stopped("during summarization")
+        nodes.append(_summarize_sequential(leaf, provider, coordinator, runtime))
     return tuple(nodes)
+
+
+def _summarize_scheduled(
+    leaves: tuple[_PreparedLeaf, ...],
+    provider: ModelProvider,
+    coordinator: CacheCoordinator,
+    observer: RuntimeObserver,
+) -> tuple[SummaryNode, ...]:
+    assert coordinator.session is not None
+    by_work_id = {leaf.work_id: leaf for leaf in leaves}
+    descriptors = {
+        leaf.work_id: coordinator.descriptor_for(
+            stage="leaf",
+            work_id=leaf.work_id,
+            prompt_version=LEAF_PROMPT_VERSION,
+            schema_version=LEAF_SCHEMA_VERSION,
+            input_value=leaf.cache_input(),
+            behavior={},
+        )
+        for leaf in leaves
+    }
+    hits = coordinator.reusable_batch(
+        work_ids=tuple(by_work_id),
+        descriptors=descriptors,
+        validators={leaf.work_id: leaf.validate for leaf in leaves},
+    )
+    for leaf in leaves:
+        if leaf.work_id in hits:
+            observer.emit_item(leaf.item.event("reused", summary=hits[leaf.work_id]))
+
+    def completed(result: ScheduledResult) -> None:
+        observer.emit_item(
+            by_work_id[result.work_id].item.event("completed", summary=result.payload)
+        )
+
+    scheduled = BoundedScheduler(
+        max_in_flight=coordinator.max_in_flight,
+        cache=coordinator.store,
+        should_stop=observer.should_stop,
+        on_complete=completed,
+    ).run(
+        tuple(
+            ScheduledWork(
+                descriptor=descriptors[leaf.work_id],
+                operation=lambda leaf=leaf: leaf.generate(provider, observer).model_dump(
+                    mode="json"
+                ),
+                validate=leaf.validate,
+            )
+            for leaf in leaves
+            if leaf.work_id not in hits
+        ),
+        coordinator.session,
+    )
+    values = {result.work_id: result.payload for result in scheduled} | hits
+    return tuple(leaf.decode(values[leaf.work_id]) for leaf in leaves)
+
+
+def _summarize_sequential(
+    leaf: _PreparedLeaf,
+    provider: ModelProvider,
+    coordinator: CacheCoordinator | None,
+    observer: RuntimeObserver,
+) -> SummaryNode:
+    if coordinator is None:
+        node = leaf.generate(provider, observer)
+        observer.emit_item(
+            leaf.item.event("completed", summary=node.model_dump(mode="json"))
+        )
+        return node
+
+    computed = False
+
+    def compute() -> SummaryNode:
+        nonlocal computed
+        computed = True
+        return leaf.generate(provider, observer)
+
+    node = coordinator.resolve(
+        stage="leaf",
+        work_id=leaf.work_id,
+        prompt_version=LEAF_PROMPT_VERSION,
+        schema_version=LEAF_SCHEMA_VERSION,
+        input_value=leaf.cache_input(),
+        behavior={},
+        decode=leaf.decode,
+        encode=lambda value: value.model_dump(mode="json"),
+        compute=compute,
+    )
+    observer.emit_item(
+        leaf.item.event(
+            "completed" if computed else "reused",
+            summary=node.model_dump(mode="json"),
+        )
+    )
+    return node

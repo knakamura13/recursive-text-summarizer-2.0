@@ -5,6 +5,8 @@ import json
 from summarizer.ingestion import SourceDocument
 from summarizer.leaf import LEAF_PROMPT_VERSION, build_leaf_request, parse_leaf_summary
 from summarizer.providers.base import ModelProvider
+from summarizer.runtime.items import ObservedItem, generate_observed, tree_node_id
+from summarizer.runtime.observers import RuntimeObserver, StageName, get_observer
 from summarizer.segmentation import BoundaryKind, CacheCoordinator, SourceSegment
 from summarizer.summaries import LEAF_SCHEMA_VERSION, SummaryNode
 from summarizer.tokenization import TokenCounter
@@ -16,6 +18,9 @@ from summarizer.tokenization import TokenCounter
 # meanings would be unrecoverable downstream, exactly where later stages need
 # to trace a root back to source.
 DOCUMENT_SEGMENT_ID = "D000001"
+
+# The one tree node a direct run produces: its leaf is also its root.
+DIRECT_NODE_ID = tree_node_id(0, 0)
 
 
 def whole_document_segment(
@@ -62,6 +67,7 @@ def summarize_direct(
     timeout_seconds: float,
     max_output_tokens: int | None = None,
     coordinator: CacheCoordinator | None = None,
+    observer: RuntimeObserver | None = None,
 ) -> SummaryNode:
     """Summarize a whole document in a single call.
 
@@ -69,7 +75,11 @@ def summarize_direct(
     direct result is the same record the rest of the hierarchy consumes. The
     caller is responsible for having established that the document fits; this
     function does not re-check the budget.
+
+    Invalid output is re-asked like a leaf's, and the call reports to
+    `observer` as the leaf `DIRECT_NODE_ID` covering `DOCUMENT_SEGMENT_ID`.
     """
+    runtime = get_observer(observer)
     segment = whole_document_segment(document, counter)
     request = build_leaf_request(
         segment,
@@ -77,15 +87,46 @@ def summarize_direct(
         timeout_seconds=timeout_seconds,
         max_output_tokens=max_output_tokens,
     )
+    item = ObservedItem(
+        kind="leaf",
+        work_id=DIRECT_NODE_ID,
+        stage=StageName.SUMMARIZING,
+        level=0,
+        order=0,
+        total=1,
+        covered_segment_ids=(DOCUMENT_SEGMENT_ID,),
+    )
+    runtime.emit_item(item.event("planned"))
+    runtime.raise_if_stopped("before summarizing the document")
+
+    def generate() -> SummaryNode:
+        return generate_observed(
+            item,
+            provider,
+            request,
+            lambda result: parse_leaf_summary(result.text, segment=segment),
+            observer=runtime,
+        )
+
     if coordinator is None:
-        result = provider.generate(request)
-        return parse_leaf_summary(result.text, segment=segment)
+        node = generate()
+        runtime.emit_item(
+            item.event("completed", summary=node.model_dump(mode="json"))
+        )
+        return node
 
     def decode(payload: object) -> SummaryNode:
         node = SummaryNode.model_validate(payload)
         return parse_leaf_summary(json.dumps(node.model_dump(mode="json")), segment=segment)
 
-    return coordinator.resolve(
+    computed = False
+
+    def compute() -> SummaryNode:
+        nonlocal computed
+        computed = True
+        return generate()
+
+    node = coordinator.resolve(
         stage="direct",
         work_id=DOCUMENT_SEGMENT_ID,
         prompt_version=LEAF_PROMPT_VERSION,
@@ -98,6 +139,13 @@ def summarize_direct(
         },
         behavior={},
         decode=decode,
-        encode=lambda node: node.model_dump(mode="json"),
-        compute=lambda: parse_leaf_summary(provider.generate(request).text, segment=segment),
+        encode=lambda value: value.model_dump(mode="json"),
+        compute=compute,
     )
+    runtime.emit_item(
+        item.event(
+            "completed" if computed else "reused",
+            summary=node.model_dump(mode="json"),
+        )
+    )
+    return node

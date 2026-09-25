@@ -1,26 +1,27 @@
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi import APIRouter
+from fastapi.responses import Response
 
-from summarizer_web.config import load_paths
-from summarizer_web.db.connection import get_database
+from summarizer_web.models.api import ErrorResponse
+from summarizer_web.services.run_views_service import ExportFormat, export_summary
 
 router = APIRouter(prefix="/runs", tags=["exports"])
 
 
-@router.get("/{run_id}/export/{format}")
-def export_run(run_id: str, format: str):
-    row = get_database().fetchone("SELECT state FROM runs WHERE run_id = ?", (run_id,))
-    if row is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    run_dir = load_paths().runs / run_id
-    if format == "text":
-        path = run_dir / "summary.txt"
-        if not path.exists():
-            raise HTTPException(status_code=404, detail="Summary not available")
-        return PlainTextResponse(path.read_text(encoding="utf-8"))
-    if format == "audit-json":
-        path = run_dir / "audit.json"
-        if not path.exists():
-            raise HTTPException(status_code=404, detail="Audit not available")
-        return FileResponse(path, media_type="application/json")
-    raise HTTPException(status_code=400, detail="Unsupported export format")
+@router.get(
+    "/{run_id}/export/{export_format}",
+    response_class=Response,
+    responses={
+        200: {
+            "content": {"text/plain": {}, "text/markdown": {}, "application/json": {}},
+            "description": "The summary (txt, md) or its audit (json) as an attachment.",
+        },
+        404: {"model": ErrorResponse, "description": "run_not_found or export_unavailable"},
+    },
+)
+def export_run(run_id: str, export_format: ExportFormat) -> Response:
+    export = export_summary(run_id, export_format)
+    return Response(
+        content=export.content,
+        media_type=export.media_type,
+        headers={"Content-Disposition": export.content_disposition},
+    )

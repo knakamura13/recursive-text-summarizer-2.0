@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import pytest
 
 from summarizer.budget import BudgetError
-from summarizer.grounding import GroundingPolicy, select_source_passages
+from summarizer.grounding import GroundingPolicy, select_source_passages, serialize_source_passage
 from summarizer.summaries import SummaryNode
 
 
@@ -202,4 +202,82 @@ def test_empty_selection_reports_reserve_and_smallest_candidate() -> None:
             source=source,
             counter=CharacterCounter(),
             policy=GroundingPolicy(max_tokens=10),
+        )
+
+
+def _quoting_child(segment_id: str, quote: str) -> SummaryNode:
+    return SummaryNode.model_validate(
+        {
+            "summary": "A child quoting its source.",
+            "content_units": [
+                {
+                    "text": "A claim.",
+                    "kind": "claim",
+                    "evidence": [{"segment_id": segment_id, "quote": quote}],
+                    "qualification": None,
+                    "uncertain": False,
+                }
+            ],
+            "entities": [],
+            "qualifications": [],
+            "contradictions": [],
+            "quotations": [],
+            "provenance": [segment_id],
+            "level": 0,
+        }
+    )
+
+
+LONG_CORE = " ".join(f"word{index}" for index in range(600)) + " the cited sentence " + " ".join(
+    f"tail{index}" for index in range(600)
+)
+
+
+def test_excerpt_keeps_the_cited_quote_when_no_whole_passage_fits() -> None:
+    selection = select_source_passages(
+        (_quoting_child("S000001", "the cited sentence"),),
+        source={"S000001": LONG_CORE},
+        counter=CharacterCounter(),
+        policy=GroundingPolicy(max_tokens=1_500),
+        allow_excerpts=True,
+    )
+
+    (passage,) = selection.passages
+    assert selection.selected_ids == ("S000001",)
+    assert "the cited sentence" in passage.text
+    assert passage.text in LONG_CORE
+    assert CharacterCounter().count(serialize_source_passage(passage)) <= 1_500
+    assert not passage.text.startswith(" ") and not passage.text.endswith(" ")
+
+
+def test_whole_passages_are_used_when_they_fit_even_with_excerpts_allowed() -> None:
+    selection = select_source_passages(
+        (_quoting_child("S000001", "the cited sentence"),),
+        source={"S000001": LONG_CORE},
+        counter=CharacterCounter(),
+        policy=GroundingPolicy(max_tokens=100_000),
+        allow_excerpts=True,
+    )
+
+    assert selection.passages[0].text == LONG_CORE
+
+
+def test_excerpts_are_off_unless_allowed() -> None:
+    with pytest.raises(BudgetError, match="cannot hold source passage S000001"):
+        select_source_passages(
+            (_quoting_child("S000001", "the cited sentence"),),
+            source={"S000001": LONG_CORE},
+            counter=CharacterCounter(),
+            policy=GroundingPolicy(max_tokens=1_500),
+        )
+
+
+def test_excerpt_still_fails_when_even_the_shortest_does_not_fit() -> None:
+    with pytest.raises(BudgetError, match="cannot hold source passage S000001"):
+        select_source_passages(
+            (_quoting_child("S000001", "the cited sentence"),),
+            source={"S000001": LONG_CORE},
+            counter=CharacterCounter(),
+            policy=GroundingPolicy(max_tokens=200),
+            allow_excerpts=True,
         )
