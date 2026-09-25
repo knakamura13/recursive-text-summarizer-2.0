@@ -48,7 +48,6 @@ from summarizer.checkpoint import (
     RunManifest,
 )
 from summarizer.compression import (
-    prepend_document_lead,
     compress_to_target,
     word_count,
     _above_ceiling,
@@ -495,10 +494,7 @@ def _prepare_root_for_editorial(
         target_words=target_words,
         coordinator=coordinator,
     )
-    summary_text = compressed.text
-    if summary_text != root.summary.strip():
-        summary_text = prepend_document_lead(summary_text, source_text)
-    return root.model_copy(update={"summary": summary_text}), compressed.generations
+    return root.model_copy(update={"summary": compressed.text}), compressed.generations
 
 
 def _verified_content_unit_draft(

@@ -13,7 +13,7 @@ from summarizer.leaf import _describe, _extract_json_object, _sanitize
 from summarizer.providers.base import GenerationRequest, GenerationResult, ModelProvider
 from summarizer.safety import redact_text
 from summarizer.segmentation import CacheCoordinator
-from summarizer.text import chunk_text_by_sentences
+from summarizer.text import chunk_text_by_sentences, default_sentence_tokenizer
 
 COMPRESSION_PROMPT_VERSION = "compression-prompt/1"
 COMPRESSION_SCHEMA_NAME = "compression_draft"
@@ -48,43 +48,44 @@ def word_count(text: str) -> int:
     return len(text.split())
 
 
-_OPENING_HEADCOUNT = re.compile(
-    r"\b\d+\s+(?:skiers|snowboarders|people|passengers|victims|deaths|fatalities)\b",
-    flags=re.IGNORECASE,
+_PROPER_NAME = re.compile(
+    r"(?:[A-Z][a-z]+(?:['-][A-Za-z]+)?)"
+    r"(?:\s+(?:[A-Z][a-z]+(?:['-][A-Za-z]+)?))+"
 )
-_OPENING_SCALE = re.compile(r"\b(?:first|only)\s+of\s+\d", flags=re.IGNORECASE)
+_NUMBER = re.compile(r"\d[\d,]*")
 
 
-def prepend_document_lead(
-    body: str,
-    source_text: str,
-    *,
-    max_sentences: int = 2,
-) -> str:
-    """Keep the document's opening headcount when compression dropped it."""
-    from summarizer.text import default_sentence_tokenizer
+def _literal_tokens(sentence: str) -> tuple[str, ...]:
+    return tuple(_PROPER_NAME.findall(sentence)) + tuple(_NUMBER.findall(sentence))
 
-    body_stripped = body.strip()
-    if not body_stripped or not source_text.strip():
-        return body_stripped
-    sentences = default_sentence_tokenizer(source_text.strip())
-    lead_parts = [
-        sentence.strip()
-        for sentence in sentences[:max_sentences]
-        if sentence.strip()
-    ]
-    if not lead_parts:
-        return body_stripped
-    lead = " ".join(lead_parts)
-    if lead.casefold() in body_stripped.casefold():
-        return body_stripped
-    if not (
-        _OPENING_HEADCOUNT.search(lead)
-        or _OPENING_SCALE.search(lead)
-        or re.search(r"\b\d{2,}\b", lead)
-    ):
-        return body_stripped
-    return f"{lead}\n\n{body_stripped}"
+
+def _literal_kept(literal: str, compressed: str) -> bool:
+    if literal[:1].isdigit():
+        return re.search(rf"(?<!\d){re.escape(literal)}(?!\d)", compressed) is not None
+    return literal.casefold() in compressed.casefold()
+
+
+def retain_sentences_with_missing_literals(source_chunk: str, compressed: str) -> str:
+    """Put back source sentences whose names or numbers the shortened text dropped.
+
+    Applies to every sentence in the chunk. Sentences with neither a number nor
+    a multi-word name may be omitted.
+    """
+    shortened = compressed.strip()
+    if not shortened:
+        return source_chunk.strip()
+    shortened_cf = shortened.casefold()
+    restored: list[str] = []
+    for sentence in default_sentence_tokenizer(source_chunk):
+        text = sentence.strip()
+        if not text or text.casefold() in shortened_cf:
+            continue
+        literals = _literal_tokens(text)
+        if literals and any(not _literal_kept(literal, shortened) for literal in literals):
+            restored.append(text)
+    if not restored:
+        return shortened
+    return f"{shortened}\n\n{' '.join(restored)}"
 
 
 def _band(target_words: int) -> tuple[float, float]:
@@ -235,7 +236,7 @@ def _compress_chunk(
             encode=lambda value: {"text": value},
             compute=compute,
         )
-    return text, generation
+    return retain_sentences_with_missing_literals(chunk, text), generation
 
 
 def _compress_pass(
