@@ -327,7 +327,7 @@ class AuditVerificationSelection(_AuditRecord):
     token_cost: int
     retrieval_method: Literal[
         "lexical-overlap/1",
-        "lexical-overlap-required/2",
+        "lexical-overlap-required/3",
         "lexical-overlap/1-escalation",
         "lexical-overlap/1-escalated",
     ]

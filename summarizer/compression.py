@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
@@ -45,6 +46,45 @@ def compression_draft_schema() -> dict[str, object]:
 
 def word_count(text: str) -> int:
     return len(text.split())
+
+
+_OPENING_HEADCOUNT = re.compile(
+    r"\b\d+\s+(?:skiers|snowboarders|people|passengers|victims|deaths|fatalities)\b",
+    flags=re.IGNORECASE,
+)
+_OPENING_SCALE = re.compile(r"\b(?:first|only)\s+of\s+\d", flags=re.IGNORECASE)
+
+
+def prepend_document_lead(
+    body: str,
+    source_text: str,
+    *,
+    max_sentences: int = 2,
+) -> str:
+    """Keep the document's opening headcount when compression dropped it."""
+    from summarizer.text import default_sentence_tokenizer
+
+    body_stripped = body.strip()
+    if not body_stripped or not source_text.strip():
+        return body_stripped
+    sentences = default_sentence_tokenizer(source_text.strip())
+    lead_parts = [
+        sentence.strip()
+        for sentence in sentences[:max_sentences]
+        if sentence.strip()
+    ]
+    if not lead_parts:
+        return body_stripped
+    lead = " ".join(lead_parts)
+    if lead.casefold() in body_stripped.casefold():
+        return body_stripped
+    if not (
+        _OPENING_HEADCOUNT.search(lead)
+        or _OPENING_SCALE.search(lead)
+        or re.search(r"\b\d{2,}\b", lead)
+    ):
+        return body_stripped
+    return f"{lead}\n\n{body_stripped}"
 
 
 def _band(target_words: int) -> tuple[float, float]:

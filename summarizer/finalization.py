@@ -48,6 +48,7 @@ from summarizer.checkpoint import (
     RunManifest,
 )
 from summarizer.compression import (
+    prepend_document_lead,
     compress_to_target,
     word_count,
     _above_ceiling,
@@ -494,7 +495,10 @@ def _prepare_root_for_editorial(
         target_words=target_words,
         coordinator=coordinator,
     )
-    return root.model_copy(update={"summary": compressed.text}), compressed.generations
+    summary_text = compressed.text
+    if summary_text != root.summary.strip():
+        summary_text = prepend_document_lead(summary_text, source_text)
+    return root.model_copy(update={"summary": summary_text}), compressed.generations
 
 
 def _verified_content_unit_draft(
@@ -762,14 +766,28 @@ def _sentence_failure(
 class _SentenceLedger:
     """Every sentence verification saw, with the latest reason it failed."""
 
-    def __init__(self) -> None:
+    def __init__(self, source_index: SourceLexicalIndex) -> None:
+        self._source_index = source_index
         self._seen: dict[str, None] = {}
         self._failed: dict[str, tuple[str, str]] = {}
 
     def record(self, result: VerificationResult) -> None:
         for passed in result.pass_results:
+            bundles_by_claim = {
+                bundle.selection.claim_id: bundle for bundle in passed.bundles
+            }
+            claims_by_id = {claim.claim_id: claim for claim in passed.claims}
             verdicts = {
-                assessment.claim_id: assessment.verdict
+                assessment.claim_id: (
+                    _effective_claim_verdict(
+                        claims_by_id[assessment.claim_id],
+                        assessment.verdict,
+                        bundles_by_claim,
+                        self._source_index,
+                    )
+                    if assessment.claim_id in claims_by_id
+                    else assessment.verdict
+                )
                 for assessment in passed.assessments
             }
             claims_by_span: dict[str, list[Claim]] = {}
@@ -1135,7 +1153,7 @@ def _verify_publication(
     progress: VerificationProgress,
 ) -> _VerifiedPublication:
     """Verify the editorial draft once, else publish its passing sentences."""
-    ledger = _SentenceLedger()
+    ledger = _SentenceLedger(source_index)
     progress.phase("Checking the editorial draft")
     result = verify_and_repair(
         draft,

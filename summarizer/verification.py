@@ -571,18 +571,53 @@ _PROPER_NAME = re.compile(
     r"(?:[A-Z][a-z]+(?:['-][A-Za-z]+)?)"
     r"(?:\s+(?:[A-Z][a-z]+(?:['-][A-Za-z]+)?))+"
 )
-_NUMBER = re.compile(r"\d+")
-_EVIDENCE_RETRIEVAL_METHOD = "lexical-overlap-required/2"
+_WARD_OR_DISTRICT = re.compile(
+    r"\b(?:Ward|District)\s+\d+\b",
+    flags=re.IGNORECASE,
+)
+_SIGNIFICANT_NUMBER = re.compile(
+    r"\b\d{2,}\b|\b\d{1,3}(?:,\d{3})+\b"
+)
+_EVIDENCE_RETRIEVAL_METHOD = "lexical-overlap-required/3"
+
+
+def _claim_literal_tokens(claim: Claim) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Proper names, ward/district labels, and non-ambiguous numbers from the anchor."""
+    names = tuple(_PROPER_NAME.findall(claim.anchor))
+    wards = tuple(match.group() for match in _WARD_OR_DISTRICT.finditer(claim.anchor))
+    numbers = tuple(match.group() for match in _SIGNIFICANT_NUMBER.finditer(claim.anchor))
+    return names, wards, numbers
 
 
 def _literal_hits_claim(claim: Claim, entry_text: str) -> bool:
-    for number in _NUMBER.findall(claim.anchor):
-        if number in entry_text:
-            return True
-    for name in _PROPER_NAME.findall(claim.anchor):
-        if name in entry_text:
-            return True
+    names, wards, numbers = _claim_literal_tokens(claim)
+    entry_cf = entry_text.casefold()
+    if names and all(name.casefold() in entry_cf for name in names):
+        return True
+    if wards and any(ward.casefold() in entry_cf for ward in wards):
+        return True
+    if numbers and any(number in entry_text for number in numbers):
+        return True
     return False
+
+
+def _claim_literals_in_evidence(claim: Claim, bundle: EvidenceBundle) -> bool:
+    """True when packed evidence contains the anchor's names and ward/number literals."""
+    combined = "\n".join(passage.text for passage in bundle.passages)
+    if not combined.strip():
+        return False
+    combined_cf = combined.casefold()
+    names, wards, numbers = _claim_literal_tokens(claim)
+    if len(names) >= 2:
+        if not all(name.casefold() in combined_cf for name in names):
+            return False
+    elif len(names) == 1 and names[0].casefold() not in combined_cf:
+        return False
+    if wards and not all(ward.casefold() in combined_cf for ward in wards):
+        return False
+    if numbers and not all(number in combined for number in numbers):
+        return False
+    return bool(names or wards or numbers)
 
 
 def required_segment_ids(
@@ -602,9 +637,15 @@ def claim_drop_blocked_by_omitted_required(
     source_index: SourceLexicalIndex,
     verdict: ClaimVerdict,
 ) -> bool:
-    """A negative verdict must not drop a sentence when required text was omitted."""
+    """Do not drop on a negative verdict when evidence was incomplete or literally on-point."""
     if verdict is ClaimVerdict.SUPPORTED:
         return False
+    if verdict is ClaimVerdict.CONTRADICTED:
+        return False
+    if verdict is ClaimVerdict.INSUFFICIENTLY_SUPPORTED and _claim_literals_in_evidence(
+        claim, bundle
+    ):
+        return True
     required = required_segment_ids(claim, source_index)
     if not required:
         return False
@@ -1956,7 +1997,7 @@ def _source_index_cache_identity(source_index: SourceLexicalIndex) -> dict[str, 
             for entry in source_index.entries
         ],
         "retrieval": {
-            "algorithm": "lexical-overlap-required/2",
+            "algorithm": "lexical-overlap-required/3",
             "term_normalization": "unicode-nfc-casefold/1",
             "passage_unit": "source-core/1",
         },
