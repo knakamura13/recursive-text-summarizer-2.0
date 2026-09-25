@@ -424,6 +424,9 @@ def build_hierarchy(
                             adaptive_grounding=adaptive_grounding,
                             coordinator=coordinator,
                             provider_schema_reserve=provider_schema_reserve,
+                            # A narrower fanout grounds on whole passages;
+                            # excerpts only when no narrower fanout exists.
+                            allow_excerpts=adaptive_grounding and fanout <= 2,
                         )
                     )
             except BudgetError:
@@ -592,6 +595,7 @@ def _prepare_merge(
     coordinator: CacheCoordinator | None,
     adaptive_grounding: bool,
     provider_schema_reserve: int,
+    allow_excerpts: bool = False,
 ) -> _PreparedMerge:
     node_id = tree_node_id(level, order)
     # A union in document order: deduplicated, first occurrence wins. Three
@@ -651,6 +655,7 @@ def _prepare_merge(
         counter=counter,
         policy=grounding_policy,
         selection_cost=selection_cost,
+        allow_excerpts=allow_excerpts,
     )
     grounded = {passage.segment_id: passage.text for passage in selection.passages}
     preserved_provenance = tuple(
