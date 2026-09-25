@@ -172,6 +172,10 @@ class ScriptedProvider:
         operation = request.operation_id or ""
         if operation == "editorial-final":
             payload: dict[str, object] = {"text": "The harbor moved record cargo this year."}
+        elif operation.startswith("compression:"):
+            from tests.support.compression_provider import compression_generation_payload
+
+            payload = compression_generation_payload(request)
         elif operation.startswith(("S", "D")):
             payload = summary_payload(0, [operation])
         else:

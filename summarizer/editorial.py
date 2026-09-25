@@ -23,14 +23,16 @@ from summarizer.safety import redact_text
 from summarizer.segmentation import CacheCoordinator
 from summarizer.summaries import SummaryNode
 
-EDITORIAL_PROMPT_VERSION = "editorial-prompt/2"
+EDITORIAL_PROMPT_VERSION = "editorial-prompt/3"
 EDITORIAL_SCHEMA_NAME = "final_editorial_draft"
 EDITORIAL_WORK_ID = "editorial-final"
 
 _INSTRUCTIONS = """\
 Write one standalone final summary from the grounded summary record supplied as
-data. Aim for about {target_words} words, using clear organization, consistent
-terminology, and minimal repetition.
+data. The record's summary field is already near the intended length of about
+{target_words} words. Polish it for clear organization, consistent terminology,
+and minimal repetition without shortening it materially. Stay within about ten
+percent of the summary field's word count.
 
 Return one JSON object conforming to the supplied schema, and nothing else.
 

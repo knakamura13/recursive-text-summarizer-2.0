@@ -9,6 +9,7 @@ from summarizer.ingestion import ingest_text
 from summarizer.pipeline import PipelineConfig, run_pipeline
 from summarizer.providers.base import ModelProvider, GenerationRequest, GenerationResult
 from summarizer.tokenization import resolve_token_counter
+from tests.support.compression_provider import compression_generation_payload
 
 
 def payload(**overrides: object) -> str:
@@ -37,6 +38,15 @@ class HostSensitiveProvider(ModelProvider):
             # Return proper FinalDraft format
             return GenerationResult(
                 text=json.dumps({"text": f"ANSWER-FROM-{self._host}"}),
+                provider="fake",
+                model=request.model,
+                input_tokens=10,
+                output_tokens=10,
+                finish_status="stop",
+            )
+        if (request.operation_id or "").startswith("compression:"):
+            return GenerationResult(
+                text=json.dumps(compression_generation_payload(request)),
                 provider="fake",
                 model=request.model,
                 input_tokens=10,

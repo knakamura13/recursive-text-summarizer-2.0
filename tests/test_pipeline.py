@@ -15,6 +15,7 @@ from summarizer.segmentation import SegmentationConfig
 from summarizer.summaries import MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
 from summarizer.tokenization import TiktokenCounter, resolve_token_counter
 from summarizer.verification import VerificationConfig
+from tests.support.compression_provider import compression_generation_payload
 
 
 class CharacterCounter:
@@ -34,6 +35,8 @@ class PipelineProvider:
         self.requests.append(request)
         if request.operation_id == "editorial-final":
             payload = {"text": "A concise, coherent final summary."}
+        elif (request.operation_id or "").startswith("compression:"):
+            payload = compression_generation_payload(request)
         elif request.operation_id == "D000001":
             payload = self._node(0, "D000001")
         elif (request.operation_id or "").startswith("S"):
@@ -65,6 +68,8 @@ class GroundedPipelineProvider(PipelineProvider):
         self.requests.append(request)
         if request.operation_id == "editorial-final":
             payload = {"text": "A concise, coherent final summary."}
+        elif (request.operation_id or "").startswith("compression:"):
+            payload = compression_generation_payload(request)
         elif request.operation_id == "D000001":
             payload = self._node(0, "D000001")
         elif (request.operation_id or "").startswith("S"):

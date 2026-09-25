@@ -6,7 +6,8 @@ import pytest
 from summarizer.direct import whole_document_segment
 from summarizer.finalization import (
     FinalizationVerificationError,
-    _drop_failing_sentences,
+    _subset_from_first_pass,
+    _verify_publication,
     _verified_content_unit_draft,
     finalize_summary,
 )
@@ -15,7 +16,11 @@ from summarizer.ingestion import ingest_text
 from summarizer.providers.base import GenerationResult
 from summarizer.summaries import SummaryNode
 from summarizer.tokenization import ConservativeUtf8TokenCounter
-from summarizer.verification import ClaimVerdict, VerificationConfig
+from summarizer.verification import (
+    ClaimVerdict,
+    VerificationConfig,
+    build_source_lexical_index,
+)
 
 
 class ScriptedProvider:
@@ -87,7 +92,7 @@ def test_finalize_summary_resolves_verification_runtime_without_injection() -> N
     ]
 
 
-def test_failed_editorial_uses_only_reverified_content_units(tmp_path) -> None:
+def test_failed_editorial_without_passing_sentences_stays_unpublished(tmp_path) -> None:
     class FallbackProvider:
         def __init__(self) -> None:
             self.requests = []
@@ -131,34 +136,23 @@ def test_failed_editorial_uses_only_reverified_content_units(tmp_path) -> None:
     root = TreeNode("L0N0001", 0, 0, summary, (), (segment.segment_id,))
     provider = FallbackProvider()
 
-    result = finalize_summary(
-        summary, provider,
-        source_id=document.source_id,
-        model="test-model",
-        timeout_seconds=30,
-        target_words=20,
-        strategy="direct",
-        segments=(segment,),
-        nodes=(root,),
-        root_node_id=root.node_id,
-        audit_path=tmp_path / "audit.json",
-        counter=counter,
-        source_cores={segment.segment_id: segment.text},
-        verification=VerificationConfig(enabled=True),
-        verification_context_window_tokens=10_000,
-    )
-
-    assert result.text == "The source fact is correct."
-    assert result.audit is not None
-    assert "verified_content_unit_fallback" in result.audit.warnings
-    assert result.audit.publication is not None
-    publication = result.audit.publication
-    assert publication.kind == "content_unit_fallback"
-    assert [
-        (removed.text, removed.verdict) for removed in publication.removed_sentences
-    ] == [("An unsupported outcome occurred.", "insufficiently_supported")]
-    assert publication.sentences[0].evidence[0].quote == "source fact"
-    assert len(provider.requests) == 7  # editorial, then three two-call checks
+    with pytest.raises(FinalizationVerificationError):
+        finalize_summary(
+            summary, provider,
+            source_id=document.source_id,
+            model="test-model",
+            timeout_seconds=30,
+            target_words=5,
+            strategy="direct",
+            segments=(segment,),
+            nodes=(root,),
+            root_node_id=root.node_id,
+            audit_path=tmp_path / "audit.json",
+            counter=counter,
+            source_cores={segment.segment_id: segment.text},
+            verification=VerificationConfig(enabled=True),
+            verification_context_window_tokens=10_000,
+        )
 
 
 def test_failed_editorial_without_supported_units_stays_unpublished(tmp_path) -> None:
@@ -195,7 +189,7 @@ def test_failed_editorial_without_supported_units_stays_unpublished(tmp_path) ->
             source_id=document.source_id,
             model="test-model",
             timeout_seconds=30,
-            target_words=20,
+            target_words=1,
             strategy="direct",
             segments=(segment,),
             nodes=(root,),
@@ -210,7 +204,7 @@ def test_failed_editorial_without_supported_units_stays_unpublished(tmp_path) ->
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
     assert "publication" not in audit
     assert audit["verification"]["failed"] is True
-    assert audit["warnings"] == ["verified_content_unit_fallback_failed"]
+    assert audit["warnings"] == []
     assert audit["citations"] == []
 
 
@@ -678,66 +672,65 @@ def _failed_draft(text: str, sentences: tuple[tuple[str, tuple[ClaimVerdict, ...
                 spans=tuple(spans),
                 claims=tuple(claims),
                 assessments=tuple(assessments),
+                bundles=(),
             ),
         ),
     )
 
 
-def test_recheck_publishes_sentences_that_still_pass() -> None:
+def test_subset_publishes_passing_sentences_without_second_verification() -> None:
     draft = "Keep this sentence. Drop this sentence."
-    checked = []
+    index = build_source_lexical_index(
+        provenance_ids=("D000001",), source={"D000001": "source"}
+    )
+    result = _subset_from_first_pass(
+        _failed_draft(
+            draft,
+            (
+                ("Keep this sentence.", (ClaimVerdict.SUPPORTED, ClaimVerdict.SUPPORTED)),
+                ("Drop this sentence.", (ClaimVerdict.INSUFFICIENTLY_SUPPORTED,)),
+            ),
+        ),
+        source_index=index,
+    )
 
-    def verify(text: str):
-        checked.append(text)
-        if text == draft:
-            return _failed_draft(
-                draft,
-                (
-                    ("Keep this sentence.", (ClaimVerdict.SUPPORTED, ClaimVerdict.SUPPORTED)),
-                    ("Drop this sentence.", (ClaimVerdict.INSUFFICIENTLY_SUPPORTED,)),
-                ),
-            )
-        return SimpleNamespace(failed=False, text=text, pass_results=())
-
-    result = _drop_failing_sentences(verify(draft), verify=verify)
-
+    assert result is not None
     assert result.failed is False
     assert result.text == "Keep this sentence."
-    assert checked == [draft, "Keep this sentence."]
 
 
-def test_recheck_stops_when_every_sentence_fails() -> None:
+def test_subset_returns_none_when_every_sentence_fails() -> None:
     draft = "First failure. Second failure."
-    checked = []
-
-    def verify(text: str):
-        checked.append(text)
-        return _failed_draft(
-            text,
+    index = build_source_lexical_index(
+        provenance_ids=("D000001",), source={"D000001": "source"}
+    )
+    result = _subset_from_first_pass(
+        _failed_draft(
+            draft,
             (
                 ("First failure.", (ClaimVerdict.SUPPORTED, ClaimVerdict.INSUFFICIENTLY_SUPPORTED)),
                 ("Second failure.", (ClaimVerdict.CONTRADICTED,)),
             ),
-        )
+        ),
+        source_index=index,
+    )
 
-    result = _drop_failing_sentences(verify(draft), verify=verify)
-
-    assert result.failed is True
-    assert checked == [draft]
+    assert result is None
 
 
-def test_recheck_does_not_salvage_a_contract_failure() -> None:
-    checked = []
-
-    def verify(text: str):
-        checked.append(text)
-        return SimpleNamespace(
+def test_subset_does_not_salvage_a_contract_failure() -> None:
+    index = build_source_lexical_index(
+        provenance_ids=("D000001",), source={"D000001": "source"}
+    )
+    result = _subset_from_first_pass(
+        SimpleNamespace(
             failed=True,
-            text=text,
-            pass_results=(SimpleNamespace(failed=True, spans=(), claims=(), assessments=()),),
-        )
+            text="Keep this sentence.",
+            pass_results=(
+                SimpleNamespace(failed=True, spans=(), claims=(), assessments=(), bundles=()),
+            ),
+        ),
+        source_index=index,
+    )
 
-    result = _drop_failing_sentences(verify("Keep this sentence."), verify=verify)
-
-    assert result.failed is True
-    assert checked == ["Keep this sentence."]
+    assert result is None
