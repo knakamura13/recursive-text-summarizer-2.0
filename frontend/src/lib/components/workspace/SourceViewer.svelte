@@ -24,9 +24,11 @@
 	// is replaced by measured pixels per character as soon as a chunk renders.
 	const LINE_HEIGHT = 24;
 	const AVERAGE_CHAR_WIDTH = 7.4;
-	const PADDING_X = 32;
+	const PADDING_X = 48;
 	/** At most three 16 K chunks are in the DOM at once. */
 	const MAX_CHUNKS = 3;
+	/** Room above a jump target for its "Page N" marker (see .page-marker). */
+	const TOP_INSET = 44;
 
 	type Jump = { offset: number; align: 'top' | 'reading' };
 	type Rendered = { index: number; height: number; pieces: ChunkPiece[] | null; error: unknown };
@@ -88,9 +90,25 @@
 	const position = $derived.by(() => {
 		void layoutVersion;
 		if (!layout || !total) return null;
-		const offset = layout.offsetAt(scrollTop + 1);
-		return { offset, percent: Math.min(100, Math.round((offset / total) * 100)), page: pageAtOffset(pages, offset) };
+		void rendered;
+		const offset = layout.offsetAt(scrollTop + TOP_INSET);
+		const marked = pageAtTop();
+		const page = (marked !== null && pages.find((item) => item.page === marked)) || pageAtOffset(pages, offset);
+		return { offset, percent: Math.min(100, Math.round((offset / total) * 100)), page };
 	});
+
+	/** The page whose marker is the last one at or above the viewport top; the offset estimate is
+	 * too coarse inside a chunk to name the page reliably. */
+	function pageAtTop(): number | null {
+		if (!scroller || !flow || pages.length === 0) return null;
+		const limit = scroller.getBoundingClientRect().top + TOP_INSET;
+		let found: number | null = null;
+		for (const marker of flow.querySelectorAll<HTMLElement>('.page-marker')) {
+			if (marker.getBoundingClientRect().top > limit) break;
+			found = Number(marker.dataset.page);
+		}
+		return found;
+	}
 
 	function setScroll(y: number) {
 		if (!scroller) return;
@@ -221,10 +239,16 @@
 		}
 		const target = jump;
 		const anchor = target ? flowEl.querySelector<HTMLElement>('[data-jump-anchor]') : null;
+		const inset = target?.align === 'reading' ? Math.min(scroller.clientHeight / 3, 160) : TOP_INSET;
 		if (target && anchor) {
 			const y = anchor.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
 			jump = null;
-			setScroll(y - (target.align === 'reading' ? Math.min(scroller.clientHeight / 3, 160) : 8));
+			setScroll(y - inset);
+		} else if (target) {
+			// The first scroll used estimated heights; head for the target again with the measured ones
+			// until its chunk renders.
+			const y = Math.max(0, current.positionOf(target.offset) - inset);
+			if (Math.abs(scroller.scrollTop - y) >= 1) setScroll(y);
 		}
 	}
 
@@ -246,8 +270,7 @@
 	<div class="toolbar">
 		{#if position}
 			<p class="position">
-				{#if position.page && lastPage !== null}p. {position.page.page} of {lastPage} ·
-				{/if}{position.percent}%{#if total}<span class="length"> of {formatCount(total)} characters</span>{/if}
+				{#if position.page && lastPage !== null}{`p. ${position.page.page} of ${lastPage} · `}{/if}{position.percent}%{#if total}<span class="length">{` of ${formatCount(total)} characters`}</span>{/if}
 			</p>
 		{/if}
 		{#if pages.length > 0}
@@ -326,9 +349,10 @@
 		flex-wrap: wrap;
 		align-items: center;
 		gap: var(--space-2) var(--space-3);
-		padding: var(--space-2) var(--space-3);
+		min-height: 3rem;
+		padding: var(--space-1) var(--space-4);
 		border-bottom: 1px solid var(--color-border);
-		font-size: 0.85rem;
+		font-size: 0.8125rem;
 	}
 
 	.position {
@@ -362,13 +386,11 @@
 	}
 
 	.focus-label.tone-quote {
-		background: var(--color-amber-soft);
-		border: 1px solid var(--color-amber-border);
+		background: var(--color-highlight);
 	}
 
 	.focus-label.tone-span {
-		background: var(--color-sage-soft);
-		border: 1px solid var(--color-sage-border);
+		background: var(--color-surface);
 	}
 
 	.scroller {
@@ -378,7 +400,7 @@
 		overflow-x: hidden;
 		overflow-anchor: none;
 		overscroll-behavior: contain;
-		padding: 0 16px;
+		padding: 0 24px;
 	}
 
 	.note {
@@ -413,13 +435,13 @@
 	}
 
 	.flow.tone-span mark {
-		background: var(--color-sage-soft);
-		box-shadow: 0 0 0 1px var(--color-sage-border);
+		background: var(--color-surface);
+		box-shadow: -3px 0 0 var(--color-surface), 3px 0 0 var(--color-surface);
 	}
 
 	.flow.tone-quote mark {
-		background: var(--color-amber-soft);
-		box-shadow: 0 0 0 1px var(--color-amber-border);
+		background: var(--color-highlight);
+		box-shadow: -2px 0 0 var(--color-highlight), 2px 0 0 var(--color-highlight);
 	}
 
 	.page-marker {

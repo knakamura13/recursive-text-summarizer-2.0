@@ -31,31 +31,44 @@
 </script>
 
 <div class="strip" data-testid="run-strip">
+	<div class="info">
 	<div class="line">
 		<StateBadge state={run.state} />
 		{#if activeRow && run.state === 'running'}
-			<span class="stage">{activeRow.label}{#if activeRow.counts}<span class="counts"> · {activeRow.counts}</span>{/if}</span>
+			<span class="stage">{activeRow.label}{#if activeRow.counts}<span class="counts">{` · ${activeRow.counts}`}</span>{/if}</span>
 		{:else if !live}
 			<span class="stage muted">updated {formatRelativeTime(run.updated_at)}</span>
 		{/if}
 		{#if live && elapsed !== null}
 			<span class="time">
-				{formatDuration(elapsed)}{#if run.state === 'running'} · {formatEta(eta)}{/if}
+				{formatDuration(elapsed)}{#if run.state === 'running'}{` · ${formatEta(eta)}`}{/if}
 			</span>
 		{/if}
 	</div>
 	{#if bar}
 		<ProgressBar value={bar.value} max={bar.max} size="sm" label="{bar.label} progress" />
 	{/if}
+	</div>
 	<RunControls {run} {blockedBy} {stopPending} {resumePending} {onstop} {onresume} {onnew} />
 </div>
 
 <style>
 	.strip {
 		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: flex-end;
+		gap: var(--space-2) var(--space-4);
+		min-width: 0;
+	}
+
+	.info {
+		display: flex;
 		flex-direction: column;
 		gap: var(--space-2);
+		flex: 1 1 10rem;
 		min-width: 0;
+		max-width: 26rem;
 	}
 
 	.line {

@@ -123,9 +123,7 @@
 <div class="tree">
 	<div class="toolbar">
 		<p class="counts" aria-live="polite">
-			{formatCount(counts.completed)} of {formatCount(counts.total)} nodes done{#if counts.active > 0}
-				· {formatCount(counts.active)} working{/if}{#if counts.failed > 0}
-				· <span class="failed-count">{formatCount(counts.failed)} failed</span>{/if}
+			{formatCount(counts.completed)} of {formatCount(counts.total)} nodes done{#if counts.active > 0}{` · ${formatCount(counts.active)} working`}{/if}{#if counts.failed > 0}{' · '}<span class="failed-count">{formatCount(counts.failed)} failed</span>{/if}
 		</p>
 		<div class="toolbar-actions">
 			<button type="button" class="link" onclick={() => collapsed.clear()} disabled={collapsed.size === 0}>
@@ -280,8 +278,8 @@
 	}
 
 	.row.selected {
-		background: var(--color-sage-soft);
-		box-shadow: inset 3px 0 0 var(--color-sage);
+		background: var(--color-surface-elevated);
+		box-shadow: inset 2px 0 0 var(--color-accent);
 	}
 
 	.scroller:focus-visible .row.focused {
@@ -322,8 +320,8 @@
 	}
 
 	.icon-completed {
-		border-color: var(--color-sage);
-		background: var(--color-sage);
+		border-color: var(--color-success);
+		background: var(--color-success);
 	}
 
 	.icon-failed {

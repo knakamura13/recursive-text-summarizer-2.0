@@ -141,7 +141,7 @@
 		padding: 0;
 		border: 1px solid var(--color-border);
 		border-radius: var(--radius-lg);
-		background: var(--color-bg);
+		background: var(--color-surface-elevated);
 		color: var(--color-text);
 		box-shadow: var(--shadow-lg);
 		width: min(34rem, calc(100vw - 1rem));

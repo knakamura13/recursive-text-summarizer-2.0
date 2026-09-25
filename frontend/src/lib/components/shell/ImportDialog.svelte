@@ -130,8 +130,8 @@
 	}
 
 	.dropzone.dragging {
-		border-color: var(--color-sage);
-		background: var(--color-sage-soft);
+		border-color: var(--color-accent);
+		background: var(--color-accent-soft);
 	}
 
 	.picker {

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { OllamaModel, RunConfig } from '$lib/api/types';
 	import type { NumericRunConfigField, RunConfigErrors } from '$lib/runConfig';
+	import { canSummarize } from '$lib/stores/models.svelte';
 
 	// Edits a RunConfig in place: model, target words, strategy, verification,
 	// and an Advanced section. Empty "automatic" fields hold null.
@@ -106,7 +107,7 @@
 				{#if config.model && !installed}
 					<option value={config.model}>{config.model} (not installed)</option>
 				{/if}
-				{#each models as model (model.name)}
+				{#each models.filter(canSummarize) as model (model.name)}
 					<option value={model.name}>
 						{model.name}{model.parameter_size ? ` · ${model.parameter_size}` : ''}
 					</option>

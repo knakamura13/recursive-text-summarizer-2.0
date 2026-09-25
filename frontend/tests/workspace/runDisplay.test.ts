@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { RunProgress } from '../../src/lib/api/types';
 import {
 	activeStageBar,
+	evidenceLabel,
 	liveElapsed,
 	liveEta,
 	reaskNote,
@@ -110,5 +111,14 @@ describe('reaskNote', () => {
 		expect(reaskNote({ ...item, attempt: 2 })).toBe('Re-asked after invalid output (try 2 of 3)');
 		expect(reaskNote({ ...item, attempt: 1 })).toBeNull();
 		expect(reaskNote({ ...item, attempt: null })).toBeNull();
+	});
+});
+
+describe('evidenceLabel', () => {
+	it('names passages the way a reader would, with pages when known', () => {
+		expect(evidenceLabel('S000012', 40, 41)).toBe('Passage 12 · pp. 40–41');
+		expect(evidenceLabel('S000003', null, null)).toBe('Passage 3');
+		expect(evidenceLabel('D000001', null, null)).toBe('Whole document');
+		expect(evidenceLabel('custom-id', 2, 2)).toBe('custom-id · p. 2');
 	});
 });

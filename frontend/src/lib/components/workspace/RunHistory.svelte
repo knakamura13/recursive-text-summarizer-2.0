@@ -148,8 +148,8 @@
 	}
 
 	.runs li.current {
-		border-color: var(--color-sage-border);
-		background: var(--color-sage-soft);
+		border-left: 2px solid var(--color-accent);
+		background: var(--color-surface-elevated);
 	}
 
 	.line {

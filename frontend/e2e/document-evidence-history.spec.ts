@@ -45,7 +45,15 @@ test('shows verified summary evidence in the Source and exposes all exports', as
 		target_words: 100,
 		short_of_target: true,
 		verification_state: 'completed',
-		publication: 'verified_subset'
+		publication: 'verified_subset',
+		notices: [
+			{
+				code: 'verified_sentence_subset',
+				message:
+					'Some sentences of the written draft could not be verified and were removed; the remaining sentences passed verification.',
+				severity: 'warning'
+			}
+		]
 	});
 	await MockApi.install(page, {
 		documents: [makeDocument({ document_id: DOC, title: 'Harbour minutes', char_count: SMALL_SOURCE.length, page_count: 1 })],
@@ -57,7 +65,7 @@ test('shows verified summary evidence in the Source and exposes all exports', as
 
 	await page.goto(`/documents/${DOC}?run=${RUN}&tab=summary`);
 	const article = page.getByRole('article', { name: 'Summary' });
-	await expect(article).toContainText('Sentences that failed verification were removed; the rest passed.');
+	await expect(article).toContainText('could not be verified and were removed; the remaining sentences passed verification.');
 	await expect(article.getByRole('link', { name: 'Text' })).toHaveAttribute('href', /\/export\/txt$/);
 	await expect(article.getByRole('link', { name: 'Markdown' })).toHaveAttribute('href', /\/export\/md$/);
 	await expect(article.getByRole('link', { name: 'Audit JSON' })).toHaveAttribute('href', /\/export\/json$/);
@@ -67,11 +75,11 @@ test('shows verified summary evidence in the Source and exposes all exports', as
 	await expect(article).toContainText('No source passage supports it.');
 
 	await article.getByRole('button', { name: /The commission reviewed the dredging budget/ }).click();
-	const evidence = article.getByRole('button', { name: new RegExp(`${QUOTE}.*D000001`) });
+	const evidence = article.getByRole('button', { name: new RegExp(`${QUOTE}.*Whole document`) });
 	await expect(evidence).toBeVisible();
 	await evidence.click();
 	const source = page.getByRole('region', { name: 'Document text' });
-	await expect(page.getByTestId('source-focus')).toContainText('Evidence · D000001 · p. 1');
+	await expect(page.getByTestId('source-focus')).toContainText('Evidence · Whole document · p. 1');
 	await expect(source.locator('mark')).toContainText(QUOTE);
 });
 

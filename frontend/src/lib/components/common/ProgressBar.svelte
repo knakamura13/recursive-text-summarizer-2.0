@@ -40,25 +40,25 @@
 	.progress {
 		position: relative;
 		width: 100%;
-		height: 0.5rem;
+		height: 0.375rem;
 		border-radius: 999px;
 		background: var(--color-border);
 		overflow: hidden;
 	}
 
 	.progress.sm {
-		height: 0.3rem;
+		height: 0.25rem;
 	}
 
 	.fill {
 		height: 100%;
 		border-radius: inherit;
-		background: var(--color-info);
+		background: var(--color-ink);
 		transition: width 0.25s ease-out;
 	}
 
 	.success .fill {
-		background: var(--color-sage);
+		background: var(--color-success);
 	}
 
 	.warning .fill {

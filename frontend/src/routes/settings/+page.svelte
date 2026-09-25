@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import { api } from '$lib/api/client';
+	import { api, errorMessage } from '$lib/api/client';
 	import type { OllamaHealth, RunConfig } from '$lib/api/types';
 	import EmptyState from '$lib/components/common/EmptyState.svelte';
 	import ErrorBanner from '$lib/components/common/ErrorBanner.svelte';
@@ -8,7 +8,7 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import { formatBytes, formatRelativeTime } from '$lib/format';
 	import { fieldErrorsFrom, runConfigPatch, validateRunConfig } from '$lib/runConfig';
-	import { models } from '$lib/stores/models.svelte';
+	import { canSummarize, models } from '$lib/stores/models.svelte';
 	import { settings } from '$lib/stores/settings.svelte';
 	import { toasts } from '$lib/stores/toasts.svelte';
 
@@ -100,6 +100,21 @@
 			if (!hostError) healthError = error;
 		} finally {
 			savingHost = false;
+		}
+	}
+
+	let savingModel = $state<string | null>(null);
+
+	async function makeDefault(name: string) {
+		savingModel = name;
+		try {
+			await settings.save({ defaults: { model: name } });
+			if (draft) draft.model = name;
+			toasts.success(`${name} is now the default model.`);
+		} catch (error) {
+			toasts.error(`Could not change the default model: ${errorMessage(error)}`);
+		} finally {
+			savingModel = null;
 		}
 	}
 
@@ -233,15 +248,21 @@
 										.join(' · ')}
 								</span>
 							</div>
-							{#if draft.model === model.name}
+							{#if saved?.defaults.model === model.name}
 								<span class="default-tag">Default</span>
+							{:else if !canSummarize(model)}
+								<span class="model-note">Embedding model</span>
 							{:else}
 								<button
 									type="button"
 									class="button small"
 									aria-label="Use {model.name} as the default model"
-									onclick={() => draft && (draft.model = model.name)}>Use as default</button
+									disabled={savingModel !== null}
+									onclick={() => makeDefault(model.name)}
 								>
+									{#if savingModel === model.name}<Spinner size="sm" label="" />{/if}
+									Use as default
+								</button>
 							{/if}
 						</li>
 					{/each}
@@ -298,7 +319,7 @@
 		gap: var(--space-6);
 		max-width: 48rem;
 		margin: 0 auto;
-		padding: var(--space-6) var(--space-4) var(--space-8);
+		padding: var(--space-8) var(--space-6) var(--space-8);
 	}
 
 	section {
@@ -308,7 +329,7 @@
 		padding: var(--space-5);
 		border: 1px solid var(--color-border);
 		border-radius: var(--radius-lg);
-		background: var(--color-bg);
+		background: var(--color-surface-elevated);
 	}
 
 	.loading {
@@ -340,7 +361,7 @@
 	}
 
 	.ok {
-		color: var(--color-sage);
+		color: var(--color-success);
 		font-weight: 500;
 	}
 
@@ -390,7 +411,7 @@
 	.model-name {
 		font-weight: 600;
 		font-family: var(--font-mono);
-		font-size: 0.9375rem;
+		font-size: 0.875rem;
 	}
 
 	.model-meta {
@@ -398,11 +419,16 @@
 		color: var(--color-text-muted);
 	}
 
+	.model-note {
+		font-size: 0.8125rem;
+		color: var(--color-text-subtle);
+	}
+
 	.default-tag {
 		padding: 0.125rem 0.625rem;
 		border-radius: 999px;
-		background: var(--color-sage-soft);
-		color: var(--color-sage);
+		background: var(--color-success-soft);
+		color: var(--color-success);
 		font-size: 0.8125rem;
 		font-weight: 600;
 	}

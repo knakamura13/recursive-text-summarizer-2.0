@@ -111,6 +111,7 @@
 		background: transparent;
 		color: var(--color-text-muted);
 		font: inherit;
+		font-size: 0.9375rem;
 		font-weight: 500;
 		white-space: nowrap;
 		cursor: pointer;
@@ -123,7 +124,7 @@
 
 	button[aria-selected='true'] {
 		color: var(--color-text);
-		border-bottom-color: var(--color-sage);
+		border-bottom-color: var(--color-accent);
 	}
 
 	button:focus-visible {
@@ -133,7 +134,8 @@
 	.fill button {
 		flex: 1 1 0;
 		min-width: 0;
-		padding: 0 var(--space-2);
+		padding: 0 var(--space-1);
+		font-size: 0.875rem;
 	}
 
 	.fill .label {
@@ -146,8 +148,8 @@
 		padding: 0 0.375rem;
 		border-radius: 999px;
 		background: var(--color-surface);
-		border: 1px solid var(--color-border);
 		font-size: 0.75rem;
+		font-variant-numeric: tabular-nums;
 		line-height: 1.25rem;
 		text-align: center;
 	}

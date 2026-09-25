@@ -47,7 +47,7 @@
 		border: 1px solid var(--color-border);
 		border-left-width: 4px;
 		border-radius: var(--radius-md);
-		background: var(--color-bg);
+		background: var(--color-surface-elevated);
 		box-shadow: var(--shadow-lg);
 		pointer-events: auto;
 	}
@@ -66,6 +66,6 @@
 	}
 
 	.toast.success {
-		border-left-color: var(--color-sage);
+		border-left-color: var(--color-success);
 	}
 </style>

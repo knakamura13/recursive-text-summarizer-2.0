@@ -210,7 +210,7 @@
 			badge:
 				id === 'tree' && failedNodes > 0
 					? `${failedNodes} failed`
-					: id === 'runs' && runs && runs.length > 0
+					: id === 'runs' && runs && runs.length > 0 && !phone
 						? runs.length
 						: null
 		}));
@@ -406,6 +406,11 @@
 										Show the latest Run
 									</button>
 				{:else if stream?.run}
+					{#if stream.run.state === 'completed'}
+						<button type="button" class="button primary read-summary" onclick={() => setQuery({ tab: 'summary' })}>
+							Read the summary
+						</button>
+					{/if}
 					<RunStatus run={stream.run} progress={stream.progress} progressAt={stream.progressAt} />
 				{:else if runsError && selectedRunId === null}
 					<ErrorBanner error={runsError} title="Could not load the Run history" onretry={() => void loadRuns()} />
@@ -530,8 +535,9 @@
 		flex-wrap: wrap;
 		align-items: flex-start;
 		justify-content: space-between;
-		gap: var(--space-2) var(--space-4);
-		padding: var(--space-3) var(--space-4);
+		align-items: center;
+		gap: var(--space-3) var(--space-6);
+		padding: var(--space-4) var(--space-5);
 		border-bottom: 1px solid var(--color-border);
 		min-width: 0;
 	}
@@ -543,8 +549,8 @@
 
 	.doc-title {
 		margin: 0;
-		font-size: 1.15rem;
-		line-height: 1.3;
+		font-size: 1.5rem;
+		line-height: 1.2;
 		overflow-wrap: anywhere;
 	}
 
@@ -556,7 +562,11 @@
 	}
 
 	.doc-header :global([data-testid='run-strip']) {
-		flex: 1 1 18rem;
+		flex: 1 1 22rem;
+	}
+
+	.read-summary {
+		align-self: flex-start;
 	}
 
 	.import-area {
@@ -582,7 +592,7 @@
 	.tabbar {
 		flex: none;
 		min-width: 0;
-		border-bottom: 1px solid var(--color-border);
+		padding: 0 var(--space-3);
 	}
 
 	.panel {
@@ -601,18 +611,18 @@
 	.stack {
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-4);
-		padding: var(--space-4);
+		gap: var(--space-5);
+		padding: var(--space-5);
 		max-width: 60rem;
 	}
 
 	/* Phone: the tab bar sits at the bottom, within thumb reach. */
 	.phone .tabbar {
 		order: 2;
-		border-bottom: none;
+		padding: 0;
 		border-top: 1px solid var(--color-border);
 		padding-bottom: env(safe-area-inset-bottom, 0);
-		background: var(--color-bg);
+		background: var(--color-surface-elevated);
 	}
 
 	.phone .doc-header {
@@ -620,7 +630,7 @@
 	}
 
 	.phone .doc-title {
-		font-size: 1rem;
+		font-size: 1.125rem;
 	}
 
 	.phone .stack {
@@ -645,6 +655,7 @@
 		min-height: 0;
 		min-width: 0;
 		border-left: 1px solid var(--color-border);
+		background: var(--color-surface-elevated);
 	}
 
 	.node-pane {
@@ -666,15 +677,16 @@
 		gap: var(--space-2);
 		margin: 0 calc(-1 * var(--space-4)) var(--space-2);
 		padding: var(--space-1) var(--space-4);
-		background: var(--color-bg);
+		background: var(--color-surface-elevated);
 		border-bottom: 1px solid var(--color-border);
 	}
 
 	.node-pane-title {
-		font-size: 0.8rem;
+		font-size: 0.72rem;
+		font-weight: 600;
 		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		color: var(--color-text-muted);
+		letter-spacing: 0.08em;
+		color: var(--color-text-subtle);
 	}
 
 	.source-pane {

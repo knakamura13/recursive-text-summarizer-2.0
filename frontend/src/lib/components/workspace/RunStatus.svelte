@@ -24,7 +24,12 @@
 	});
 	const elapsed = $derived(liveElapsed(progress?.elapsed_seconds ?? null, progressAt, now, live && run.state !== 'queued'));
 	const eta = $derived(run.state === 'running' ? liveEta(progress?.eta_seconds ?? null, progressAt, now, true) : null);
-	const rows = $derived(stageRows(progress));
+	// A completed Run never ran its pending stages (verification off): show them as skipped.
+	const rows = $derived(
+		stageRows(progress).map((row) =>
+			run.state === 'completed' && row.state === 'pending' ? { ...row, state: 'skipped' as const } : row
+		)
+	);
 	const bar = $derived(live ? activeStageBar(progress) : null);
 	const items = $derived(live ? (progress?.current_items ?? []) : []);
 	const failureStage = $derived(
@@ -45,8 +50,7 @@
 	<header class="head">
 		<StateBadge state={run.state} />
 		<span class="meta">
-			Attempt {run.attempt?.attempt_number ?? run.attempt_count}{#if run.selected_strategy}
-				· {run.selected_strategy}{/if} · started {formatRelativeTime(run.created_at, wallNow)}
+			Attempt {run.attempt?.attempt_number ?? run.attempt_count}{#if run.selected_strategy}{` · ${run.selected_strategy}`}{/if} · started {formatRelativeTime(run.created_at, wallNow)}
 		</span>
 	</header>
 
@@ -132,9 +136,7 @@
 			<p class="failure-message">{run.failure.message}</p>
 			{#if run.failure.item || failureStage}
 				<p class="failure-where">
-					{#if failureStage}Stage: {failureStage}{/if}{#if failureStage && run.failure.item}
-						·
-					{/if}{#if run.failure.item}Item: {run.failure.item}{/if}
+					{#if failureStage}Stage: {failureStage}{/if}{#if failureStage && run.failure.item}{' · '}{/if}{#if run.failure.item}Item: {run.failure.item}{/if}
 				</p>
 			{/if}
 			{#if run.failure.hint}
@@ -182,6 +184,8 @@
 	}
 
 	.summary {
+		font-family: var(--font-serif);
+		font-size: 1.25rem;
 		font-weight: 600;
 	}
 
@@ -198,15 +202,17 @@
 	}
 
 	.times dt {
-		font-size: 0.75rem;
+		font-size: 0.72rem;
+		font-weight: 600;
 		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		color: var(--color-text-muted);
+		letter-spacing: 0.08em;
+		color: var(--color-text-subtle);
 	}
 
 	.times dd {
 		margin: 0;
-		font-size: 1.05rem;
+		font-family: var(--font-serif);
+		font-size: 1.375rem;
 		font-variant-numeric: tabular-nums;
 	}
 
@@ -240,7 +246,7 @@
 		margin-top: 4px;
 		border-radius: 50%;
 		border: 2px solid var(--color-border-strong);
-		background: var(--color-bg);
+		background: var(--color-surface-elevated);
 		z-index: 1;
 	}
 
@@ -250,8 +256,8 @@
 	}
 
 	.step-completed .marker {
-		border-color: var(--color-sage);
-		background: var(--color-sage);
+		border-color: var(--color-success);
+		background: var(--color-success);
 	}
 
 	.step-skipped .marker {
@@ -292,7 +298,18 @@
 
 	.section-title {
 		margin: 0;
+		font-size: 0.72rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		color: var(--color-text-subtle);
+	}
+
+	.failure .section-title {
 		font-size: 0.95rem;
+		text-transform: none;
+		letter-spacing: 0;
+		color: var(--color-danger);
 	}
 
 	.items {

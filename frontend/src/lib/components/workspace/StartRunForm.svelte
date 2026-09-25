@@ -5,10 +5,10 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import { api, errorMessage, isAbortError } from '$lib/api/client';
 	import type { DocumentDetail, Preflight, Run, RunConfig } from '$lib/api/types';
-	import { formatCount, stageLabel } from '$lib/format';
+	import { formatCount, formatEta, stageLabel } from '$lib/format';
 	import { fieldErrorsFrom, validateRunConfig, type RunConfigErrors } from '$lib/runConfig';
 	import { activity } from '$lib/stores/activity.svelte';
-	import { models } from '$lib/stores/models.svelte';
+	import { canSummarize, models } from '$lib/stores/models.svelte';
 	import { settings } from '$lib/stores/settings.svelte';
 
 	interface Props {
@@ -54,7 +54,10 @@
 
 	// Preselect the only sensible choice when the settings name no model.
 	$effect(() => {
-		if (config && !config.model && models.list.length > 0) config.model = models.list[0].name;
+		if (config && !config.model) {
+			const first = models.list.find(canSummarize);
+			if (first) config.model = first.name;
+		}
 	});
 
 	const localErrors = $derived(config ? validateRunConfig(config, { requireModel: true }) : {});
@@ -232,9 +235,7 @@
 						Another Run is active:
 						<a href="/documents/{encodeURIComponent(reason.run.document_id)}?run={encodeURIComponent(reason.run.run_id)}"
 							>{reason.run.document_title}</a
-						>{#if reason.run.progress?.stage}
-							· {stageLabel(reason.run.progress.stage)}{/if}{#if reason.run.progress?.leaves.total}
-							· {formatCount(reason.run.progress.leaves.done)} of {formatCount(reason.run.progress.leaves.total)} segments{/if}.
+						>{#if reason.run.progress?.stage}{` · ${stageLabel(reason.run.progress.stage)}`}{/if}{#if reason.run.progress?.eta_seconds != null}{` · ${formatEta(reason.run.progress.eta_seconds)}`}{/if}.
 						Only one Run can be active at a time.
 					</li>
 				{:else}

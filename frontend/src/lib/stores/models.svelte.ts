@@ -3,6 +3,11 @@
 import { api, errorMessage } from '$lib/api/client';
 import type { OllamaModel } from '$lib/api/types';
 
+/** Embedding models (nomic-embed-text, bge, ...) cannot write summaries. */
+export function canSummarize(model: OllamaModel): boolean {
+	return !/embed/i.test(model.name) && !/bert$/i.test(model.family ?? '');
+}
+
 class ModelsStore {
 	#list = $state.raw<OllamaModel[]>([]);
 	#error = $state<string | null>(null);

@@ -52,10 +52,10 @@
 		gap: 0.15rem;
 		width: 100%;
 		min-height: 44px;
-		padding: var(--space-2);
-		border: 1px solid var(--color-amber-border);
+		padding: var(--space-2) var(--space-3);
+		border: 1px solid var(--color-border);
 		border-radius: var(--radius-sm);
-		background: var(--color-amber-soft);
+		background: var(--color-bg);
 		color: inherit;
 		font: inherit;
 		font-size: 0.9rem;
@@ -68,6 +68,7 @@
 
 	button.evidence-item:hover {
 		border-color: var(--color-amber);
+		background: var(--color-amber-soft);
 	}
 
 	.evidence-item.static {
@@ -76,6 +77,9 @@
 	}
 
 	q {
+		font-family: var(--font-serif);
+		font-size: 1rem;
+		line-height: 1.5;
 		overflow-wrap: anywhere;
 	}
 

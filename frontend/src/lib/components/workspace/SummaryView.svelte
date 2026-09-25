@@ -4,10 +4,11 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import { api } from '$lib/api/client';
 	import type { FinalSummary, Run, SummarySentence } from '$lib/api/types';
-	import { formatCount, formatPages } from '$lib/format';
+	import { formatCount } from '$lib/format';
 	import type { TextRange } from '$lib/source/sourceModel';
 	import { toasts } from '$lib/stores/toasts.svelte';
 	import EvidenceList from './EvidenceList.svelte';
+	import { evidenceLabel } from './runDisplay';
 
 	interface Props {
 		run: Run;
@@ -28,11 +29,8 @@
 		unchecked: 'Not checked (verification was off)',
 		not_meaningfully_verifiable: 'Not checkable against the source'
 	};
-	const PUBLICATION: Record<NonNullable<FinalSummary['publication']>, string> = {
-		editorial: 'The written summary passed verification.',
-		verified_subset: 'Sentences that failed verification were removed; the rest passed.',
-		content_unit_fallback: 'The written summary did not pass verification, so this summary is built from verified content units.'
-	};
+	// Other publication kinds arrive as server notices (verified_sentence_subset, verified_content_unit_fallback).
+	const passedAsWritten = $derived(summary?.publication === 'editorial' && summary.verification_state === 'completed');
 
 	let selected = $state<number | null>(null);
 
@@ -55,8 +53,7 @@
 		selected = selected === sentence.index ? null : sentence.index;
 		const first = sentence.evidence.find((ref) => ref.start !== null && ref.end !== null);
 		if (selected !== null && showOnSelect && first && first.start !== null && first.end !== null) {
-			const pages = formatPages(first.page_start, first.page_end);
-			onshow({ start: first.start, end: first.end }, `Evidence · ${first.segment_id}${pages ? ` · ${pages}` : ''}`);
+			onshow({ start: first.start, end: first.end }, `Evidence · ${evidenceLabel(first.segment_id, first.page_start, first.page_end)}`);
 		}
 	}
 
@@ -94,8 +91,7 @@
 	<article class="summary" aria-label="Summary">
 		<div class="toolbar">
 			<p class="words" class:short={summary.short_of_target}>
-				{#if summary.word_count !== null}{formatCount(summary.word_count)} words{/if}{#if summary.target_words !== null}
-					of {formatCount(summary.target_words)} targeted{/if}
+				{#if summary.word_count !== null}{formatCount(summary.word_count)} words{/if}{#if summary.target_words !== null}{` of ${formatCount(summary.target_words)} targeted`}{/if}
 			</p>
 			<div class="actions">
 				<button type="button" class="button small" onclick={copy}>Copy</button>
@@ -105,12 +101,10 @@
 			</div>
 		</div>
 
-		{#if (summary.publication && summary.verification_state === 'completed') || summary.notices.length > 0}
+		{#if passedAsWritten || summary.notices.length > 0}
 			<ul class="notices">
-				{#if summary.publication && summary.verification_state === 'completed'}
-					<li class="notice severity-{summary.publication === 'editorial' ? 'info' : 'warning'}">
-						{PUBLICATION[summary.publication]}
-					</li>
+				{#if passedAsWritten}
+					<li class="notice severity-info">The written summary passed verification.</li>
 				{/if}
 				{#each summary.notices as notice (notice.code + notice.message)}
 					<li class="notice severity-{notice.severity}">{notice.message}</li>
@@ -159,8 +153,7 @@
 				<h3>Sources</h3>
 				<ul>
 					{#each summary.citations as citation (citation.citation_id)}
-						{@const pages = formatPages(citation.page_start, citation.page_end)}
-						{@const label = `[${citation.citation_id}] ${citation.segment_id}${pages ? ` · ${pages}` : ''}`}
+						{@const label = `[${citation.citation_id}] ${evidenceLabel(citation.segment_id, citation.page_start, citation.page_end)}`}
 						<li>
 							{#if citation.start !== null && citation.end !== null}
 								{@const range = { start: citation.start, end: citation.end }}
@@ -199,6 +192,7 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--space-4);
+		max-width: 44rem;
 	}
 
 	.toolbar {
@@ -207,21 +201,25 @@
 		align-items: center;
 		justify-content: space-between;
 		gap: var(--space-2);
+		padding-bottom: var(--space-3);
+		border-bottom: 1px solid var(--color-border);
 	}
 
 	.words {
 		margin: 0;
 		color: var(--color-text-muted);
-		font-size: 0.9rem;
+		font-size: 0.875rem;
+		font-variant-numeric: tabular-nums;
 	}
 
 	.words.short {
-		color: var(--color-amber-strong, var(--color-amber));
+		color: var(--color-amber-strong);
 	}
 
 	.actions {
 		display: flex;
 		flex-wrap: wrap;
+		align-items: center;
 		gap: var(--space-1);
 	}
 
@@ -231,66 +229,82 @@
 		list-style: none;
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-1);
+		gap: var(--space-2);
 	}
 
 	.notice {
-		padding: var(--space-2) var(--space-3);
-		border-radius: var(--radius-sm);
-		background: var(--color-surface);
-		font-size: 0.9rem;
+		padding: 0.1rem 0 0.1rem var(--space-3);
+		border-left: 3px solid var(--color-border-strong);
+		color: var(--color-text-muted);
+		font-size: 0.875rem;
+	}
+
+	.severity-info {
+		border-left-color: var(--color-success);
 	}
 
 	.severity-warning {
-		background: var(--color-amber-soft);
+		border-left-color: var(--color-amber);
+		color: var(--color-text);
 	}
 
 	.severity-error {
-		background: var(--color-danger-soft);
+		border-left-color: var(--color-danger);
+		color: var(--color-danger);
 	}
 
 	.legend {
 		margin: 0;
-		font-size: 0.85rem;
-		color: var(--color-text-muted);
+		font-size: 0.8125rem;
+		color: var(--color-text-subtle);
 	}
 
 	.text p {
-		margin: 0 0 var(--space-3);
+		margin: 0 0 var(--space-4);
+		font-family: var(--font-serif);
+		font-size: 1.1875rem;
 		line-height: 1.7;
+		color: var(--color-text);
 	}
 
 	.sentence {
 		cursor: pointer;
 		border-radius: 2px;
+		transition: background-color 120ms ease;
 	}
 
 	.sentence:hover {
-		background: var(--color-surface);
+		background: var(--color-amber-soft);
 	}
 
 	.sentence.selected {
-		background: var(--color-amber-soft);
+		background: var(--color-highlight);
 	}
 
 	.verdict-supported {
 		text-decoration: underline;
-		text-decoration-color: var(--color-sage);
+		text-decoration-color: var(--color-success-border);
 		text-decoration-thickness: 2px;
-		text-underline-offset: 3px;
+		text-underline-offset: 0.22em;
+	}
+
+	.verdict-supported:hover,
+	.verdict-supported.selected {
+		text-decoration-color: var(--color-success);
 	}
 
 	.verdict-not_meaningfully_verifiable {
 		text-decoration: underline dotted;
 		text-decoration-color: var(--color-text-subtle);
-		text-underline-offset: 3px;
+		text-underline-offset: 0.22em;
 	}
 
 	.evidence-panel {
-		margin: 0 0 var(--space-3);
-		padding: var(--space-3);
-		border-left: 3px solid var(--color-amber);
-		background: var(--color-surface);
+		margin: calc(-1 * var(--space-2)) 0 var(--space-4);
+		padding: var(--space-3) var(--space-4);
+		border-left: 3px solid var(--color-highlight);
+		background: var(--color-surface-elevated);
+		border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 		display: flex;
 		flex-direction: column;
 		gap: var(--space-2);
@@ -298,8 +312,11 @@
 
 	.verdict {
 		margin: 0;
-		font-size: 0.85rem;
+		font-size: 0.72rem;
 		font-weight: 600;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--color-success);
 	}
 
 	.muted {
@@ -311,30 +328,43 @@
 		font-size: 0.9rem;
 	}
 
+	.citations {
+		padding-top: var(--space-3);
+		border-top: 1px solid var(--color-border);
+	}
+
 	.citations h3 {
 		margin: 0 0 var(--space-2);
-		font-size: 0.9rem;
+		font-size: 0.72rem;
+		font-weight: 600;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--color-text-subtle);
 	}
 
 	.citations ul {
 		display: flex;
 		flex-wrap: wrap;
-		gap: var(--space-1);
+		gap: var(--space-1) var(--space-2);
 		margin: 0;
 		padding: 0;
 		list-style: none;
 	}
 
 	.citation {
-		min-height: 44px;
+		min-height: 2.25rem;
 		padding: 0 var(--space-3);
 		border: 1px solid var(--color-border);
 		border-radius: var(--radius-sm);
-		background: var(--color-bg);
+		background: var(--color-surface-elevated);
 		color: inherit;
 		font: inherit;
-		font-size: 0.85rem;
+		font-size: 0.8125rem;
 		cursor: pointer;
+	}
+
+	.citation:hover {
+		border-color: var(--color-border-strong);
 	}
 
 	.citation.static {
@@ -343,11 +373,18 @@
 		cursor: default;
 	}
 
+	.removed {
+		padding-top: var(--space-3);
+		border-top: 1px solid var(--color-border);
+	}
+
 	.removed summary {
 		min-height: 44px;
 		display: flex;
 		align-items: center;
 		cursor: pointer;
+		font-size: 0.875rem;
+		color: var(--color-text-muted);
 	}
 
 	.removed ul {
@@ -355,17 +392,26 @@
 		padding-left: 1.2rem;
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-2);
+		gap: var(--space-3);
 	}
 
 	.removed-text {
 		margin: 0;
+		font-family: var(--font-serif);
 		text-decoration: line-through;
+		text-decoration-color: var(--color-accent);
 		color: var(--color-text-muted);
 	}
 
 	.removed-why {
-		margin: 0;
-		font-size: 0.85rem;
+		margin: 0.15rem 0 0;
+		font-size: 0.8125rem;
+		color: var(--color-text-subtle);
+	}
+
+	@media (max-width: 639px) {
+		.text p {
+			font-size: 1.0625rem;
+		}
 	}
 </style>

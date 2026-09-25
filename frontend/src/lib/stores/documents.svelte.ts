@@ -106,8 +106,14 @@ class DocumentsStore {
 			if (this.get(document.document_id) || !filtered) this.upsert(document);
 		}
 		const stillImporting = new Set(next.importing.map((document) => document.document_id));
-		for (const document of previous.importing) {
-			if (!stillImporting.has(document.document_id)) void this.#reload(document.document_id);
+		const finished = new Set<string>();
+		for (const document of previous.importing) finished.add(document.document_id);
+		// An import can finish between two snapshots, so it never appears in either.
+		for (const document of this.#list) {
+			if (document.import_state === 'importing') finished.add(document.document_id);
+		}
+		for (const id of finished) {
+			if (!stillImporting.has(id)) void this.#reload(id);
 		}
 	}
 

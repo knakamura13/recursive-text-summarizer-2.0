@@ -556,16 +556,12 @@ def _final_summary(context: _RunContext) -> FinalSummaryResponse:
     short = target is not None and word_count < target
     notices = _audit_notices(audit)
     if short:
-        reason = {
-            "verified_subset": " Unverified sentences were removed.",
-            "content_unit_fallback": " It was assembled from verified content units.",
-        }.get(kind, "")
         notices.insert(
             _leading_publication_notices(notices),
             Notice(
                 code="short_of_target",
-                message=f"This summary has {word_count} words, below the target of {target}.{reason}",
-                severity="warning" if reason else "info",
+                message=f"This summary has {word_count} words, below the target of {target}.",
+                severity="info" if kind == "editorial" else "warning",
             ),
         )
     if not verified:

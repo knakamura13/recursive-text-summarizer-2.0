@@ -164,8 +164,7 @@
 
 		{#if detail.started_at || detail.completed_at}
 			<p class="timing">
-				{#if detail.started_at}Started {new Date(detail.started_at).toLocaleString()}{/if}{#if detail.completed_at}
-					· finished {new Date(detail.completed_at).toLocaleString()}{/if}
+				{#if detail.started_at}Started {new Date(detail.started_at).toLocaleString()}{/if}{#if detail.completed_at}{` · finished ${new Date(detail.completed_at).toLocaleString()}`}{/if}
 			</p>
 		{/if}
 	{/if}
@@ -180,7 +179,7 @@
 
 	.head h2 {
 		margin: 0;
-		font-size: 1.05rem;
+		font-size: 1.25rem;
 		overflow-wrap: anywhere;
 	}
 
@@ -199,7 +198,7 @@
 	}
 
 	.state-completed {
-		color: var(--color-sage);
+		color: var(--color-success);
 	}
 
 	.state-failed {
@@ -214,11 +213,18 @@
 
 	h3 {
 		margin: 0;
-		font-size: 0.9rem;
+		font-size: 0.72rem;
+		font-weight: 600;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--color-text-subtle);
 	}
 
 	.summary {
 		margin: 0;
+		font-family: var(--font-serif);
+		font-size: 1.0625rem;
+		line-height: 1.6;
 		white-space: pre-wrap;
 		overflow-wrap: anywhere;
 	}
@@ -253,6 +259,8 @@
 
 	.unit-text {
 		margin: 0 0 var(--space-1);
+		font-family: var(--font-serif);
+		line-height: 1.5;
 		overflow-wrap: anywhere;
 	}
 
@@ -312,9 +320,9 @@
 	.segment {
 		min-height: 44px;
 		padding: 0 var(--space-3);
-		border: 1px solid var(--color-sage-border);
+		border: 1px solid var(--color-success-border);
 		border-radius: var(--radius-sm);
-		background: var(--color-sage-soft);
+		background: var(--color-success-soft);
 		color: inherit;
 		font: inherit;
 		font-size: 0.85rem;

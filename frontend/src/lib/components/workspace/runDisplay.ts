@@ -138,7 +138,15 @@ export function describeConfig(config: RunConfig): string {
 }
 
 /** "Segment 3 · pp. 4–5" style label for an evidence reference. */
+/** "Passage 12" for S000012, "Whole document" for the direct strategy's D000001. */
+export function segmentName(segmentId: string): string {
+	const match = /^([DS])0*(\d+)$/.exec(segmentId);
+	if (!match) return segmentId;
+	return match[1] === 'D' ? 'Whole document' : `Passage ${match[2]}`;
+}
+
 export function evidenceLabel(segmentId: string, pageStart: number | null, pageEnd: number | null): string {
 	const pages = formatPages(pageStart, pageEnd);
-	return pages ? `${segmentId} · ${pages}` : segmentId;
+	const name = segmentName(segmentId);
+	return pages ? `${name} · ${pages}` : name;
 }

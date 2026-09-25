@@ -23,7 +23,7 @@
 
 <div class="controls">
 	{#if stoppable || run.state === 'stopping'}
-		<button type="button" class="button danger" disabled={stopping} onclick={onstop}>
+		<button type="button" class="button danger-outline" disabled={stopping} onclick={onstop}>
 			{stopping ? 'Stopping…' : 'Stop'}
 		</button>
 	{:else}

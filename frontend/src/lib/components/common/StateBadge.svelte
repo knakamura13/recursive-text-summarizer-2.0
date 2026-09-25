@@ -1,15 +1,15 @@
 <script lang="ts" module>
 	import type { ImportState, RunState } from '$lib/api/types';
 
-	const TONES: Record<RunState | ImportState, 'active' | 'success' | 'warning' | 'danger'> = {
+	const TONES: Record<RunState | ImportState, 'active' | 'success' | 'paused' | 'danger'> = {
 		queued: 'active',
 		running: 'active',
 		stopping: 'active',
 		importing: 'active',
 		completed: 'success',
 		ready: 'success',
-		stopped: 'warning',
-		interrupted: 'warning',
+		stopped: 'paused',
+		interrupted: 'paused',
 		failed: 'danger'
 	};
 </script>
@@ -48,12 +48,11 @@
 		display: inline-flex;
 		align-items: center;
 		gap: 0.375rem;
-		padding: 0.125rem 0.5rem;
-		border: 1px solid;
-		border-radius: 999px;
+		padding: 0.0625rem 0.5rem;
+		border-radius: var(--radius-sm);
 		font-size: 0.8125rem;
 		font-weight: 600;
-		line-height: 1.4;
+		line-height: 1.5;
 		white-space: nowrap;
 	}
 
@@ -63,8 +62,8 @@
 	}
 
 	.dot {
-		width: 0.5rem;
-		height: 0.5rem;
+		width: 0.4375rem;
+		height: 0.4375rem;
 		border-radius: 50%;
 		background: currentColor;
 		flex: none;
@@ -81,26 +80,26 @@
 	}
 
 	.active {
-		color: var(--color-info);
-		background: var(--color-info-soft);
-		border-color: var(--color-info-border);
+		color: var(--color-amber-strong);
+		background: var(--color-amber-soft);
+	}
+
+	.active .dot {
+		background: var(--color-amber);
 	}
 
 	.success {
-		color: var(--color-sage);
-		background: var(--color-sage-soft);
-		border-color: var(--color-sage-border);
+		color: var(--color-success);
+		background: var(--color-success-soft);
 	}
 
-	.warning {
-		color: var(--color-amber-strong);
-		background: var(--color-amber-soft);
-		border-color: var(--color-amber-border);
+	.paused {
+		color: var(--color-text-muted);
+		background: var(--color-surface);
 	}
 
 	.danger {
 		color: var(--color-danger);
 		background: var(--color-danger-soft);
-		border-color: var(--color-danger-border);
 	}
 </style>

@@ -157,6 +157,6 @@
 	}
 
 	.status.done {
-		color: var(--color-sage);
+		color: var(--color-success);
 	}
 </style>

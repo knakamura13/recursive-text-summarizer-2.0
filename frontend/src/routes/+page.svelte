@@ -15,10 +15,13 @@
 	import {
 		formatBytes,
 		formatCount,
+		formatEta,
 		formatImportProgress,
 		formatName,
-		formatRelativeTime
+		formatRelativeTime,
+		stageLabel
 	} from '$lib/format';
+	import { activity } from '$lib/stores/activity.svelte';
 	import { documents } from '$lib/stores/documents.svelte';
 	import { imports } from '$lib/stores/imports.svelte';
 	import { toasts } from '$lib/stores/toasts.svelte';
@@ -37,6 +40,12 @@
 		imports.items.filter((item) => item.phase === 'waiting' || item.phase === 'uploading')
 	);
 	const searching = $derived(documents.search.trim() !== '');
+	const activeRun = $derived(activity.activeRun);
+	const activeEta = $derived(
+		activeRun?.state === 'running' && activeRun.progress?.eta_seconds != null
+			? formatEta(activeRun.progress.eta_seconds)
+			: ''
+	);
 
 	onMount(() => {
 		void documents.refresh();
@@ -187,34 +196,31 @@
 							<p class="meta">
 								{#if document.origin === 'paste'}
 									<span>Pasted text</span>
-								{:else if document.filename && document.filename !== document.title}
+								{:else if document.filename && document.filename.replace(/\.[^.]+$/, '') !== document.title}
 									<span class="filename">{document.filename}</span>
 								{/if}
 								<span>{formatName(document.format)}</span>
 								<span>{formatBytes(document.size_bytes)}</span>
 								{#if document.page_count}
-									<span
-										>{formatCount(document.page_count)}
-										{document.page_count === 1 ? 'page' : 'pages'}</span
-									>
+									<span>{`${formatCount(document.page_count)} ${document.page_count === 1 ? 'page' : 'pages'}`}</span>
 								{/if}
 								{#if document.char_count}
 									<span>{formatCount(document.char_count)} characters</span>
 								{/if}
 							</p>
+						</div>
 
+						<div class="state">
 							{#if document.import_state === 'importing'}
 								<div class="import">
 									<p class="status">
 										<StateBadge state="importing" size="sm" />
 										<span>{formatImportProgress(document.import_progress)}</span>
-										{#if document.import_progress?.message}
-											<span class="muted">{document.import_progress.message}</span>
-										{/if}
 									</p>
 									<ProgressBar
 										value={document.import_progress?.done ?? 0}
 										max={document.import_progress?.total ?? null}
+										size="sm"
 										label="Import progress of {document.title}"
 										valueText={formatImportProgress(document.import_progress)}
 									/>
@@ -228,22 +234,27 @@
 								<p class="status">
 									<span class="visually-hidden">Latest Run:</span>
 									<StateBadge state={document.latest_run.state} size="sm" />
-									<span class="muted">{formatRelativeTime(document.latest_run.updated_at, now)}</span>
+									{#if activeRun?.run_id === document.latest_run.run_id && activeRun.progress?.stage}
+										<span class="muted">{stageLabel(activeRun.progress.stage)}{activeEta ? ` · ${activeEta}` : ''}</span>
+									{:else}
+										<span class="muted">{formatRelativeTime(document.latest_run.updated_at, now)}</span>
+									{/if}
 								</p>
 							{:else}
-								<p class="status muted">No Runs yet</p>
+								<p class="status muted">Not summarized yet</p>
 							{/if}
 						</div>
+
 						<div class="row-actions">
 							<button
 								type="button"
-								class="button small"
+								class="button small ghost"
 								aria-label="Rename “{document.title}”"
 								onclick={() => askRename(document)}>Rename</button
 							>
 							<button
 								type="button"
-								class="button small"
+								class="button small ghost delete"
 								aria-label="Delete “{document.title}”"
 								onclick={() => askDelete(document)}>Delete</button
 							>
@@ -278,11 +289,11 @@
 		position: relative;
 		display: flex;
 		flex-direction: column;
-		gap: var(--space-4);
-		max-width: 64rem;
+		gap: var(--space-5);
+		max-width: 68rem;
 		min-height: 100%;
 		margin: 0 auto;
-		padding: var(--space-6) var(--space-4) var(--space-8);
+		padding: var(--space-8) var(--space-6) var(--space-8);
 	}
 
 	.page-head {
@@ -293,8 +304,15 @@
 		gap: var(--space-3);
 	}
 
+	.page-head h1 {
+		font-size: 2.25rem;
+		line-height: 1.1;
+	}
+
 	.count {
+		margin-top: var(--space-1);
 		color: var(--color-text-muted);
+		font-size: 0.9375rem;
 	}
 
 	.actions {
@@ -309,6 +327,10 @@
 		gap: var(--space-2);
 	}
 
+	.search input {
+		max-width: 28rem;
+	}
+
 	.loading {
 		display: flex;
 		justify-content: center;
@@ -320,22 +342,22 @@
 		list-style: none;
 		margin: 0;
 		padding: 0;
-		border: 1px solid var(--color-border);
-		border-radius: var(--radius-md);
-		overflow: hidden;
+		border-top: 1px solid var(--color-text);
 	}
 
 	.row {
+		position: relative;
 		display: grid;
-		grid-template-columns: minmax(0, 1fr) auto;
-		gap: var(--space-3);
-		align-items: start;
-		padding: var(--space-3) var(--space-4);
-		background: var(--color-bg);
+		grid-template-columns: minmax(0, 1fr) minmax(10rem, 14rem) auto;
+		gap: var(--space-2) var(--space-5);
+		align-items: center;
+		padding: var(--space-4) var(--space-2);
+		border-bottom: 1px solid var(--color-border);
+		transition: background-color 120ms ease;
 	}
 
-	.row + .row {
-		border-top: 1px solid var(--color-border);
+	.row:hover {
+		background: var(--color-surface-elevated);
 	}
 
 	.summary {
@@ -348,39 +370,64 @@
 	.title {
 		align-self: flex-start;
 		max-width: 100%;
+		font-family: var(--font-serif);
 		font-weight: 600;
-		font-size: 1.0625rem;
+		font-size: 1.1875rem;
+		line-height: 1.3;
 		color: var(--color-text);
 		text-decoration: none;
 		overflow-wrap: anywhere;
 	}
 
-	.title:hover {
+	/* The whole row opens the Document; the actions sit above this layer. */
+	.title::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+	}
+
+	.title:focus-visible {
+		outline: none;
+	}
+
+	.title:focus-visible::after {
+		outline: 2px solid var(--color-focus);
+		outline-offset: -2px;
+	}
+
+	.row:hover .title {
 		text-decoration: underline;
+		text-decoration-color: var(--color-accent);
+		text-decoration-thickness: 1px;
+		text-underline-offset: 0.2em;
 	}
 
 	.meta {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 0 var(--space-2);
-		font-size: 0.875rem;
+		font-size: 0.8125rem;
 		color: var(--color-text-muted);
 	}
 
 	.meta span + span::before {
 		content: '·';
 		margin-right: var(--space-2);
+		color: var(--color-text-subtle);
 	}
 
 	.filename {
 		overflow-wrap: anywhere;
 	}
 
+	.state {
+		min-width: 0;
+	}
+
 	.import {
 		display: flex;
 		flex-direction: column;
 		gap: var(--space-2);
-		max-width: 28rem;
 	}
 
 	.status {
@@ -388,7 +435,7 @@
 		flex-wrap: wrap;
 		align-items: center;
 		gap: var(--space-2);
-		font-size: 0.9375rem;
+		font-size: 0.875rem;
 	}
 
 	.status.failed {
@@ -400,8 +447,30 @@
 	}
 
 	.row-actions {
+		position: relative;
+		z-index: 1;
 		display: flex;
-		gap: var(--space-2);
+		gap: var(--space-1);
+		opacity: 0.7;
+		transition: opacity 120ms ease;
+	}
+
+	.row:hover .row-actions,
+	.row:focus-within .row-actions {
+		opacity: 1;
+	}
+
+	.row-actions .button {
+		color: var(--color-text-muted);
+	}
+
+	.row-actions .button:hover {
+		color: var(--color-text);
+	}
+
+	.row-actions .delete:hover {
+		color: var(--color-danger);
+		background: var(--color-danger-soft);
 	}
 
 	.drop-overlay {
@@ -411,22 +480,44 @@
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		background: rgba(232, 240, 233, 0.9);
-		border: 3px dashed var(--color-sage);
+		background: rgba(245, 242, 235, 0.92);
+		border: 3px dashed var(--color-accent);
 		pointer-events: none;
-		font-size: 1.25rem;
+		font-family: var(--font-serif);
+		font-size: 1.5rem;
 		font-weight: 600;
-		color: var(--color-sage);
+		color: var(--color-text);
 	}
 
-	@media (max-width: 639px) {
+	@media (max-width: 767px) {
 		.library {
-			padding: var(--space-4) var(--space-3) var(--space-8);
+			padding: var(--space-5) var(--space-3) var(--space-8);
+			gap: var(--space-4);
+		}
+
+		.page-head h1 {
+			font-size: 1.75rem;
+		}
+
+		.search input {
+			max-width: none;
 		}
 
 		.row {
-			grid-template-columns: minmax(0, 1fr);
-			padding: var(--space-3);
+			grid-template-columns: minmax(0, 1fr) auto;
+			padding: var(--space-3) var(--space-1);
+		}
+
+		.state {
+			grid-column: 1;
+			grid-row: 2;
+		}
+
+		.row-actions {
+			grid-column: 2;
+			grid-row: 1 / span 2;
+			flex-direction: column;
+			opacity: 1;
 		}
 	}
 </style>
