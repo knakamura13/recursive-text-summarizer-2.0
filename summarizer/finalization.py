@@ -7,10 +7,11 @@ With verification enabled, exactly one of two verified texts is published:
    verification pass and the passing remainder is published without a second
    full verification (warning `verified_sentence_subset`).
 
-Nothing is published unless at least one sentence passes that first check;
-otherwise a failure audit is written and `FinalizationVerificationError` is
-raised. The audit's `publication` records the kind, each published sentence
-with its supporting quotations, and every removed sentence with its verdict.
+Nothing is published unless a sentence passes that first check or a rejected
+numbered paraphrase is replaced by its source sentence. Otherwise a failure
+audit is written and `FinalizationVerificationError` is raised. The audit's
+`publication` records the kind, each published sentence with its supporting
+quotations, and every removed sentence with its verdict.
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ from summarizer.checkpoint import (
 )
 from summarizer.compression import (
     compress_to_target,
-    restore_paraphrased_number_sentences,
+    overlapping_numbered_source_sentences,
     retain_sentences_with_missing_literals,
     word_count,
     _above_ceiling,
@@ -86,6 +87,7 @@ from summarizer.verification import (
     DraftSpan,
     ClaimVerdict,
     EvidenceBundle,
+    EvidenceSelection,
     SourceLexicalIndex,
     VerificationConfig,
     VerificationPassResult,
@@ -439,14 +441,247 @@ def _renumber_pass_ordinals(
     return renumbered_spans, tuple(renumbered_claims)
 
 
+def _source_sentence_catalog(
+    source_cores: Mapping[str, str] | None,
+) -> list[tuple[str, str]]:
+    if not source_cores:
+        return []
+    catalog: list[tuple[str, str]] = []
+    for segment_id, core in source_cores.items():
+        for sentence in default_sentence_tokenizer(core):
+            text = sentence.strip()
+            if text:
+                catalog.append((text, segment_id))
+    return catalog
+
+
+def _subset_with_numbered_source_sentences(
+    result: VerificationResult,
+    *,
+    source_index: SourceLexicalIndex,
+    source_cores: Mapping[str, str],
+    strict_numbers: bool,
+    strict_names: bool,
+) -> VerificationResult | None:
+    """Replace a rejected numbered paraphrase with the source sentence.
+
+    A sentence verification accepted stays as written. A contradicted sentence
+    stays dropped. Other rejected sentences that share a number with the source
+    are published in the source's words, cited to that source sentence.
+    """
+    catalog = _source_sentence_catalog(source_cores)
+    if not catalog or not result.failed or not result.pass_results:
+        return None
+    passed = result.pass_results[-1]
+    if passed.failed or not passed.spans or not passed.claims or not passed.assessments:
+        return None
+    verdicts = {
+        assessment.claim_id: assessment.verdict for assessment in passed.assessments
+    }
+    claims_by_id = {claim.claim_id: claim for claim in passed.claims}
+    assessments_by_id = {
+        assessment.claim_id: assessment for assessment in passed.assessments
+    }
+    bundles_by_claim = {bundle.selection.claim_id: bundle for bundle in passed.bundles}
+    claims_by_span: dict[str, list[str]] = {}
+    for claim in passed.claims:
+        claims_by_span.setdefault(claim.span_id, []).append(claim.claim_id)
+    publish_kwargs = {
+        "claims_by_id": claims_by_id,
+        "verdicts": verdicts,
+        "assessments_by_id": assessments_by_id,
+        "bundles_by_claim": bundles_by_claim,
+        "source_index": source_index,
+        "strict_numbers": strict_numbers,
+        "strict_names": strict_names,
+    }
+    source_sentences = [text for text, _segment_id in catalog]
+    segment_for_sentence = {text: segment_id for text, segment_id in catalog}
+    pieces: list[tuple[str, DraftSpan | None, str | None]] = []
+    used: set[str] = set()
+    replaced = False
+    for span in passed.spans:
+        text = span.text.strip()
+        if not text:
+            continue
+        claim_ids = claims_by_span.get(span.span_id, [])
+        if claim_ids and all(
+            _claim_can_publish(claim_id, **publish_kwargs) for claim_id in claim_ids
+        ):
+            pieces.append(("kept", span, None))
+            used.add(text)
+            continue
+        if any(verdicts.get(claim_id) is ClaimVerdict.CONTRADICTED for claim_id in claim_ids):
+            continue
+        additions = [
+            sentence
+            for sentence in overlapping_numbered_source_sentences(text, source_sentences)
+            if sentence not in used
+        ]
+        if not additions:
+            continue
+        replaced = True
+        for sentence in additions:
+            used.add(sentence)
+            pieces.append(("source", None, sentence))
+    if not replaced or not pieces:
+        return None
+
+    span_texts = [
+        item[2] if item[0] == "source" else item[1].text.strip()
+        for item in pieces
+    ]
+    prefix = pieces[0][1].span_id[:3] if pieces[0][0] == "kept" else passed.spans[0].span_id[:3]
+    built_spans: list[DraftSpan] = []
+    cursor = 0
+    for index, sentence in enumerate(span_texts):
+        span_text = sentence if index == len(span_texts) - 1 else f"{sentence} "
+        built_spans.append(
+            DraftSpan(
+                span_id=f"{prefix}S{index + 1:06d}",
+                ordinal=index + 1,
+                start=cursor,
+                end=cursor + len(span_text),
+                text=span_text,
+                content_hash=hashlib.sha256(span_text.encode("utf-8")).hexdigest(),
+            )
+        )
+        cursor += len(span_text)
+    reduced = "".join(span.text for span in built_spans)
+    template = passed.assessments[0]
+    new_claims: list[Claim] = []
+    new_assessments: list[ClaimAssessment] = []
+    new_selections: list[EvidenceSelection] = []
+    new_bundles: list[EvidenceBundle] = []
+    claim_number = 1
+
+    def adopt(assessment: ClaimAssessment, claim_id: str) -> ClaimAssessment:
+        if assessment.verdict is ClaimVerdict.SUPPORTED:
+            promoted = assessment
+        else:
+            finding = _citation_for_promoted_claim(
+                assessment, bundles_by_claim.get(assessment.claim_id)
+            )
+            promoted = replace(assessment, verdict=ClaimVerdict.SUPPORTED, findings=(finding,))
+        return replace(
+            promoted,
+            claim_id=claim_id,
+            findings=tuple(
+                replace(finding, claim_id=claim_id) for finding in promoted.findings
+            ),
+        )
+
+    for built, (kind, original, sentence) in zip(built_spans, pieces, strict=True):
+        if kind == "kept" and original is not None:
+            originals = [
+                claims_by_id[claim_id]
+                for claim_id in claims_by_span.get(original.span_id, [])
+            ]
+            for ordinal, claim in enumerate(originals, start=1):
+                claim_id = f"{prefix}C{claim_number:06d}"
+                claim_number += 1
+                new_claims.append(
+                    replace(claim, claim_id=claim_id, span_id=built.span_id, ordinal=ordinal)
+                )
+                new_assessments.append(adopt(assessments_by_id[claim.claim_id], claim_id))
+                bundle = bundles_by_claim[claim.claim_id]
+                selection = replace(bundle.selection, claim_id=claim_id)
+                new_selections.append(selection)
+                new_bundles.append(replace(bundle, selection=selection))
+            continue
+        assert sentence is not None
+        claim_id = f"{prefix}C{claim_number:06d}"
+        claim_number += 1
+        segment_id = segment_for_sentence[sentence]
+        new_claims.append(
+            Claim(
+                claim_id=claim_id,
+                span_id=built.span_id,
+                ordinal=1,
+                anchor=sentence,
+                is_fallback=False,
+            )
+        )
+        new_assessments.append(
+            ClaimAssessment(
+                claim_id=claim_id,
+                verdict=ClaimVerdict.SUPPORTED,
+                findings=(
+                    BatchFinding(
+                        claim_id=claim_id,
+                        verdict=ClaimVerdict.SUPPORTED,
+                        evidence_ids=(segment_id,),
+                        exact_quotes=(sentence,),
+                    ),
+                ),
+                pass_index=template.pass_index,
+                verifier_provider=template.verifier_provider,
+                verifier_model=template.verifier_model,
+                prompt_version=template.prompt_version,
+            )
+        )
+        selection = EvidenceSelection(
+            claim_id=claim_id,
+            selected_ids=(segment_id,),
+            examined_ids=(segment_id,),
+            omitted_ids=(),
+            token_cost=0,
+            retrieval_method="numbered-source-sentence",
+            retrieval_complete=True,
+        )
+        new_selections.append(selection)
+        new_bundles.append(EvidenceBundle(selection=selection, passages=()))
+    filtered_pass = VerificationPassResult(
+        spans=tuple(built_spans),
+        claims=tuple(new_claims),
+        assessments=tuple(new_assessments),
+        selections=tuple(new_selections),
+        bundles=tuple(new_bundles),
+        generations=getattr(passed, "generations", ()),
+        phase_generations=getattr(passed, "phase_generations", ()),
+        diagnostic_codes=getattr(passed, "diagnostic_codes", ()),
+        failed=False,
+    )
+    return VerificationResult(
+        text=reduced,
+        passes=(tuple(new_assessments),),
+        selections=(tuple(new_selections),),
+        repairs=getattr(result, "repairs", ()),
+        generations=getattr(result, "generations", ()),
+        diagnostic_codes=(
+            *getattr(result, "diagnostic_codes", ()),
+            "verified_sentence_subset",
+        ),
+        exhausted=getattr(result, "exhausted", False),
+        failed=False,
+        pass_results=(filtered_pass,),
+        phase_generations=getattr(result, "phase_generations", ()),
+        warning_codes=(
+            *getattr(result, "warning_codes", ()),
+            "verified_sentence_subset",
+        ),
+    )
+
+
 def _subset_from_first_pass(
     result: VerificationResult,
     *,
     source_index: SourceLexicalIndex,
     strict_numbers: bool = False,
     strict_names: bool = False,
+    source_cores: Mapping[str, str] | None = None,
 ) -> VerificationResult | None:
     """Publish passing sentences from the first failed verification pass."""
+    if source_cores:
+        replaced = _subset_with_numbered_source_sentences(
+            result,
+            source_index=source_index,
+            source_cores=source_cores,
+            strict_numbers=strict_numbers,
+            strict_names=strict_names,
+        )
+        if replaced is not None:
+            return replaced
     reduced = _passing_sentence_text(
         result,
         source_index=source_index,
@@ -545,20 +780,19 @@ def _subset_from_first_pass(
     )
 
 
-def _ordered_source_text(
+def _ordered_source_cores(
     source_cores: Mapping[str, str] | None,
     segments: Sequence[SourceSegment],
-) -> str:
-    """Document text in segment order, used to undo a numbered paraphrase."""
+) -> dict[str, str]:
+    """Document cores in segment order, used when a numbered paraphrase is rejected."""
     if not source_cores:
-        return ""
-    ordered = sorted(segments, key=lambda segment: segment.order)
-    parts = [
-        source_cores[segment.segment_id]
-        for segment in ordered
-        if segment.segment_id in source_cores and source_cores[segment.segment_id].strip()
-    ]
-    return "\n\n".join(parts)
+        return {}
+    ordered: dict[str, str] = {}
+    for segment in sorted(segments, key=lambda item: item.order):
+        core = source_cores.get(segment.segment_id, "")
+        if core.strip():
+            ordered[segment.segment_id] = core
+    return ordered
 
 
 def _compression_source_text(
@@ -1285,6 +1519,8 @@ def _verify_publication(
     coordinator: CacheCoordinator | None,
     target_words: int,
     progress: VerificationProgress,
+    source_cores: Mapping[str, str] | None = None,
+    segments: Sequence[SourceSegment] = (),
 ) -> _VerifiedPublication:
     """Verify the editorial draft once, else publish its passing sentences."""
     ledger = _SentenceLedger(
@@ -1312,6 +1548,7 @@ def _verify_publication(
             source_index=source_index,
             strict_numbers=config.strict_numbers,
             strict_names=config.strict_names,
+            source_cores=_ordered_source_cores(source_cores, segments),
         )
         if subset is not None:
             result = subset
@@ -1402,9 +1639,6 @@ def _finalize_summary(
         strict_numbers=verification.strict_numbers,
         strict_names=verification.strict_names,
     )
-    document_text = _ordered_source_text(source_cores, segments)
-    if document_text:
-        final_text = restore_paraphrased_number_sentences(document_text, final_text)
     audit_warnings = tuple(warnings)
     audit_segments = tuple(segments)
     passages: _EvidencePassages | None = None
@@ -1443,6 +1677,8 @@ def _finalize_summary(
             coordinator=verification_coordinator,
             target_words=target_words,
             progress=VerificationProgress(runtime_observer),
+            source_cores=source_cores,
+            segments=segments,
         )
         if outcome.result.failed:
             _build_audit(

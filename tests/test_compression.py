@@ -5,6 +5,7 @@ from summarizer.compression import (
     compress_to_target,
     restore_paraphrased_number_sentences,
     retain_sentences_with_missing_literals,
+    retain_sentences_with_omitted_numbers,
     word_count,
     _above_ceiling,
     _in_band,
@@ -193,6 +194,45 @@ def test_a_shortening_that_keeps_the_words_stays() -> None:
     rewritten = "The council approved 42 units in March."
 
     assert restore_paraphrased_number_sentences(source, rewritten) == rewritten
+
+
+def test_compression_stops_when_shortening_would_drop_a_number() -> None:
+    source = (
+        "Alpha reviewed the harbour plan in detail before lunch. "
+        "The council approved 42 units in March after a long debate about funding."
+    )
+    provider = Provider(['{"text":"Alpha reviewed the harbour plan."}'])
+    target = 4
+
+    result = compress_to_target(
+        source,
+        provider,
+        source_id="a" * 64,
+        model="m",
+        timeout_seconds=30,
+        target_words=target,
+    )
+
+    assert result.text == source
+    assert word_count(result.text) > target * (1 + BAND_TOLERANCE)
+    assert provider.calls == 1
+
+
+def test_an_omitted_number_is_restored_without_the_strict_switch() -> None:
+    source = "The council approved 42 units in March. Beta closed the meeting."
+    shortened = "Beta closed the meeting."
+
+    restored = retain_sentences_with_omitted_numbers(source, shortened)
+
+    assert "The council approved 42 units in March." in restored
+    assert "Beta closed the meeting." in restored
+
+
+def test_a_rounded_number_is_not_treated_as_omitted() -> None:
+    source = "They built a stunning 963.6 foot skyscraper beside the river."
+    shortened = "They built a stunning nearly 1000 foot skyscraper beside the river."
+
+    assert retain_sentences_with_omitted_numbers(source, shortened) == shortened
 
 
 def test_a_changed_fact_around_a_rounded_number_restores_the_source() -> None:

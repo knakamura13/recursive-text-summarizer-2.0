@@ -31,8 +31,9 @@ _INSTRUCTIONS = """\
 Write one standalone final summary from the grounded summary record supplied as
 data. The record's summary field is already near the intended length of about
 {target_words} words. Polish it for clear organization, consistent terminology,
-and minimal repetition without shortening it materially. Stay within about ten
-percent of the summary field's word count.
+and minimal repetition. You may tighten wording. Do not drop a number, date,
+or count. If keeping those facts makes the summary longer than {target_words}
+words, keep the facts.
 
 Return one JSON object conforming to the supplied schema, and nothing else.
 

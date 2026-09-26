@@ -102,7 +102,7 @@ def test_finalize_summary_resolves_verification_runtime_without_injection() -> N
     ]
 
 
-def test_finalize_replaces_an_editorial_paraphrase_of_a_numbered_sentence() -> None:
+def test_finalize_keeps_an_editorial_paraphrase_when_verification_is_off() -> None:
     counter = ConservativeUtf8TokenCounter()
     document = ingest_text("The crew counted 16 divers on the reef.")
     segment = whole_document_segment(document, counter)
@@ -143,10 +143,10 @@ def test_finalize_replaces_an_editorial_paraphrase_of_a_numbered_sentence() -> N
         source_cores={segment.segment_id: document.text},
     )
 
-    assert result.text == "The crew counted 16 divers on the reef."
+    assert result.text == "The event impacted sixteen divers on the reef."
 
 
-def test_verification_sees_the_restored_numbered_sentence(monkeypatch) -> None:
+def test_verification_sees_the_editorial_paraphrase(monkeypatch) -> None:
     counter = ConservativeUtf8TokenCounter()
     document = ingest_text("The crew counted 16 divers on the reef.")
     segment = whole_document_segment(document, counter)
@@ -205,8 +205,112 @@ def test_verification_sees_the_restored_numbered_sentence(monkeypatch) -> None:
         verification_context_window_tokens=10_000,
     )
 
-    assert checked == ["The crew counted 16 divers on the reef."]
-    assert result.text == "The crew counted 16 divers on the reef."
+    assert checked == ["The event impacted sixteen divers on the reef."]
+    assert result.text == "The event impacted sixteen divers on the reef."
+
+
+def test_rejected_numbered_paraphrase_publishes_the_source_sentence(monkeypatch) -> None:
+    counter = ConservativeUtf8TokenCounter()
+    document = ingest_text("The crew counted 16 divers on the reef.")
+    segment = whole_document_segment(document, counter)
+    summary = SummaryNode.model_validate(
+        {
+            "summary": document.text,
+            "content_units": [],
+            "entities": [],
+            "qualifications": [],
+            "contradictions": [],
+            "quotations": [],
+            "provenance": [segment.segment_id],
+            "level": 0,
+        }
+    )
+    root = TreeNode("L0N0001", 0, 0, summary, (), (segment.segment_id,))
+    paraphrase = "The event impacted sixteen divers on the reef."
+    checked: list[str] = []
+
+    def verify(text, **kwargs):
+        checked.append(text)
+        span = _draft_span("V01S000001", 1, text, 0)
+        claim = Claim("V01C000001", "V01S000001", 1, text.strip(), False)
+        index = build_source_lexical_index(
+            provenance_ids=(segment.segment_id,),
+            source={segment.segment_id: document.text},
+        )
+        bundle = select_claim_evidence(
+            claim,
+            source_index=index,
+            counter=counter,
+            max_tokens=1000,
+        )
+        assessment = ClaimAssessment(
+            claim_id=claim.claim_id,
+            verdict=ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+            findings=(
+                BatchFinding(
+                    claim_id=claim.claim_id,
+                    verdict=ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+                    evidence_ids=(),
+                    exact_quotes=(),
+                ),
+            ),
+            pass_index=1,
+            verifier_provider="test",
+            verifier_model="test",
+            prompt_version="verification-classification/1",
+        )
+        passed = VerificationPassResult(
+            spans=(span,),
+            claims=(claim,),
+            assessments=(assessment,),
+            selections=(bundle.selection,),
+            bundles=(bundle,),
+            generations=(),
+            phase_generations=(),
+            diagnostic_codes=(),
+            failed=False,
+        )
+        return VerificationResult(
+            text=text,
+            passes=((assessment,),),
+            selections=((bundle.selection,),),
+            repairs=(),
+            generations=(),
+            diagnostic_codes=("insufficient_support",),
+            exhausted=False,
+            failed=True,
+            pass_results=(passed,),
+        )
+
+    monkeypatch.setattr("summarizer.finalization.verify_and_repair", verify)
+
+    class Provider:
+        def generate(self, request):
+            return GenerationResult(
+                json.dumps({"text": paraphrase}),
+                "fake",
+                request.model,
+            )
+
+    result = finalize_summary(
+        summary,
+        Provider(),
+        source_id=document.source_id,
+        model="test-model",
+        timeout_seconds=30,
+        target_words=8,
+        strategy="direct",
+        segments=(segment,),
+        nodes=(root,),
+        root_node_id=root.node_id,
+        counter=counter,
+        source_cores={segment.segment_id: document.text},
+        verification=VerificationConfig(enabled=True),
+        verification_context_window_tokens=10_000,
+    )
+
+    assert checked == [paraphrase]
+    assert result.text == document.text
 
 
 def test_failed_editorial_without_passing_sentences_stays_unpublished(tmp_path) -> None:
@@ -1113,3 +1217,103 @@ def test_subset_publishes_when_leniency_keeps_every_sentence() -> None:
     assert second in result.text
     published = _published_sentences(result.text, result, passages=None)
     assert [sentence.text for sentence in published] == [first, second]
+
+
+def test_subset_replaces_a_rejected_numbered_paraphrase_with_the_source_sentence() -> None:
+    kept = "The harbour opened in May."
+    paraphrase = "The event impacted sixteen divers on the reef."
+    contradicted = "Nearly 1000 people died."
+    source_sentence = "The crew counted 16 divers on the reef."
+    rescued = "963 people were rescued."
+    draft = f"{kept} {paraphrase} {contradicted}"
+    index = build_source_lexical_index(
+        provenance_ids=("S000001", "S000002", "S000003"),
+        source={
+            "S000001": kept,
+            "S000002": source_sentence,
+            "S000003": rescued,
+        },
+    )
+    texts = (kept, paraphrase, contradicted)
+    spans = []
+    cursor = 0
+    for index_number, text in enumerate(texts, start=1):
+        piece = text if index_number == len(texts) else f"{text} "
+        spans.append(_draft_span(f"V01S{index_number:06d}", index_number, piece, cursor))
+        cursor += len(piece)
+    claims = tuple(
+        Claim(f"V01C{number:06d}", f"V01S{number:06d}", 1, text, False)
+        for number, text in enumerate(texts, start=1)
+    )
+    bundles = tuple(
+        select_claim_evidence(
+            claim,
+            source_index=index,
+            counter=ConservativeUtf8TokenCounter(),
+            max_tokens=1000,
+        )
+        for claim in claims
+    )
+    verdicts = (
+        ClaimVerdict.SUPPORTED,
+        ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+        ClaimVerdict.CONTRADICTED,
+    )
+    quotes = ((kept,), (), (rescued,))
+    evidence_ids = (("S000001",), (), ("S000003",))
+    assessments = tuple(
+        ClaimAssessment(
+            claim_id=claim.claim_id,
+            verdict=verdict,
+            findings=(
+                BatchFinding(
+                    claim_id=claim.claim_id,
+                    verdict=verdict,
+                    evidence_ids=ids,
+                    exact_quotes=quote,
+                ),
+            ),
+            pass_index=1,
+            verifier_provider="test",
+            verifier_model="test",
+            prompt_version="verification-classification/1",
+        )
+        for claim, verdict, ids, quote in zip(claims, verdicts, evidence_ids, quotes, strict=True)
+    )
+    passed = VerificationPassResult(
+        spans=tuple(spans),
+        claims=claims,
+        assessments=assessments,
+        selections=tuple(bundle.selection for bundle in bundles),
+        bundles=bundles,
+        generations=(),
+        phase_generations=(),
+        diagnostic_codes=(),
+        failed=False,
+    )
+    result = _subset_from_first_pass(
+        VerificationResult(
+            text=draft,
+            passes=(assessments,),
+            selections=(passed.selections,),
+            repairs=(),
+            generations=(),
+            diagnostic_codes=("insufficient_support", "contradicted"),
+            exhausted=False,
+            failed=True,
+            pass_results=(passed,),
+        ),
+        source_index=index,
+        source_cores={
+            "S000001": kept,
+            "S000002": source_sentence,
+            "S000003": rescued,
+        },
+    )
+
+    assert result is not None
+    published = _published_sentences(result.text, result, passages=None)
+    assert [sentence.text for sentence in published] == [kept, source_sentence]
+    assert published[1].verdict == "supported"
+    assert published[1].evidence[0].quote == source_sentence
+    assert "died" not in result.text

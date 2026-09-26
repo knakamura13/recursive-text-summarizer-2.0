@@ -45,7 +45,7 @@ def test_request_is_a_dedicated_genre_neutral_fenced_final_call() -> None:
     assert request.response_schema is not None
     assert "near the intended length of about" in request.instructions
     assert "120 words" in request.instructions
-    assert "without shortening it materially" in request.instructions
+    assert "Do not drop a number" in request.instructions
     assert "unsupported" in request.instructions
     assert "qualifications" in request.instructions
     assert "article" not in request.instructions.lower()
