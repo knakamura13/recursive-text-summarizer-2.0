@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
@@ -105,6 +106,38 @@ def retain_sentences_with_missing_literals(
     return f"{shortened}\n\n{' '.join(restored)}"
 
 
+def retain_sentences_with_omitted_numbers(source_chunk: str, shortened: str) -> str:
+    """Put back a source sentence whose number the shortened text dropped.
+
+    A rounding that keeps an approximation word stays. A sentence with no
+    number may be omitted.
+    """
+    compact = shortened.strip()
+    if not compact:
+        return source_chunk.strip()
+    compact_cf = compact.casefold()
+    short_values = _number_values(compact)
+    restored: list[str] = []
+    for sentence in default_sentence_tokenizer(source_chunk):
+        text = sentence.strip()
+        if not text or text.casefold() in compact_cf:
+            continue
+        values = _number_values(text)
+        if not values:
+            continue
+        if short_values and _numbers_close(compact, values, short_values):
+            continue
+        restored.append(text)
+    if not restored:
+        return compact
+    return f"{compact}\n\n{' '.join(restored)}"
+
+
+def _omits_a_number(source_text: str, shortened: str) -> bool:
+    """True when `shortened` drops a number that `source_text` stated."""
+    return retain_sentences_with_omitted_numbers(source_text, shortened) != shortened.strip()
+
+
 def restore_paraphrased_number_sentences(source_text: str, rewritten: str) -> str:
     """Replace a rewrite that keeps a number but changes the other words.
 
@@ -140,17 +173,30 @@ def restore_paraphrased_number_sentences(source_text: str, rewritten: str) -> st
     return " ".join(pieces)
 
 
+def overlapping_numbered_source_sentences(
+    sentence: str, source_sentences: Sequence[str]
+) -> list[str]:
+    """Source sentences that share a number and a content word with `sentence`.
+
+    The sentence itself is not a replacement for itself. A caller decides whether
+    a faithful shortening should stay.
+    """
+    if not _number_values(sentence):
+        return []
+    stripped = sentence.strip()
+    return [
+        source
+        for source in source_sentences
+        if source.strip() != stripped
+        and _shares_number(sentence, source)
+        and (_content_tokens(sentence) & _content_tokens(source))
+    ]
+
+
 def _paraphrased_source_sentences(
     sentence: str, source_sentences: list[str]
 ) -> list[str] | None:
-    if not _number_values(sentence):
-        return None
-    overlapping = [
-        source
-        for source in source_sentences
-        if _shares_number(sentence, source)
-        and (_content_tokens(sentence) & _content_tokens(source))
-    ]
+    overlapping = overlapping_numbered_source_sentences(sentence, source_sentences)
     if not overlapping:
         return None
     if any(_rewrite_keeps_source_words(sentence, source) for source in overlapping):
@@ -432,6 +478,7 @@ def compress_to_target(
             word_count(current), target_words
         ):
             break
+        previous = current
         current, gens = _compress_pass(
             current,
             provider,
@@ -444,6 +491,9 @@ def compress_to_target(
             strict_names=strict_names,
         )
         all_generations.extend(gens)
+        if word_count(current) >= word_count(previous) or _omits_a_number(previous, current):
+            current = previous
+            break
         passes_run = pass_index
         if _in_band(word_count(current), target_words) or _under_floor(
             word_count(current), target_words
@@ -454,6 +504,7 @@ def compress_to_target(
         passes_run == MAX_PASSES
         and _above_ceiling(word_count(current), target_words)
     ):
+        previous = current
         current, gens = _compress_pass(
             current,
             provider,
@@ -466,7 +517,10 @@ def compress_to_target(
             strict_names=strict_names,
         )
         all_generations.extend(gens)
-        passes_run = MAX_PASSES + 1
+        if word_count(current) >= word_count(previous) or _omits_a_number(previous, current):
+            current = previous
+        else:
+            passes_run = MAX_PASSES + 1
 
     return CompressionResult(
         text=current.strip(),
