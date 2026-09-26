@@ -102,6 +102,113 @@ def test_finalize_summary_resolves_verification_runtime_without_injection() -> N
     ]
 
 
+def test_finalize_replaces_an_editorial_paraphrase_of_a_numbered_sentence() -> None:
+    counter = ConservativeUtf8TokenCounter()
+    document = ingest_text("The crew counted 16 divers on the reef.")
+    segment = whole_document_segment(document, counter)
+    summary = SummaryNode.model_validate(
+        {
+            "summary": document.text,
+            "content_units": [],
+            "entities": [],
+            "qualifications": [],
+            "contradictions": [],
+            "quotations": [],
+            "provenance": [segment.segment_id],
+            "level": 0,
+        }
+    )
+    root = TreeNode("L0N0001", 0, 0, summary, (), (segment.segment_id,))
+
+    class Provider:
+        def generate(self, request):
+            return GenerationResult(
+                json.dumps({"text": "The event impacted sixteen divers on the reef."}),
+                "fake",
+                request.model,
+            )
+
+    result = finalize_summary(
+        summary,
+        Provider(),
+        source_id=document.source_id,
+        model="test-model",
+        timeout_seconds=30,
+        target_words=8,
+        strategy="direct",
+        segments=(segment,),
+        nodes=(root,),
+        root_node_id=root.node_id,
+        counter=counter,
+        source_cores={segment.segment_id: document.text},
+    )
+
+    assert result.text == "The crew counted 16 divers on the reef."
+
+
+def test_verification_sees_the_restored_numbered_sentence(monkeypatch) -> None:
+    counter = ConservativeUtf8TokenCounter()
+    document = ingest_text("The crew counted 16 divers on the reef.")
+    segment = whole_document_segment(document, counter)
+    summary = SummaryNode.model_validate(
+        {
+            "summary": document.text,
+            "content_units": [],
+            "entities": [],
+            "qualifications": [],
+            "contradictions": [],
+            "quotations": [],
+            "provenance": [segment.segment_id],
+            "level": 0,
+        }
+    )
+    root = TreeNode("L0N0001", 0, 0, summary, (), (segment.segment_id,))
+    checked: list[str] = []
+
+    def verify(text, **kwargs):
+        checked.append(text)
+        return VerificationResult(
+            text=text,
+            passes=(),
+            selections=(),
+            repairs=(),
+            generations=(),
+            diagnostic_codes=(),
+            exhausted=False,
+            failed=False,
+        )
+
+    monkeypatch.setattr("summarizer.finalization.verify_and_repair", verify)
+
+    class Provider:
+        def generate(self, request):
+            return GenerationResult(
+                json.dumps({"text": "The event impacted sixteen divers on the reef."}),
+                "fake",
+                request.model,
+            )
+
+    result = finalize_summary(
+        summary,
+        Provider(),
+        source_id=document.source_id,
+        model="test-model",
+        timeout_seconds=30,
+        target_words=8,
+        strategy="direct",
+        segments=(segment,),
+        nodes=(root,),
+        root_node_id=root.node_id,
+        counter=counter,
+        source_cores={segment.segment_id: document.text},
+        verification=VerificationConfig(enabled=True),
+        verification_context_window_tokens=10_000,
+    )
+
+    assert checked == ["The crew counted 16 divers on the reef."]
+    assert result.text == "The crew counted 16 divers on the reef."
+
+
 def test_failed_editorial_without_passing_sentences_stays_unpublished(tmp_path) -> None:
     class FallbackProvider:
         def __init__(self) -> None:
@@ -911,3 +1018,98 @@ def test_lenient_subset_publishes_with_supported_evidence() -> None:
     assert published[0].text == kept
     assert published[0].verdict == "supported"
     assert published[0].evidence[0].quote == kept_source
+
+
+def test_subset_publishes_when_leniency_keeps_every_sentence() -> None:
+    first = "The harbour opened in May."
+    second = "They built a stunning nearly 1000 foot skyscraper."
+    draft = f"{first} {second}"
+    index = build_source_lexical_index(
+        provenance_ids=("S000001", "S000002"),
+        source={
+            "S000001": "The harbour opened in May.",
+            "S000002": "They built a stunning 963.6 foot skyscraper.",
+        },
+    )
+    spans = (
+        _draft_span("V01S000001", 1, f"{first} ", 0),
+        _draft_span("V01S000002", 2, second, len(first) + 1),
+    )
+    claims = (
+        Claim("V01C000001", "V01S000001", 1, first, False),
+        Claim("V01C000002", "V01S000002", 1, second, False),
+    )
+    bundles = tuple(
+        select_claim_evidence(
+            claim,
+            source_index=index,
+            counter=ConservativeUtf8TokenCounter(),
+            max_tokens=1000,
+        )
+        for claim in claims
+    )
+    assessments = (
+        ClaimAssessment(
+            claim_id=claims[0].claim_id,
+            verdict=ClaimVerdict.SUPPORTED,
+            findings=(
+                BatchFinding(
+                    claim_id=claims[0].claim_id,
+                    verdict=ClaimVerdict.SUPPORTED,
+                    evidence_ids=("S000001",),
+                    exact_quotes=("The harbour opened in May.",),
+                ),
+            ),
+            pass_index=1,
+            verifier_provider="test",
+            verifier_model="test",
+            prompt_version="verification-classification/1",
+        ),
+        ClaimAssessment(
+            claim_id=claims[1].claim_id,
+            verdict=ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+            findings=(
+                BatchFinding(
+                    claim_id=claims[1].claim_id,
+                    verdict=ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+                    evidence_ids=(),
+                    exact_quotes=(),
+                ),
+            ),
+            pass_index=1,
+            verifier_provider="test",
+            verifier_model="test",
+            prompt_version="verification-classification/1",
+        ),
+    )
+    passed = VerificationPassResult(
+        spans=spans,
+        claims=claims,
+        assessments=assessments,
+        selections=tuple(bundle.selection for bundle in bundles),
+        bundles=bundles,
+        generations=(),
+        phase_generations=(),
+        diagnostic_codes=(),
+        failed=False,
+    )
+    result = _subset_from_first_pass(
+        VerificationResult(
+            text=draft,
+            passes=(assessments,),
+            selections=(passed.selections,),
+            repairs=(),
+            generations=(),
+            diagnostic_codes=("insufficient_support",),
+            exhausted=False,
+            failed=True,
+            pass_results=(passed,),
+        ),
+        source_index=index,
+    )
+
+    assert result is not None
+    assert first in result.text
+    assert second in result.text
+    published = _published_sentences(result.text, result, passages=None)
+    assert [sentence.text for sentence in published] == [first, second]

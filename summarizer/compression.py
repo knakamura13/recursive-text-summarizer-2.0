@@ -14,6 +14,13 @@ from summarizer.providers.base import GenerationRequest, GenerationResult, Model
 from summarizer.safety import redact_text
 from summarizer.segmentation import CacheCoordinator
 from summarizer.text import chunk_text_by_sentences, default_sentence_tokenizer
+from summarizer.verification import (
+    _APPROX_WORDS,
+    _NUMBER_WORD,
+    _content_tokens,
+    _number_values,
+    _numbers_close,
+)
 
 COMPRESSION_PROMPT_VERSION = "compression-prompt/1"
 COMPRESSION_SCHEMA_NAME = "compression_draft"
@@ -96,6 +103,83 @@ def retain_sentences_with_missing_literals(
     if not restored:
         return shortened
     return f"{shortened}\n\n{' '.join(restored)}"
+
+
+def restore_paraphrased_number_sentences(source_text: str, rewritten: str) -> str:
+    """Replace a rewrite that keeps a number but changes the other words.
+
+    A shortening or a rounding that keeps the remaining words stays. Omitting a
+    numbered sentence stays omitted. A nearby number without an approximation
+    word is a different fact, so the rewrite stays for verification to judge.
+    """
+    shortened = rewritten.strip()
+    if not shortened:
+        return source_text.strip()
+    source_sentences = [
+        sentence.strip()
+        for sentence in default_sentence_tokenizer(source_text)
+        if sentence.strip()
+    ]
+    rewritten_sentences = [
+        sentence.strip()
+        for sentence in default_sentence_tokenizer(shortened)
+        if sentence.strip()
+    ]
+    pieces: list[str] = []
+    used: set[str] = set()
+    for sentence in rewritten_sentences:
+        replacement = _paraphrased_source_sentences(sentence, source_sentences)
+        if replacement is None:
+            pieces.append(sentence)
+            continue
+        for source_sentence in replacement:
+            if source_sentence in used:
+                continue
+            used.add(source_sentence)
+            pieces.append(source_sentence)
+    return " ".join(pieces)
+
+
+def _paraphrased_source_sentences(
+    sentence: str, source_sentences: list[str]
+) -> list[str] | None:
+    if not _number_values(sentence):
+        return None
+    overlapping = [
+        source
+        for source in source_sentences
+        if _shares_number(sentence, source)
+        and (_content_tokens(sentence) & _content_tokens(source))
+    ]
+    if not overlapping:
+        return None
+    if any(_rewrite_keeps_source_words(sentence, source) for source in overlapping):
+        return None
+    return overlapping
+
+
+def _shares_number(rewritten: str, source: str) -> bool:
+    rewritten_numbers = _number_values(rewritten)
+    source_numbers = _number_values(source)
+    if not rewritten_numbers or not source_numbers:
+        return False
+    approximate = bool(
+        _APPROX_WORDS.intersection(_NUMBER_WORD.findall(rewritten.casefold()))
+    )
+    for left in rewritten_numbers:
+        for right in source_numbers:
+            if left == right:
+                return True
+            if approximate and abs(left - right) <= 0.10 * max(abs(right), 1.0):
+                return True
+    return False
+
+
+def _rewrite_keeps_source_words(rewritten: str, source: str) -> bool:
+    tokens = _content_tokens(rewritten)
+    if not tokens or not tokens <= _content_tokens(source):
+        return False
+    return _numbers_close(rewritten, _number_values(rewritten), _number_values(source))
 
 
 def _enabled_literal_missing(

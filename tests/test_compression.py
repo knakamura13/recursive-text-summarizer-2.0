@@ -3,6 +3,7 @@ from summarizer.compression import (
     RETENTION_RATIO,
     build_compression_request,
     compress_to_target,
+    restore_paraphrased_number_sentences,
     retain_sentences_with_missing_literals,
     word_count,
     _above_ceiling,
@@ -145,3 +146,60 @@ def test_strict_names_restores_a_shortened_name() -> None:
         source, shortened, strict_names=True
     )
     assert "Elyse Saugstad" in restored
+
+
+def test_a_paraphrase_that_keeps_numbers_is_replaced_by_the_source_sentences() -> None:
+    source = (
+        "The crew counted 16 divers on the reef. "
+        "A slab nearly 200 feet across and 3 feet deep broke loose."
+    )
+    rewritten = (
+        "The event impacted sixteen divers on the reef, originating from a slab "
+        "that cracked a meadow, measuring nearly 200 feet across and 3 feet deep."
+    )
+
+    restored = restore_paraphrased_number_sentences(source, rewritten)
+
+    assert "The crew counted 16 divers on the reef." in restored
+    assert "A slab nearly 200 feet across and 3 feet deep broke loose." in restored
+    assert "The event impacted" not in restored
+
+
+def test_a_rounded_sentence_with_the_same_words_stays() -> None:
+    source = "They built a stunning 963.6 foot skyscraper beside the river."
+    rewritten = "They built a stunning nearly 1000 foot skyscraper beside the river."
+
+    assert restore_paraphrased_number_sentences(source, rewritten) == rewritten
+
+
+def test_omitting_a_numbered_sentence_does_not_restore_it() -> None:
+    source = "They built a stunning 963.6 foot skyscraper beside the river. The river flooded."
+    rewritten = "The river flooded."
+
+    assert restore_paraphrased_number_sentences(source, rewritten) == rewritten
+
+
+def test_a_different_year_is_not_treated_as_a_rounded_source_sentence() -> None:
+    source = "The lake froze in 1910."
+    rewritten = "The lake froze in 1911."
+
+    restored = restore_paraphrased_number_sentences(source, rewritten)
+
+    assert restored == rewritten
+
+
+def test_a_shortening_that_keeps_the_words_stays() -> None:
+    source = "The council approved 42 units in March after a long debate."
+    rewritten = "The council approved 42 units in March."
+
+    assert restore_paraphrased_number_sentences(source, rewritten) == rewritten
+
+
+def test_a_changed_fact_around_a_rounded_number_restores_the_source() -> None:
+    source = "963 people were rescued."
+    rewritten = "Nearly 1000 people died."
+
+    restored = restore_paraphrased_number_sentences(source, rewritten)
+
+    assert "963 people were rescued." in restored
+    assert "died" not in restored
