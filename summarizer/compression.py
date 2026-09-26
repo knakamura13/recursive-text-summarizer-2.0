@@ -65,11 +65,17 @@ def _literal_kept(literal: str, compressed: str) -> bool:
     return literal.casefold() in compressed.casefold()
 
 
-def retain_sentences_with_missing_literals(source_chunk: str, compressed: str) -> str:
-    """Put back source sentences whose names or numbers the shortened text dropped.
+def retain_sentences_with_missing_literals(
+    source_chunk: str,
+    compressed: str,
+    *,
+    strict_numbers: bool = False,
+    strict_names: bool = False,
+) -> str:
+    """Put back source sentences whose enabled literals the shortened text dropped.
 
-    Applies to every sentence in the chunk. Sentences with neither a number nor
-    a multi-word name may be omitted.
+    With both switches off, a rounded number or a shortened name stays as written.
+    Sentences with neither a number nor a multi-word name may be omitted either way.
     """
     shortened = compressed.strip()
     if not shortened:
@@ -80,12 +86,34 @@ def retain_sentences_with_missing_literals(source_chunk: str, compressed: str) -
         text = sentence.strip()
         if not text or text.casefold() in shortened_cf:
             continue
-        literals = _literal_tokens(text)
-        if literals and any(not _literal_kept(literal, shortened) for literal in literals):
+        if _enabled_literal_missing(
+            text,
+            shortened,
+            strict_numbers=strict_numbers,
+            strict_names=strict_names,
+        ):
             restored.append(text)
     if not restored:
         return shortened
     return f"{shortened}\n\n{' '.join(restored)}"
+
+
+def _enabled_literal_missing(
+    sentence: str,
+    shortened: str,
+    *,
+    strict_numbers: bool,
+    strict_names: bool,
+) -> bool:
+    for literal in _literal_tokens(sentence):
+        is_number = literal[:1].isdigit()
+        if is_number and not strict_numbers:
+            continue
+        if not is_number and not strict_names:
+            continue
+        if not _literal_kept(literal, shortened):
+            return True
+    return False
 
 
 def _band(target_words: int) -> tuple[float, float]:
@@ -187,6 +215,8 @@ def _compress_chunk(
     pass_index: int,
     chunk_index: int,
     coordinator: CacheCoordinator | None,
+    strict_numbers: bool,
+    strict_names: bool,
 ) -> tuple[str, GenerationResult | None]:
     input_words = word_count(chunk)
     target_word_count = max(1, int(input_words * RETENTION_RATIO))
@@ -236,7 +266,12 @@ def _compress_chunk(
             encode=lambda value: {"text": value},
             compute=compute,
         )
-    return retain_sentences_with_missing_literals(chunk, text), generation
+    return retain_sentences_with_missing_literals(
+        chunk,
+        text,
+        strict_numbers=strict_numbers,
+        strict_names=strict_names,
+    ), generation
 
 
 def _compress_pass(
@@ -248,6 +283,8 @@ def _compress_pass(
     timeout_seconds: float,
     pass_index: int,
     coordinator: CacheCoordinator | None,
+    strict_numbers: bool,
+    strict_names: bool,
 ) -> tuple[str, tuple[GenerationResult, ...]]:
     chunks = chunk_text_by_sentences(text, CHUNK_CHAR_LIMIT)
     generations: list[GenerationResult] = []
@@ -262,6 +299,8 @@ def _compress_pass(
             pass_index=pass_index,
             chunk_index=index,
             coordinator=coordinator,
+            strict_numbers=strict_numbers,
+            strict_names=strict_names,
         )
         outputs.append(compressed)
         if generation is not None:
@@ -288,6 +327,8 @@ def compress_to_target(
     timeout_seconds: float,
     target_words: int,
     coordinator: CacheCoordinator | None = None,
+    strict_numbers: bool = False,
+    strict_names: bool = False,
 ) -> CompressionResult:
     """Shorten `text` toward `target_words` with up to four whole-document passes."""
     if target_words <= 0:
@@ -315,6 +356,8 @@ def compress_to_target(
             timeout_seconds=timeout_seconds,
             pass_index=pass_index,
             coordinator=coordinator,
+            strict_numbers=strict_numbers,
+            strict_names=strict_names,
         )
         all_generations.extend(gens)
         passes_run = pass_index
@@ -335,6 +378,8 @@ def compress_to_target(
             timeout_seconds=timeout_seconds,
             pass_index=MAX_PASSES + 1,
             coordinator=coordinator,
+            strict_numbers=strict_numbers,
+            strict_names=strict_names,
         )
         all_generations.extend(gens)
         passes_run = MAX_PASSES + 1

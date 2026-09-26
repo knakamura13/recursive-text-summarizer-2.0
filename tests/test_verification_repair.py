@@ -8,6 +8,7 @@ from summarizer.grounding import SourcePassage
 from summarizer.providers.base import GenerationResult
 from summarizer.providers.base import ProviderError
 from summarizer.tokenization import ConservativeUtf8TokenCounter
+from summarizer.finalization import _passing_sentence_text
 from summarizer.verification import (
     Claim,
     ClaimVerdict,
@@ -302,6 +303,63 @@ def test_verify_once_escalates_raw_contradictions_through_omitted_evidence() -> 
     ]
     escalation_request = provider.requests[-1]
     assert all(segment_id in escalation_request.input_text for segment_id in ("S000002", "S000003", "S000004"))
+
+
+def test_unusable_escalation_keeps_recorded_verdicts() -> None:
+    class ScriptedProvider:
+        def __init__(self) -> None:
+            self.requests = []
+            self.responses = iter(
+                (
+                    '{"spans":[{"span_id":"V01S000001","anchors":[]},{"span_id":"V01S000002","anchors":[]}]}',
+                    '{"findings":[{"claim_id":"V01C000001","verdict":"supported","evidence":[{"segment_id":"S000001","exact_quote":"The value is 42."}]},{"claim_id":"V01C000002","verdict":"contradicted","evidence":[{"segment_id":"S000002","exact_quote":"The total is 99."}]}]}',
+                    "not-json",
+                    "not-json",
+                )
+            )
+
+        def generate(self, request):
+            self.requests.append(request)
+            return GenerationResult(next(self.responses), "scripted", "model")
+
+    source_index = build_source_lexical_index(
+        provenance_ids=("S000001", "S000002", "S000003"),
+        source={
+            "S000001": "The value is 42.",
+            "S000002": "The total is 99.",
+            "S000003": "The total is 100.",
+        },
+    )
+    draft = "The value is 42. The total is 99."
+    provider = ScriptedProvider()
+    checked = verify_draft_once(
+        draft,
+        source_id="a" * 64,
+        source_index=source_index,
+        runtime=VerificationRuntime(provider, ConservativeUtf8TokenCounter(), "model", 30, 10_000),
+        config=VerificationConfig(enabled=True, evidence_tokens=80),
+        pass_index=1,
+        terminalize_errors=True,
+    )
+
+    assert not checked.failed
+    assert [assessment.verdict for assessment in checked.assessments] == [
+        ClaimVerdict.SUPPORTED,
+        ClaimVerdict.CONTRADICTED,
+    ]
+    assert "escalation_classification_failed" in checked.diagnostic_codes
+    assert checked.selections[1].retrieval_method == "lexical-overlap-required/3"
+    assert len(provider.requests) == 4
+
+    published = verify_and_repair(
+        draft,
+        source_id="a" * 64,
+        source_index=source_index,
+        runtime=VerificationRuntime(ScriptedProvider(), ConservativeUtf8TokenCounter(), "model", 30, 10_000),
+        config=VerificationConfig(enabled=True, evidence_tokens=80),
+    )
+    kept = _passing_sentence_text(published, source_index=source_index)
+    assert kept == "The value is 42."
 
 
 def test_verify_and_repair_reverifies_the_complete_repaired_draft() -> None:

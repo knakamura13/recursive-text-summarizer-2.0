@@ -55,6 +55,8 @@ export interface RunConfig {
 	max_concurrency: number;
 	timeout_seconds: number;
 	max_retries: number;
+	strict_numbers: boolean;
+	strict_names: boolean;
 }
 
 export type ClearableConfigField = 'context_window' | 'chunk_tokens' | 'max_merge_children';

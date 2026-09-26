@@ -80,7 +80,9 @@ def test_parse_args_returns_exact_defaults() -> None:
     assert parsed.app.output_path == Path("output.txt")
     assert parsed.app.model == "gpt-4o-mini"
     assert parsed.app.provider == "openai"
-    assert parsed.app.timeout_seconds == 180
+    assert parsed.app.timeout_seconds == 600
+    assert parsed.pipeline.verification.strict_numbers is False
+    assert parsed.pipeline.verification.strict_names is False
     assert parsed.retry.max_attempts == 5
     assert parsed.pipeline.target_words == 300
     assert parsed.pipeline.segmentation is None
@@ -97,7 +99,8 @@ def test_parse_args_supports_pipeline_overrides() -> None:
             "--ollama-host", "http://ollama.internal:11434", "--timeout", "42.5",
             "--max-retries", "3", "--target-words", "120", "--chunk-tokens", "2048",
             "--overlap-tokens", "64", "--max-merge-children", "7", "--verify",
-            "--max-repair-passes", "2", "--citations", "--audit", "audit.json",
+            "--max-repair-passes", "2", "--citations", "--strict-numbers", "--strict-names",
+            "--audit", "audit.json",
             "--cache-dir", "cache", "--run-id", "run-one", "--resume",
             "--max-concurrency", "3", "--dry-run",
         ]
@@ -112,6 +115,8 @@ def test_parse_args_supports_pipeline_overrides() -> None:
     assert parsed.pipeline.max_merge_children == 7
     assert parsed.pipeline.verification.enabled is True
     assert parsed.pipeline.verification.max_repair_passes == 2
+    assert parsed.pipeline.verification.strict_numbers is True
+    assert parsed.pipeline.verification.strict_names is True
     assert parsed.pipeline.include_citations is True
     assert parsed.pipeline.audit_path == Path("audit.json")
     assert parsed.pipeline.cache.enabled is True
@@ -203,7 +208,7 @@ def test_main_uses_discovered_ollama_context_for_budget_and_requests(
     )
 
     assert exit_code == 0
-    assert provider.context_calls == [("local-model", None, 180)]
+    assert provider.context_calls == [("local-model", None, 600)]
     operation_ids = [call.operation_id for call in provider.calls]
     assert operation_ids[0] == "D000001"
     assert operation_ids[-1] == "editorial-final"

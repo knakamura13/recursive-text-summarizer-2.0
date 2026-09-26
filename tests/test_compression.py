@@ -101,6 +101,7 @@ def test_compression_keeps_a_dropped_number_from_any_sentence() -> None:
         model="m",
         timeout_seconds=30,
         target_words=4,
+        strict_numbers=True,
     )
     assert "approved 42 units in March" in result.text
     assert result.text.index("Beta closed") < result.text.index("approved 42")
@@ -116,3 +117,31 @@ def test_compression_does_not_duplicate_a_kept_literal() -> None:
     source = "The council approved 42 units in March. Beta closed the meeting."
     shortened = "The council approved 42 units in March."
     assert retain_sentences_with_missing_literals(source, shortened) == shortened
+
+
+def test_literal_retention_is_off_unless_a_switch_is_on() -> None:
+    source = "They built a stunning 963.6 foot skyscraper beside the river."
+    shortened = "They built a nearly 1000 foot skyscraper beside the river."
+    assert retain_sentences_with_missing_literals(source, shortened) == shortened
+
+    named = "Professional skier Elyse Saugstad wore a backpack."
+    shortened_name = "Professional skier Saugstad wore a backpack."
+    assert retain_sentences_with_missing_literals(named, shortened_name) == shortened_name
+
+
+def test_strict_numbers_restores_a_rounded_sentence() -> None:
+    source = "They built a stunning 963.6 foot skyscraper beside the river."
+    shortened = "They built a nearly 1000 foot skyscraper beside the river."
+    restored = retain_sentences_with_missing_literals(
+        source, shortened, strict_numbers=True
+    )
+    assert "963.6" in restored
+
+
+def test_strict_names_restores_a_shortened_name() -> None:
+    source = "Professional skier Elyse Saugstad wore a backpack."
+    shortened = "Professional skier Saugstad wore a backpack."
+    restored = retain_sentences_with_missing_literals(
+        source, shortened, strict_names=True
+    )
+    assert "Elyse Saugstad" in restored

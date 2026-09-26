@@ -154,6 +154,14 @@
 			<input type="checkbox" bind:checked={config.verify} {disabled} />
 			<span>Verify every summary sentence against the source</span>
 		</label>
+		<label class="checkbox-field span">
+			<input type="checkbox" bind:checked={config.strict_numbers} {disabled} />
+			<span>Keep numbers exactly as written. Off, a summary may round or omit them.</span>
+		</label>
+		<label class="checkbox-field span">
+			<input type="checkbox" bind:checked={config.strict_names} {disabled} />
+			<span>Keep multi-word names exactly as written. Off, a summary may shorten them.</span>
+		</label>
 	</div>
 
 	<details class="advanced" open={advancedInvalid || undefined}>
@@ -193,6 +201,10 @@
 		grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
 		gap: var(--space-4);
 		align-items: start;
+	}
+
+	.checkbox-field.span {
+		grid-column: 1 / -1;
 	}
 
 	.advanced {

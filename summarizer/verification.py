@@ -76,6 +76,8 @@ class VerificationConfig:
     output_reserve_tokens: int = 1024
     safety_margin_tokens: int = 256
     max_repair_passes: int = 1
+    strict_numbers: bool = False
+    strict_names: bool = False
 
     def __post_init__(self) -> None:
         for name in ("evidence_tokens", "request_tokens", "output_reserve_tokens"):
@@ -651,6 +653,137 @@ def claim_drop_blocked_by_omitted_required(
         return False
     omitted = set(bundle.selection.omitted_ids)
     return bool(required & omitted)
+
+
+_LENIENT_STOP = frozenset(
+    "a an the of to in on for and or with from by at as is was were be been being "
+    "that this it its their his her".split()
+)
+_APPROX_WORDS = frozenset(
+    "nearly almost about around approximately roughly over under some".split()
+)
+_UNIT_FOLDS = {"ft": "foot", "feet": "foot", "foot": "foot"}
+_CARDINALS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_NUMBER_WORD = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)?")
+_DECIMAL_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def _number_values(text: str) -> list[float]:
+    values = [
+        float(match.group().replace(",", "")) for match in _DECIMAL_NUMBER.finditer(text)
+    ]
+    ones = {word: value for word, value in _CARDINALS.items() if value < 20}
+    tens = {word: value for word, value in _CARDINALS.items() if value >= 20}
+    for word in _NUMBER_WORD.findall(text.casefold()):
+        if "-" in word:
+            left, right = word.split("-", 1)
+            if left in tens and right in ones and ones[right] < 10:
+                values.append(float(tens[left] + ones[right]))
+            continue
+        if word in _CARDINALS:
+            values.append(float(_CARDINALS[word]))
+    return values
+
+
+def _content_tokens(text: str) -> set[str]:
+    ones = {word for word, value in _CARDINALS.items() if value < 20}
+    tens = {word for word, value in _CARDINALS.items() if value >= 20}
+    tokens: set[str] = set()
+    for word in _NUMBER_WORD.findall(text):
+        folded = word.casefold()
+        if "-" in folded:
+            left, right = folded.split("-", 1)
+            if left in tens and right in ones:
+                continue
+        if folded in _LENIENT_STOP or folded in _APPROX_WORDS or folded in _CARDINALS:
+            continue
+        tokens.add(_UNIT_FOLDS.get(folded, folded))
+    return tokens
+
+
+def _numbers_close(claim_text: str, claim_numbers: Sequence[float], evidence_numbers: Sequence[float]) -> bool:
+    """Allow an equal value, or a rounded value only when the claim says it is approximate."""
+    if not claim_numbers or not evidence_numbers:
+        return False
+    approximate = bool(_APPROX_WORDS.intersection(_NUMBER_WORD.findall(claim_text.casefold())))
+    for number in claim_numbers:
+        def matches(other: float, number: float = number) -> bool:
+            if number == other:
+                return True
+            if not approximate:
+                return False
+            return abs(number - other) <= 0.10 * max(abs(other), 1.0)
+
+        if not any(matches(other) for other in evidence_numbers):
+            return False
+    return True
+
+
+def _number_change_is_lenient(claim_text: str, evidence_text: str) -> bool:
+    claim_tokens = _content_tokens(claim_text)
+    if not claim_tokens or not claim_tokens <= _content_tokens(evidence_text):
+        return False
+    claim_numbers = _number_values(claim_text)
+    evidence_numbers = _number_values(evidence_text)
+    if claim_numbers:
+        return _numbers_close(claim_text, claim_numbers, evidence_numbers)
+    return bool(evidence_numbers)
+
+
+def _name_was_shortened(claim_text: str, evidence_text: str) -> bool:
+    claim_cf = claim_text.casefold()
+    for name in _PROPER_NAME.findall(evidence_text):
+        if name.casefold() in claim_cf:
+            continue
+        if any(
+            re.search(rf"\b{re.escape(part)}\b", claim_text, flags=re.IGNORECASE)
+            for part in name.split()
+        ):
+            return True
+    return False
+
+
+def _name_shortening_is_lenient(claim_text: str, evidence_text: str) -> bool:
+    claim_tokens = _content_tokens(claim_text)
+    if not claim_tokens or not claim_tokens <= _content_tokens(evidence_text):
+        return False
+    evidence_cf = evidence_text.casefold()
+    if any(name.casefold() not in evidence_cf for name in _PROPER_NAME.findall(claim_text)):
+        return False
+    return _name_was_shortened(claim_text, evidence_text)
+
+
+def claim_kept_for_lenient_literals(
+    claim: Claim,
+    bundle: EvidenceBundle,
+    verdict: ClaimVerdict,
+    *,
+    strict_numbers: bool,
+    strict_names: bool,
+) -> bool:
+    """Keep a negative verdict when the only change is an allowed number or name."""
+    if verdict is ClaimVerdict.SUPPORTED or verdict is ClaimVerdict.NOT_MEANINGFULLY_VERIFIABLE:
+        return False
+    if strict_numbers and strict_names:
+        return False
+    evidence = "\n".join(passage.text for passage in bundle.passages)
+    if not evidence.strip():
+        return False
+    anchor = claim.anchor
+    if not strict_numbers and _number_change_is_lenient(anchor, evidence):
+        if strict_names and _name_was_shortened(anchor, evidence):
+            return False
+        return True
+    if not strict_names and _name_shortening_is_lenient(anchor, evidence):
+        return True
+    return False
 
 
 def build_source_lexical_index(
@@ -1754,8 +1887,23 @@ def verify_draft_once(
                 )
 
     # Re-check each omitted complete core under the same bounded request contract
-    # before reducing a contradicted claim's findings.
+    # before reducing a contradicted claim's findings. An unusable second look
+    # keeps the first finding so verdicts already recorded still publish.
     source_by_id = {entry.segment_id: entry.text for entry in source_index.entries}
+    unresolved_escalations: set[str] = set()
+
+    def verdict_after_unresolved_escalation(
+        claim_id: str, verdict: ClaimVerdict
+    ) -> ClaimVerdict:
+        if claim_id not in unresolved_escalations:
+            return verdict
+        findings = findings_by_claim[claim_id]
+        if any(finding.verdict is ClaimVerdict.SUPPORTED for finding in findings):
+            return verdict
+        if any(finding.verdict is ClaimVerdict.CONTRADICTED for finding in findings):
+            return ClaimVerdict.CONTRADICTED
+        return verdict
+
     for claim in claims:
         if not escalates(claim):
             continue
@@ -1814,42 +1962,98 @@ def verify_draft_once(
                 "classification_capacity_failed",
                 failed_phase=GenerationPhase.CLASSIFICATION,
             )
+        initial_findings = list(findings_by_claim[claim.claim_id])
+        escalation_unusable = False
         for batch in escalation_batches:
             extra_bundle = escalation_bundle(batch)
             request = build_classification_request(
                 (claim,), evidence={claim.claim_id: extra_bundle}, spans=span_texts,
                 source_id=source_id, runtime=runtime,
             )
-            progress.raise_if_stopped("before evidence escalation")
-            try:
-                generation = runtime.provider.generate(request)
-            except (ProviderError, VerificationResponseError):
-                if not terminalize_errors:
-                    raise
-                return classification_failure(
-                    "classification_provider_failed",
-                    failed_phase=GenerationPhase.CLASSIFICATION,
-                )
-            generations.append(generation)
-            try:
-                findings_by_claim[claim.claim_id].extend(
-                    parse_claim_findings(
-                        generation.text,
-                        claims=(claim,),
-                        selected={
-                            claim.claim_id: {
-                                passage.segment_id: passage.text
-                                for passage in extra_bundle.passages
-                            }
-                        },
+            selected = {
+                claim.claim_id: {
+                    passage.segment_id: passage.text
+                    for passage in extra_bundle.passages
+                }
+            }
+            parsed: tuple[BatchFinding, ...] | None = None
+            for attempt in range(2):
+                if attempt:
+                    progress.raise_if_stopped("before re-asking evidence escalation")
+                else:
+                    progress.raise_if_stopped("before evidence escalation")
+                try:
+                    generation = runtime.provider.generate(request)
+                except (ProviderError, VerificationResponseError):
+                    if not terminalize_errors:
+                        raise
+                    return classification_failure(
+                        "classification_provider_failed",
+                        failed_phase=GenerationPhase.CLASSIFICATION,
                     )
-                )
-            except VerificationResponseError:
-                if not terminalize_errors:
-                    raise
-                return classification_failure("classification_failed")
+                generations.append(generation)
+                try:
+                    parsed = parse_claim_findings(
+                        generation.text, claims=(claim,), selected=selected,
+                    )
+                except VerificationResponseError as error:
+                    if attempt == 0:
+                        try:
+                            request = _corrected_request(
+                                request, error, phase=GenerationPhase.CLASSIFICATION,
+                                runtime=runtime, config=config,
+                            )
+                        except VerificationCapacityError:
+                            if not terminalize_errors:
+                                raise
+                            return classification_failure(
+                                "classification_capacity_failed",
+                                failed_phase=GenerationPhase.CLASSIFICATION,
+                            )
+                        continue
+                    if str(error) == "claim-verification: quote not in evidence":
+                        try:
+                            parsed = parse_claim_findings(
+                                generation.text,
+                                claims=(claim,),
+                                selected=selected,
+                                downgrade_invalid_quotes=True,
+                            )
+                        except VerificationResponseError:
+                            parsed = None
+                        else:
+                            classification_diagnostics.append(
+                                "invalid_evidence_quotes_downgraded"
+                            )
+                        break
+                    if not terminalize_errors:
+                        raise
+                    parsed = None
+                    break
+                else:
+                    break
+            if parsed is None:
+                findings_by_claim[claim.claim_id] = list(initial_findings)
+                classification_diagnostics.append("escalation_classification_failed")
+                unresolved_escalations.add(claim.claim_id)
+                escalation_unusable = True
+                break
+            findings_by_claim[claim.claim_id].extend(parsed)
             finding_generations[claim.claim_id] = generation
             extra_passages.extend(extra_bundle.passages)
+        if escalation_unusable:
+            claim_progress.completed(
+                claim.claim_id,
+                verdict_after_unresolved_escalation(
+                    claim.claim_id,
+                    reduce_batch_findings(
+                        claim.claim_id,
+                        findings_by_claim[claim.claim_id],
+                        retrieval_complete=bundles[claim.claim_id].selection.retrieval_complete,
+                    )[0],
+                ),
+            )
+            continue
         combined_passages = (*initial_bundle.passages, *extra_passages)
         bundles[claim.claim_id] = EvidenceBundle(
             selection=EvidenceSelection(
@@ -1887,6 +2091,7 @@ def verify_draft_once(
             findings,
             retrieval_complete=bundle.selection.retrieval_complete,
         )
+        verdict = verdict_after_unresolved_escalation(claim.claim_id, verdict)
         diagnostic_codes.extend(codes)
         assessments.append(
             ClaimAssessment(

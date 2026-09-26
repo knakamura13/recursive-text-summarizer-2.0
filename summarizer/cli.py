@@ -64,7 +64,7 @@ def _parser() -> argparse.ArgumentParser:
         "--provider", choices=("openai", "ollama"), default="openai"
     )
     parser.add_argument("--ollama-host", default="http://localhost:11434")
-    parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--target-words", type=int, default=300)
@@ -82,6 +82,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-merge-children", type=int, default=None)
     parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--strict-numbers", action="store_true")
+    parser.add_argument("--strict-names", action="store_true")
     parser.add_argument("--max-repair-passes", type=int, default=1)
     parser.add_argument("--citations", action="store_true")
     parser.add_argument("--audit", type=Path, default=None)
@@ -176,7 +178,10 @@ def parse_args(argv: list[str] | None = None) -> ParsedConfig:
                 max_tokens=args.chunk_tokens, overlap_tokens=args.overlap_tokens
             )
         verification = VerificationConfig(
-            enabled=args.verify, max_repair_passes=args.max_repair_passes
+            enabled=args.verify,
+            max_repair_passes=args.max_repair_passes,
+            strict_numbers=args.strict_numbers,
+            strict_names=args.strict_names,
         )
         if args.max_merge_children is not None and args.max_merge_children <= 0:
             raise ValueError("max_merge_children must be positive when provided")
