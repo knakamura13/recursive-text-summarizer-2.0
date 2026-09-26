@@ -49,6 +49,7 @@ from summarizer.checkpoint import (
 )
 from summarizer.compression import (
     compress_to_target,
+    restore_paraphrased_number_sentences,
     retain_sentences_with_missing_literals,
     word_count,
     _above_ceiling,
@@ -362,8 +363,8 @@ def _passing_sentence_text(
 
     Kept sentences stay in order, and a paragraph break survives wherever the
     dropped text crossed one. A contract failure has no sentence verdicts to
-    trust, so nothing is kept. `None` also means nothing was dropped, which
-    stops a failed draft from being checked again unchanged.
+    trust, so nothing is kept. When every sentence passes, the text is returned
+    so a lenient pass can still be published.
     """
     if not result.failed or not result.pass_results:
         return None
@@ -411,7 +412,7 @@ def _passing_sentence_text(
         else:
             dropped += 1
             paragraph_break = paragraph_break or bool(_PARAGRAPH_BREAK.search(span.text))
-    if not kept or not dropped:
+    if not kept:
         return None
     return "".join(pieces)
 
@@ -509,6 +510,10 @@ def _subset_from_first_pass(
         bundle for bundle in passed.bundles if bundle.selection.claim_id in kept_claim_ids
     )
     kept_spans, kept_claims = _renumber_pass_ordinals(kept_spans, kept_claims)
+    dropped_a_sentence = len(kept_spans) < len(
+        tuple(span for span in passed.spans if span.text.strip())
+    )
+    subset_codes = ("verified_sentence_subset",) if dropped_a_sentence else ()
     filtered_pass = VerificationPassResult(
         spans=kept_spans,
         claims=kept_claims,
@@ -527,7 +532,7 @@ def _subset_from_first_pass(
         generations=getattr(result, "generations", ()),
         diagnostic_codes=(
             *getattr(result, "diagnostic_codes", ()),
-            "verified_sentence_subset",
+            *subset_codes,
         ),
         exhausted=getattr(result, "exhausted", False),
         failed=False,
@@ -535,9 +540,25 @@ def _subset_from_first_pass(
         phase_generations=getattr(result, "phase_generations", ()),
         warning_codes=(
             *getattr(result, "warning_codes", ()),
-            "verified_sentence_subset",
+            *subset_codes,
         ),
     )
+
+
+def _ordered_source_text(
+    source_cores: Mapping[str, str] | None,
+    segments: Sequence[SourceSegment],
+) -> str:
+    """Document text in segment order, used to undo a numbered paraphrase."""
+    if not source_cores:
+        return ""
+    ordered = sorted(segments, key=lambda segment: segment.order)
+    parts = [
+        source_cores[segment.segment_id]
+        for segment in ordered
+        if segment.segment_id in source_cores and source_cores[segment.segment_id].strip()
+    ]
+    return "\n\n".join(parts)
 
 
 def _compression_source_text(
@@ -1293,8 +1314,9 @@ def _verify_publication(
             strict_names=config.strict_names,
         )
         if subset is not None:
-            kind = "verified_subset"
             result = subset
+            if "verified_sentence_subset" in subset.warning_codes:
+                kind = "verified_subset"
             ledger.record(result)
     published = (
         frozenset(span.text.strip() for span in result.pass_results[-1].spans)
@@ -1380,6 +1402,9 @@ def _finalize_summary(
         strict_numbers=verification.strict_numbers,
         strict_names=verification.strict_names,
     )
+    document_text = _ordered_source_text(source_cores, segments)
+    if document_text:
+        final_text = restore_paraphrased_number_sentences(document_text, final_text)
     audit_warnings = tuple(warnings)
     audit_segments = tuple(segments)
     passages: _EvidencePassages | None = None
@@ -1407,7 +1432,7 @@ def _finalize_summary(
         )
         audit_segments = (*segments, *passages.segments)
         outcome = _verify_publication(
-            editorial.text,
+            final_text,
             root,
             source_id=source_id,
             source_index=build_source_lexical_index(
