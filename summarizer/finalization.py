@@ -49,6 +49,7 @@ from summarizer.checkpoint import (
 )
 from summarizer.compression import (
     compress_to_target,
+    retain_sentences_with_missing_literals,
     word_count,
     _above_ceiling,
     _in_band,
@@ -78,6 +79,7 @@ from summarizer.summaries import SummaryNode
 from summarizer.text import default_sentence_tokenizer
 from summarizer.tokenization import TokenCounter
 from summarizer.verification import (
+    BatchFinding,
     Claim,
     ClaimAssessment,
     DraftSpan,
@@ -91,6 +93,7 @@ from summarizer.verification import (
     VerificationRuntime,
     build_source_lexical_index,
     claim_drop_blocked_by_omitted_required,
+    claim_kept_for_lenient_literals,
     split_draft_spans,
     verify_and_repair,
     verify_draft_once,
@@ -263,19 +266,97 @@ def _effective_claim_verdict(
     verdict: ClaimVerdict,
     bundles_by_claim: Mapping[str, EvidenceBundle],
     source_index: SourceLexicalIndex,
+    *,
+    strict_numbers: bool = False,
+    strict_names: bool = False,
 ) -> ClaimVerdict:
     bundle = bundles_by_claim.get(claim.claim_id)
     if bundle is not None and claim_drop_blocked_by_omitted_required(
         claim, bundle, source_index, verdict
     ):
         return ClaimVerdict.SUPPORTED
+    if bundle is not None and claim_kept_for_lenient_literals(
+        claim,
+        bundle,
+        verdict,
+        strict_numbers=strict_numbers,
+        strict_names=strict_names,
+    ):
+        return ClaimVerdict.SUPPORTED
     return verdict
+
+
+def _citation_for_promoted_claim(
+    assessment: ClaimAssessment,
+    bundle: EvidenceBundle | None,
+) -> BatchFinding | None:
+    """A source quote that lets a kept negative verdict be published as supported."""
+    if bundle is None:
+        return None
+    examined = set(bundle.selection.examined_ids)
+    quote: tuple[str, str] | None = None
+    for finding in assessment.findings:
+        for segment_id, text in zip(finding.evidence_ids, finding.exact_quotes, strict=True):
+            if segment_id in examined and text.strip() and not text.startswith("[redacted:"):
+                quote = (segment_id, text)
+                break
+        if quote is not None:
+            break
+    if quote is None:
+        for passage in bundle.passages:
+            if passage.segment_id in examined and passage.text.strip():
+                quote = (passage.segment_id, passage.text)
+                break
+    if quote is None:
+        return None
+    return BatchFinding(
+        claim_id=assessment.claim_id,
+        verdict=ClaimVerdict.SUPPORTED,
+        evidence_ids=(quote[0],),
+        exact_quotes=(quote[1],),
+    )
+
+
+def _claim_can_publish(
+    claim_id: str,
+    *,
+    claims_by_id: Mapping[str, Claim],
+    verdicts: Mapping[str, ClaimVerdict],
+    assessments_by_id: Mapping[str, ClaimAssessment],
+    bundles_by_claim: Mapping[str, EvidenceBundle],
+    source_index: SourceLexicalIndex,
+    strict_numbers: bool,
+    strict_names: bool,
+) -> bool:
+    claim = claims_by_id.get(claim_id)
+    verdict = verdicts.get(claim_id)
+    assessment = assessments_by_id.get(claim_id)
+    if claim is None or verdict is None or assessment is None:
+        return False
+    effective = _effective_claim_verdict(
+        claim,
+        verdict,
+        bundles_by_claim,
+        source_index,
+        strict_numbers=strict_numbers,
+        strict_names=strict_names,
+    )
+    if effective is not ClaimVerdict.SUPPORTED:
+        return False
+    if verdict is ClaimVerdict.SUPPORTED:
+        return True
+    return (
+        _citation_for_promoted_claim(assessment, bundles_by_claim.get(claim_id))
+        is not None
+    )
 
 
 def _passing_sentence_text(
     result: VerificationResult,
     *,
     source_index: SourceLexicalIndex,
+    strict_numbers: bool = False,
+    strict_names: bool = False,
 ) -> str | None:
     """Keep sentences whose every claim passed, and drop the rest.
 
@@ -293,10 +374,22 @@ def _passing_sentence_text(
         assessment.claim_id: assessment.verdict for assessment in passed.assessments
     }
     claims_by_id = {claim.claim_id: claim for claim in passed.claims}
+    assessments_by_id = {
+        assessment.claim_id: assessment for assessment in passed.assessments
+    }
     bundles_by_claim = {bundle.selection.claim_id: bundle for bundle in passed.bundles}
     claims_by_span: dict[str, list[str]] = {}
     for claim in passed.claims:
         claims_by_span.setdefault(claim.span_id, []).append(claim.claim_id)
+    publish_kwargs = {
+        "claims_by_id": claims_by_id,
+        "verdicts": verdicts,
+        "assessments_by_id": assessments_by_id,
+        "bundles_by_claim": bundles_by_claim,
+        "source_index": source_index,
+        "strict_numbers": strict_numbers,
+        "strict_names": strict_names,
+    }
     pieces: list[str] = []
     kept = dropped = 0
     paragraph_break = False
@@ -306,15 +399,7 @@ def _passing_sentence_text(
             continue
         claim_ids = claims_by_span.get(span.span_id, [])
         if claim_ids and all(
-            _effective_claim_verdict(
-                claims_by_id[claim_id],
-                verdicts[claim_id],
-                bundles_by_claim,
-                source_index,
-            )
-            is ClaimVerdict.SUPPORTED
-            for claim_id in claim_ids
-            if claim_id in claims_by_id and claim_id in verdicts
+            _claim_can_publish(claim_id, **publish_kwargs) for claim_id in claim_ids
         ):
             if pieces:
                 pieces.append("\n\n" if paragraph_break else " ")
@@ -357,9 +442,16 @@ def _subset_from_first_pass(
     result: VerificationResult,
     *,
     source_index: SourceLexicalIndex,
+    strict_numbers: bool = False,
+    strict_names: bool = False,
 ) -> VerificationResult | None:
     """Publish passing sentences from the first failed verification pass."""
-    reduced = _passing_sentence_text(result, source_index=source_index)
+    reduced = _passing_sentence_text(
+        result,
+        source_index=source_index,
+        strict_numbers=strict_numbers,
+        strict_names=strict_names,
+    )
     if reduced is None:
         return None
     passed = result.pass_results[-1]
@@ -367,10 +459,22 @@ def _subset_from_first_pass(
         assessment.claim_id: assessment.verdict for assessment in passed.assessments
     }
     claims_by_id = {claim.claim_id: claim for claim in passed.claims}
+    assessments_by_id = {
+        assessment.claim_id: assessment for assessment in passed.assessments
+    }
     bundles_by_claim = {bundle.selection.claim_id: bundle for bundle in passed.bundles}
     claims_by_span: dict[str, list[str]] = {}
     for claim in passed.claims:
         claims_by_span.setdefault(claim.span_id, []).append(claim.claim_id)
+    publish_kwargs = {
+        "claims_by_id": claims_by_id,
+        "verdicts": verdicts,
+        "assessments_by_id": assessments_by_id,
+        "bundles_by_claim": bundles_by_claim,
+        "source_index": source_index,
+        "strict_numbers": strict_numbers,
+        "strict_names": strict_names,
+    }
 
     def span_passes(span) -> bool:
         text = span.text.strip()
@@ -379,17 +483,7 @@ def _subset_from_first_pass(
         claim_ids = claims_by_span.get(span.span_id, [])
         if not claim_ids:
             return False
-        return all(
-            _effective_claim_verdict(
-                claims_by_id[claim_id],
-                verdicts[claim_id],
-                bundles_by_claim,
-                source_index,
-            )
-            is ClaimVerdict.SUPPORTED
-            for claim_id in claim_ids
-            if claim_id in claims_by_id and claim_id in verdicts
-        )
+        return all(_claim_can_publish(claim_id, **publish_kwargs) for claim_id in claim_ids)
 
     kept_spans = tuple(span for span in passed.spans if span_passes(span))
     kept_span_ids = {span.span_id for span in kept_spans}
@@ -397,8 +491,17 @@ def _subset_from_first_pass(
         claim for claim in passed.claims if claim.span_id in kept_span_ids
     )
     kept_claim_ids = {claim.claim_id for claim in kept_claims}
+
+    def published_assessment(assessment: ClaimAssessment) -> ClaimAssessment:
+        if assessment.verdict is ClaimVerdict.SUPPORTED:
+            return assessment
+        finding = _citation_for_promoted_claim(
+            assessment, bundles_by_claim.get(assessment.claim_id)
+        )
+        return replace(assessment, verdict=ClaimVerdict.SUPPORTED, findings=(finding,))
+
     kept_assessments = tuple(
-        assessment
+        published_assessment(assessment)
         for assessment in passed.assessments
         if assessment.claim_id in kept_claim_ids
     )
@@ -473,6 +576,8 @@ def _prepare_root_for_editorial(
     target_words: int,
     source_cores: Mapping[str, str],
     segments: Sequence[SourceSegment],
+    strict_numbers: bool = False,
+    strict_names: bool = False,
 ) -> tuple[SummaryNode, tuple[GenerationResult, ...]]:
     source_text = _compression_source_text(
         root,
@@ -493,6 +598,8 @@ def _prepare_root_for_editorial(
         timeout_seconds=timeout_seconds,
         target_words=target_words,
         coordinator=coordinator,
+        strict_numbers=strict_numbers,
+        strict_names=strict_names,
     )
     return root.model_copy(update={"summary": compressed.text}), compressed.generations
 
@@ -762,8 +869,16 @@ def _sentence_failure(
 class _SentenceLedger:
     """Every sentence verification saw, with the latest reason it failed."""
 
-    def __init__(self, source_index: SourceLexicalIndex) -> None:
+    def __init__(
+        self,
+        source_index: SourceLexicalIndex,
+        *,
+        strict_numbers: bool = False,
+        strict_names: bool = False,
+    ) -> None:
         self._source_index = source_index
+        self._strict_numbers = strict_numbers
+        self._strict_names = strict_names
         self._seen: dict[str, None] = {}
         self._failed: dict[str, tuple[str, str]] = {}
 
@@ -780,6 +895,8 @@ class _SentenceLedger:
                         assessment.verdict,
                         bundles_by_claim,
                         self._source_index,
+                        strict_numbers=self._strict_numbers,
+                        strict_names=self._strict_names,
                     )
                     if assessment.claim_id in claims_by_id
                     else assessment.verdict
@@ -1149,7 +1266,11 @@ def _verify_publication(
     progress: VerificationProgress,
 ) -> _VerifiedPublication:
     """Verify the editorial draft once, else publish its passing sentences."""
-    ledger = _SentenceLedger(source_index)
+    ledger = _SentenceLedger(
+        source_index,
+        strict_numbers=config.strict_numbers,
+        strict_names=config.strict_names,
+    )
     progress.phase("Checking the editorial draft")
     result = verify_and_repair(
         draft,
@@ -1165,7 +1286,12 @@ def _verify_publication(
     generations: tuple[GenerationResult, ...] = ()
     if result.failed:
         progress.phase("Removing unsupported sentences")
-        subset = _subset_from_first_pass(result, source_index=source_index)
+        subset = _subset_from_first_pass(
+            result,
+            source_index=source_index,
+            strict_numbers=config.strict_numbers,
+            strict_names=config.strict_names,
+        )
         if subset is not None:
             kind = "verified_subset"
             result = subset
@@ -1233,6 +1359,8 @@ def _finalize_summary(
             target_words=target_words,
             source_cores=source_cores,
             segments=segments,
+            strict_numbers=verification.strict_numbers,
+            strict_names=verification.strict_names,
         )
     runtime_observer.emit(StageEvent(StageName.WRITING, "active"))
     editorial = write_editorial(
@@ -1246,7 +1374,12 @@ def _finalize_summary(
         observer=runtime_observer,
     )
     runtime_observer.emit(StageEvent(StageName.WRITING, "completed"))
-    final_text = editorial.text
+    final_text = retain_sentences_with_missing_literals(
+        root.summary,
+        editorial.text,
+        strict_numbers=verification.strict_numbers,
+        strict_names=verification.strict_names,
+    )
     audit_warnings = tuple(warnings)
     audit_segments = tuple(segments)
     passages: _EvidencePassages | None = None

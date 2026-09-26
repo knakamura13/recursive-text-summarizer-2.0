@@ -151,6 +151,10 @@ _NOTICE_TEXT: dict[str, tuple[Literal["info", "warning", "error"], str]] = {
         "The model failed while checking claims against the source.",
     ),
     "classification_failed": ("warning", "The model's claim check was unusable."),
+    "escalation_classification_failed": (
+        "warning",
+        "An extra evidence check was unusable, so that claim kept its first result.",
+    ),
 }
 
 

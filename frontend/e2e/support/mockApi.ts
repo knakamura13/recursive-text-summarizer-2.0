@@ -115,8 +115,10 @@ export function defaultRunConfig(overrides: Partial<RunConfig> = {}): RunConfig 
 		overlap_tokens: 0,
 		max_merge_children: null,
 		max_concurrency: 1,
-		timeout_seconds: 180,
+		timeout_seconds: 600,
 		max_retries: 5,
+		strict_numbers: false,
+		strict_names: false,
 		...overrides
 	};
 }

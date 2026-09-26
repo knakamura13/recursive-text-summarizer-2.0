@@ -25,7 +25,7 @@ def test_configuration_defaults_are_legacy_compatible() -> None:
     assert app.model == "gpt-4o-mini"
     assert app.provider == "openai"
     assert app.ollama_host == ""
-    assert app.timeout_seconds == 180
+    assert app.timeout_seconds == 600
     assert cache.enabled is False
     assert cache.root == Path(".summarizer-cache")
     assert reliability.max_in_flight == 1

@@ -84,8 +84,10 @@ class RunConfig(ApiModel):
     overlap_tokens: int = Field(0, ge=0)
     max_merge_children: int | None = Field(None, ge=2, le=64)
     max_concurrency: int = Field(1, ge=1, le=16)
-    timeout_seconds: float = Field(180.0, ge=10.0, le=3600.0)
+    timeout_seconds: float = Field(600.0, ge=10.0, le=3600.0)
     max_retries: int = Field(5, ge=1, le=20)
+    strict_numbers: bool = False
+    strict_names: bool = False
 
     @model_validator(mode="after")
     def _overlap_below_chunk(self) -> RunConfig:
@@ -114,6 +116,8 @@ class RunConfigPatch(ApiModel):
     max_concurrency: int | None = Field(None, ge=1, le=16)
     timeout_seconds: float | None = Field(None, ge=10.0, le=3600.0)
     max_retries: int | None = Field(None, ge=1, le=20)
+    strict_numbers: bool | None = None
+    strict_names: bool | None = None
     clear: list[Literal["context_window", "chunk_tokens", "max_merge_children"]] = Field(
         default_factory=list,
         description="Nullable fields to reset to null, since null means 'unchanged' here.",

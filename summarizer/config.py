@@ -49,7 +49,7 @@ class AppConfig:
     input_path: Path = Path("input.txt")
     output_path: Path = Path("output.txt")
     model: str = "gpt-4o-mini"
-    timeout_seconds: float = 180
+    timeout_seconds: float = 600
     provider: ProviderName = "openai"
     ollama_host: str = ""
 

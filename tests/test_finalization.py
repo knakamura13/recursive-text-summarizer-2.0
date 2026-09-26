@@ -1,3 +1,4 @@
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -6,6 +7,8 @@ import pytest
 from summarizer.direct import whole_document_segment
 from summarizer.finalization import (
     FinalizationVerificationError,
+    _effective_claim_verdict,
+    _published_sentences,
     _subset_from_first_pass,
     _verify_publication,
     _verified_content_unit_draft,
@@ -17,9 +20,16 @@ from summarizer.providers.base import GenerationResult
 from summarizer.summaries import SummaryNode
 from summarizer.tokenization import ConservativeUtf8TokenCounter
 from summarizer.verification import (
+    BatchFinding,
+    Claim,
+    ClaimAssessment,
     ClaimVerdict,
+    DraftSpan,
     VerificationConfig,
+    VerificationPassResult,
+    VerificationResult,
     build_source_lexical_index,
+    select_claim_evidence,
 )
 
 
@@ -734,3 +744,170 @@ def test_subset_does_not_salvage_a_contract_failure() -> None:
     )
 
     assert result is None
+
+
+def _lenient_bundle(anchor: str, evidence: str):
+    index = build_source_lexical_index(
+        provenance_ids=("S000001",), source={"S000001": evidence}
+    )
+    item = Claim(
+        claim_id="V01C000001",
+        span_id="V01S000001",
+        ordinal=1,
+        anchor=anchor,
+        is_fallback=True,
+    )
+    bundle = select_claim_evidence(
+        item,
+        source_index=index,
+        counter=ConservativeUtf8TokenCounter(),
+        max_tokens=1000,
+    )
+    return item, index, {item.claim_id: bundle}
+
+
+def test_lenient_numbers_keep_a_rounded_sentence() -> None:
+    item, index, bundles = _lenient_bundle(
+        "They built a stunning nearly 1000 foot skyscraper.",
+        "They built a stunning 963.6 foot skyscraper.",
+    )
+    assert _effective_claim_verdict(
+        item,
+        ClaimVerdict.CONTRADICTED,
+        bundles,
+        index,
+        strict_numbers=False,
+    ) is ClaimVerdict.SUPPORTED
+    assert _effective_claim_verdict(
+        item,
+        ClaimVerdict.CONTRADICTED,
+        bundles,
+        index,
+        strict_numbers=True,
+    ) is ClaimVerdict.CONTRADICTED
+
+
+def test_lenient_numbers_still_drop_a_different_fact() -> None:
+    item, index, bundles = _lenient_bundle(
+        "Nearly 1000 people died.",
+        "963 people were rescued.",
+    )
+    assert _effective_claim_verdict(
+        item,
+        ClaimVerdict.CONTRADICTED,
+        bundles,
+        index,
+        strict_numbers=False,
+    ) is ClaimVerdict.CONTRADICTED
+
+
+def test_lenient_names_keep_a_shortened_name() -> None:
+    item, index, bundles = _lenient_bundle(
+        "Professional skier Saugstad wore a backpack.",
+        "Professional skier Elyse Saugstad wore a backpack.",
+    )
+    assert _effective_claim_verdict(
+        item,
+        ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+        bundles,
+        index,
+        strict_names=False,
+    ) is ClaimVerdict.SUPPORTED
+    assert _effective_claim_verdict(
+        item,
+        ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+        bundles,
+        index,
+        strict_names=True,
+    ) is ClaimVerdict.INSUFFICIENTLY_SUPPORTED
+
+
+def _draft_span(span_id: str, ordinal: int, text: str, start: int) -> DraftSpan:
+    return DraftSpan(
+        span_id=span_id,
+        ordinal=ordinal,
+        start=start,
+        end=start + len(text),
+        text=text,
+        content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    )
+
+
+def test_lenient_subset_publishes_with_supported_evidence() -> None:
+    kept = "They built a stunning nearly 1000 foot skyscraper."
+    dropped = "Nearly 1000 people died."
+    draft = f"{kept} {dropped}"
+    kept_source = "They built a stunning 963.6 foot skyscraper."
+    dropped_source = "963 people were rescued."
+    index = build_source_lexical_index(
+        provenance_ids=("S000001", "S000002"),
+        source={"S000001": kept_source, "S000002": dropped_source},
+    )
+    spans = (
+        _draft_span("V01S000001", 1, f"{kept} ", 0),
+        _draft_span("V01S000002", 2, dropped, len(kept) + 1),
+    )
+    claims = (
+        Claim("V01C000001", "V01S000001", 1, kept, False),
+        Claim("V01C000002", "V01S000002", 1, dropped, False),
+    )
+    bundles = tuple(
+        select_claim_evidence(
+            claim,
+            source_index=index,
+            counter=ConservativeUtf8TokenCounter(),
+            max_tokens=1000,
+        )
+        for claim in claims
+    )
+    assessments = tuple(
+        ClaimAssessment(
+            claim_id=claim.claim_id,
+            verdict=ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+            findings=(
+                BatchFinding(
+                    claim_id=claim.claim_id,
+                    verdict=ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+                    evidence_ids=(),
+                    exact_quotes=(),
+                ),
+            ),
+            pass_index=1,
+            verifier_provider="test",
+            verifier_model="test",
+            prompt_version="verification-classification/1",
+        )
+        for claim in claims
+    )
+    passed = VerificationPassResult(
+        spans=spans,
+        claims=claims,
+        assessments=assessments,
+        selections=tuple(bundle.selection for bundle in bundles),
+        bundles=bundles,
+        generations=(),
+        phase_generations=(),
+        diagnostic_codes=(),
+        failed=False,
+    )
+    result = _subset_from_first_pass(
+        VerificationResult(
+            text=draft,
+            passes=(assessments,),
+            selections=(passed.selections,),
+            repairs=(),
+            generations=(),
+            diagnostic_codes=(),
+            exhausted=False,
+            failed=True,
+            pass_results=(passed,),
+        ),
+        source_index=index,
+    )
+
+    assert result is not None
+    assert result.text == kept
+    published = _published_sentences(result.text, result, passages=None)
+    assert published[0].text == kept
+    assert published[0].verdict == "supported"
+    assert published[0].evidence[0].quote == kept_source

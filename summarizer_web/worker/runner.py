@@ -471,7 +471,10 @@ def _execute(
         include_citations=config.citations,
         audit_path=run_dir / "audit.json",
         verification=VerificationConfig(
-            enabled=config.verify, max_repair_passes=config.max_repair_passes
+            enabled=config.verify,
+            max_repair_passes=config.max_repair_passes,
+            strict_numbers=config.strict_numbers,
+            strict_names=config.strict_names,
         ),
         cache=CacheConfig(enabled=True, root=load_paths().cache),
         reliability=ReliabilityConfig(

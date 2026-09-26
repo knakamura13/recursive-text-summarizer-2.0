@@ -1216,6 +1216,8 @@ _SAFE_CONFIGURATION = frozenset(
         "output_reserve_tokens",
         "max_repair_passes",
         "enabled",
+        "strict_numbers",
+        "strict_names",
         "context_window_tokens",
         "context_window_assumed",
         "counter_exact",
@@ -1231,7 +1233,7 @@ _SAFE_CONFIGURATION_SECTIONS = frozenset(
 )
 _CONFIG_PROMPT_VERSION = re.compile(r"^[a-z][a-z0-9_-]{0,63}/[1-9][0-9]*$")
 _CONFIG_BOOLEAN_FIELDS = frozenset(
-    {"include_citations", "enabled", "context_window_assumed", "counter_exact", "fits"}
+    {"include_citations", "enabled", "context_window_assumed", "counter_exact", "fits", "strict_numbers", "strict_names"}
 )
 _CONFIG_POSITIVE_INTEGER_FIELDS = frozenset(
     {
