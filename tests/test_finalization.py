@@ -209,7 +209,9 @@ def test_verification_sees_the_editorial_paraphrase(monkeypatch) -> None:
     assert result.text == "The event impacted sixteen divers on the reef."
 
 
-def test_rejected_numbered_paraphrase_publishes_the_source_sentence(monkeypatch) -> None:
+def test_without_strict_numbers_a_rejected_numbered_paraphrase_is_not_swapped_for_the_source(
+    monkeypatch,
+) -> None:
     counter = ConservativeUtf8TokenCounter()
     document = ingest_text("The crew counted 16 divers on the reef.")
     segment = whole_document_segment(document, counter)
@@ -292,25 +294,25 @@ def test_rejected_numbered_paraphrase_publishes_the_source_sentence(monkeypatch)
                 request.model,
             )
 
-    result = finalize_summary(
-        summary,
-        Provider(),
-        source_id=document.source_id,
-        model="test-model",
-        timeout_seconds=30,
-        target_words=8,
-        strategy="direct",
-        segments=(segment,),
-        nodes=(root,),
-        root_node_id=root.node_id,
-        counter=counter,
-        source_cores={segment.segment_id: document.text},
-        verification=VerificationConfig(enabled=True),
-        verification_context_window_tokens=10_000,
-    )
+    with pytest.raises(FinalizationVerificationError):
+        finalize_summary(
+            summary,
+            Provider(),
+            source_id=document.source_id,
+            model="test-model",
+            timeout_seconds=30,
+            target_words=8,
+            strategy="direct",
+            segments=(segment,),
+            nodes=(root,),
+            root_node_id=root.node_id,
+            counter=counter,
+            source_cores={segment.segment_id: document.text},
+            verification=VerificationConfig(enabled=True),
+            verification_context_window_tokens=10_000,
+        )
 
     assert checked == [paraphrase]
-    assert result.text == document.text
 
 
 def test_failed_editorial_without_passing_sentences_stays_unpublished(tmp_path) -> None:
@@ -1219,11 +1221,15 @@ def test_subset_publishes_when_leniency_keeps_every_sentence() -> None:
     assert [sentence.text for sentence in published] == [first, second]
 
 
-def test_subset_replaces_a_rejected_numbered_paraphrase_with_the_source_sentence() -> None:
-    kept = "The harbour opened in May."
+_NUMBERED_KEPT = "The harbour opened in May."
+_NUMBERED_SOURCE = "The crew counted 16 divers on the reef."
+
+
+def _subset_after_a_numbered_paraphrase(*, strict_numbers: bool):
+    kept = _NUMBERED_KEPT
     paraphrase = "The event impacted sixteen divers on the reef."
     contradicted = "Nearly 1000 people died."
-    source_sentence = "The crew counted 16 divers on the reef."
+    source_sentence = _NUMBERED_SOURCE
     rescued = "963 people were rescued."
     draft = f"{kept} {paraphrase} {contradicted}"
     index = build_source_lexical_index(
@@ -1291,7 +1297,7 @@ def test_subset_replaces_a_rejected_numbered_paraphrase_with_the_source_sentence
         diagnostic_codes=(),
         failed=False,
     )
-    result = _subset_from_first_pass(
+    return _subset_from_first_pass(
         VerificationResult(
             text=draft,
             passes=(assessments,),
@@ -1309,11 +1315,25 @@ def test_subset_replaces_a_rejected_numbered_paraphrase_with_the_source_sentence
             "S000002": source_sentence,
             "S000003": rescued,
         },
+        strict_numbers=strict_numbers,
     )
+
+
+def test_strict_numbers_replaces_a_rejected_numbered_paraphrase_with_the_source_sentence() -> None:
+    result = _subset_after_a_numbered_paraphrase(strict_numbers=True)
 
     assert result is not None
     published = _published_sentences(result.text, result, passages=None)
-    assert [sentence.text for sentence in published] == [kept, source_sentence]
+    assert [sentence.text for sentence in published] == [_NUMBERED_KEPT, _NUMBERED_SOURCE]
     assert published[1].verdict == "supported"
-    assert published[1].evidence[0].quote == source_sentence
+    assert published[1].evidence[0].quote == _NUMBERED_SOURCE
     assert "died" not in result.text
+
+
+def test_without_strict_numbers_a_rejected_numbered_paraphrase_is_not_replaced() -> None:
+    result = _subset_after_a_numbered_paraphrase(strict_numbers=False)
+
+    assert result is not None
+    published = _published_sentences(result.text, result, passages=None)
+    assert [sentence.text for sentence in published] == [_NUMBERED_KEPT]
+    assert _NUMBERED_SOURCE not in result.text

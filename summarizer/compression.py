@@ -138,41 +138,6 @@ def _omits_a_number(source_text: str, shortened: str) -> bool:
     return retain_sentences_with_omitted_numbers(source_text, shortened) != shortened.strip()
 
 
-def restore_paraphrased_number_sentences(source_text: str, rewritten: str) -> str:
-    """Replace a rewrite that keeps a number but changes the other words.
-
-    A shortening or a rounding that keeps the remaining words stays. Omitting a
-    numbered sentence stays omitted. A nearby number without an approximation
-    word is a different fact, so the rewrite stays for verification to judge.
-    """
-    shortened = rewritten.strip()
-    if not shortened:
-        return source_text.strip()
-    source_sentences = [
-        sentence.strip()
-        for sentence in default_sentence_tokenizer(source_text)
-        if sentence.strip()
-    ]
-    rewritten_sentences = [
-        sentence.strip()
-        for sentence in default_sentence_tokenizer(shortened)
-        if sentence.strip()
-    ]
-    pieces: list[str] = []
-    used: set[str] = set()
-    for sentence in rewritten_sentences:
-        replacement = _paraphrased_source_sentences(sentence, source_sentences)
-        if replacement is None:
-            pieces.append(sentence)
-            continue
-        for source_sentence in replacement:
-            if source_sentence in used:
-                continue
-            used.add(source_sentence)
-            pieces.append(source_sentence)
-    return " ".join(pieces)
-
-
 def overlapping_numbered_source_sentences(
     sentence: str, source_sentences: Sequence[str]
 ) -> list[str]:
@@ -193,17 +158,6 @@ def overlapping_numbered_source_sentences(
     ]
 
 
-def _paraphrased_source_sentences(
-    sentence: str, source_sentences: list[str]
-) -> list[str] | None:
-    overlapping = overlapping_numbered_source_sentences(sentence, source_sentences)
-    if not overlapping:
-        return None
-    if any(_rewrite_keeps_source_words(sentence, source) for source in overlapping):
-        return None
-    return overlapping
-
-
 def _shares_number(rewritten: str, source: str) -> bool:
     rewritten_numbers = _number_values(rewritten)
     source_numbers = _number_values(source)
@@ -219,13 +173,6 @@ def _shares_number(rewritten: str, source: str) -> bool:
             if approximate and abs(left - right) <= 0.10 * max(abs(right), 1.0):
                 return True
     return False
-
-
-def _rewrite_keeps_source_words(rewritten: str, source: str) -> bool:
-    tokens = _content_tokens(rewritten)
-    if not tokens or not tokens <= _content_tokens(source):
-        return False
-    return _numbers_close(rewritten, _number_values(rewritten), _number_values(source))
 
 
 def _enabled_literal_missing(
@@ -491,7 +438,9 @@ def compress_to_target(
             strict_names=strict_names,
         )
         all_generations.extend(gens)
-        if word_count(current) >= word_count(previous) or _omits_a_number(previous, current):
+        if word_count(current) >= word_count(previous) or (
+            strict_numbers and _omits_a_number(previous, current)
+        ):
             current = previous
             break
         passes_run = pass_index
@@ -517,7 +466,9 @@ def compress_to_target(
             strict_names=strict_names,
         )
         all_generations.extend(gens)
-        if word_count(current) >= word_count(previous) or _omits_a_number(previous, current):
+        if word_count(current) >= word_count(previous) or (
+            strict_numbers and _omits_a_number(previous, current)
+        ):
             current = previous
         else:
             passes_run = MAX_PASSES + 1
