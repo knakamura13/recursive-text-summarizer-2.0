@@ -465,10 +465,13 @@ def _subset_with_numbered_source_sentences(
 ) -> VerificationResult | None:
     """Replace a rejected numbered paraphrase with the source sentence.
 
-    A sentence verification accepted stays as written. A contradicted sentence
-    stays dropped. Other rejected sentences that share a number with the source
-    are published in the source's words, cited to that source sentence.
+    Runs only with `strict_numbers` on. A sentence verification accepted stays
+    as written. A contradicted sentence stays dropped. Other rejected sentences
+    that share a number with the source are published in the source's words,
+    cited to that source sentence.
     """
+    if not strict_numbers:
+        return None
     catalog = _source_sentence_catalog(source_cores)
     if not catalog or not result.failed or not result.pass_results:
         return None
