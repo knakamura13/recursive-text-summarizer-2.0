@@ -1,0 +1,31 @@
+{
+  "study": "chapter-comparison-2026-09-26",
+  "artifact_root": "/private/tmp/rts-study-20260926",
+  "checkout_root": "/private/tmp/rts-study-20260926/checkouts",
+  "versions": {
+    "legacy": "2008717136ed235dec000ea281b31c4f4aeed43b",
+    "pre_experiments": "c41febc849bcc962aff90ab953ed277476b3adac",
+    "current": "9d31e4eb656b68580cfe7156b70a38ab358d9eff"
+  },
+  "model": "gemma4:latest",
+  "model_digest": "c6eb396dbd5992bbe3f5cdb947e8bbc0ee413d7c17e2beaae69f5d569cf982eb",
+  "ollama_version": "0.34.4",
+  "context_tokens": 32768,
+  "temperature": 1,
+  "top_k": 64,
+  "top_p": 0.95,
+  "think": false,
+  "output_token_rule": "max(2048, ceil(3 * target_words) + 1024)",
+  "target_fractions": [0.25, 0.5],
+  "seeds": [101, 202, 303],
+  "sources": {
+    "atomic_habits": {"role": "development", "pdf_pages": [31, 41], "words": 3537, "sha256": "f00a6832803b69b127f20eb604fa10951b80da2d533aace5fe3f2cbc908a326d"},
+    "nvc": {"role": "development", "pdf_pages": [48, 60], "words": 2792, "sha256": "1330f00645bd659a954438181986a0a2d17de08bd75e76ef1f27444d6018f698"},
+    "isl": {"role": "development", "pdf_pages": [26, 68], "words": 15590, "sha256": "c0b22f24e9323365225508d13c51fdab8bd3aaaa592f8e2d12c9867597b18e1e"},
+    "gathering": {"role": "validation", "pdf_pages": [9, 20], "words": 9795, "sha256": "47692d025b74bafab2b0bcf536dc8b6828de1110d87ccf40ba6ae4f7cc4ec095"},
+    "all_statistics": {"role": "validation", "pdf_pages": [258, 269], "words": 2813, "sha256": "a12b42ccf330bc107e80828dfe1f72c1d09d01c0bbe1f18d8bd7c21ee74fc69b"},
+    "transcript": {"role": "validation", "url": "https://tim.blog/2023/01/06/james-clear-atomic-habits-transcript/", "words": 26572, "sha256": "68938f6f38b0eb6966427ace520f0c1580b0e39d087b36078cb044bcacbb8963"},
+    "news": {"role": "secondary", "words": 932, "sha256": "744e321b0e28a0bad05febe49ee3be5dd12c9fb3a6ea333b1f48b1f458a13c7f"}
+  },
+  "stage_order": ["pilot", "baseline", "validation"]
+}
