@@ -464,6 +464,32 @@ def test_audit_v2_rejects_a_published_result_whose_last_pass_left_work_unresolve
         _artifact(verification=published)
 
 
+def test_audit_v2_rejects_a_claimless_span_missing_from_unresolved_work() -> None:
+    complete = _verification("D000001")
+    first = complete.pass_results[0]
+    start = first.spans[0].end
+    undecomposed = DraftSpan(
+        "V01S000002", 2, start, start + 5, " More", hashlib.sha256(b" More").hexdigest()
+    )
+    partial = replace(
+        complete,
+        passes=((),),
+        pass_results=(
+            replace(
+                first,
+                spans=(*first.spans, undecomposed),
+                assessments=(),
+                unresolved=(UnresolvedWork("V01C000001", GenerationPhase.CLASSIFICATION, "omitted"),),
+            ),
+        ),
+        repairs=(),
+        failed=True,
+    )
+
+    with pytest.raises((AuditError, ValueError), match="exactly the unfinished"):
+        _artifact(verification=partial)
+
+
 def test_audit_v2_serializes_terminal_decomposition_failure_without_claim_prose() -> None:
     generation = GenerationResult("malformed provider prose", "provider", "model")
     result = VerificationResult(

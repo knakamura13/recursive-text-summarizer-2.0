@@ -53,7 +53,8 @@ class VerificationPipelineProvider:
         self.requests.append(request)
         operation = request.operation_id or ""
         if operation == "editorial-final":
-            response = {"text": "42."}
+            text = "42. The value is 41." if self.verification == "omit-second" else "42."
+            response = {"text": text}
         elif operation == "D000001" or operation.startswith("S"):
             response = self._node(0, operation or "S000001")
         elif operation.startswith("merge-"):
@@ -90,12 +91,12 @@ class VerificationPipelineProvider:
         return GenerationResult(json.dumps(response), "fake", request.model, 1, 1, "completed")
 
     def _decomposition(self, prefix: str) -> dict[str, object]:
-        if self.verification == "supported":
+        if self.verification in {"supported", "omit-second"}:
             return {"spans": [{"span_id": f"{prefix}S000001", "anchors": []}]}
         return {"spans": [{"span_id": f"{prefix}S000001", "anchors": ["42"]}]}
 
     def _classification(self, prefix: str, request_text: str) -> dict[str, object]:
-        if self.verification == "supported":
+        if self.verification in {"supported", "omit-second"}:
             return self._findings(prefix, "supported", request_text)
         return self._findings(prefix, "contradicted", request_text, include_fallback=True)
 
@@ -868,6 +869,37 @@ def test_terminal_verification_failure_writes_audit_before_reader_output(tmp_pat
     ]
     assert body["citations"] == []
     assert "Sources:" not in audit_path.read_text()
+
+
+def test_published_subset_audit_keeps_the_withheld_unresolved_span(tmp_path) -> None:
+    provider = VerificationPipelineProvider(verification="omit-second")
+    audit_path = tmp_path / "audit.json"
+
+    result = run_pipeline(
+        ingest_text("The source confirms the value is 41."),
+        provider,
+        CharacterCounter(),
+        app=app(),
+        strategy=strategy(),
+        config=PipelineConfig(
+            target_words=40,
+            include_citations=True,
+            audit_path=audit_path,
+            verification=VerificationConfig(enabled=True),
+        ),
+    )
+
+    body = json.loads(audit_path.read_text())
+    last_pass = body["verification"]["passes"][-1]
+    assert result.final.text.startswith("42.")
+    assert "The value is 41." not in result.final.text
+    assert body["publication"]["kind"] == "verified_subset"
+    assert "verification_incomplete" in body["verification"]["warning_codes"]
+    assert last_pass["complete"] is False
+    assert last_pass["unresolved"] == [
+        {"item_id": "V01S000002", "phase": "decomposition", "reason": "omitted"}
+    ]
+    assert "V01S000002" not in {span["span_id"] for span in last_pass["spans"]}
 
 
 def test_exhausted_contradiction_writes_terminal_audit_before_raising(tmp_path) -> None:

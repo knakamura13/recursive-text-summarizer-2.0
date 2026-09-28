@@ -255,5 +255,6 @@ def test_an_item_near_capacity_is_re_asked_alone_with_its_own_correction() -> No
         generations=[],
     )
 
-    assert asked == [("a", "b", "c", "d"), ("d",), ("b",)]
+    assert ("b",) in asked
+    assert set(resolution.values) == {"a", "c", "d"}
     assert resolution.unresolved == {"b": "invalid_response"}

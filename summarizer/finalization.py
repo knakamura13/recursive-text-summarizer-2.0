@@ -621,6 +621,9 @@ def _subset_from_first_pass(
         generations=getattr(passed, "generations", ()),
         phase_generations=getattr(passed, "phase_generations", ()),
         diagnostic_codes=getattr(passed, "diagnostic_codes", ()),
+        # Unfinished spans and claims are never kept, so each entry names work
+        # this publication withheld; the audit keeps its id and reason.
+        unresolved=getattr(passed, "unresolved", ()),
     )
     prior = tuple(result.pass_results[:-1])
     return VerificationResult(

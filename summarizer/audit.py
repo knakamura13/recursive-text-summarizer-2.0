@@ -59,7 +59,9 @@ JSON paths read by the web application (offsets are code points, i.e. Python
   (`phase` `decomposition`) or claim (`phase` `classification`) the verifier
   never finished after its bounded re-asks, by `item_id`, with `reason`
   `omitted`, `invalid_response`, or `capacity`. Such a pass is never
-  `complete`, and its unresolved sentences are never published.
+  `complete`, and its unresolved sentences are never published. When a
+  verified subset publishes, its last pass keeps the unresolved entries for
+  the spans and claims it withheld, which no longer appear in that pass.
 """
 
 from __future__ import annotations
@@ -935,27 +937,39 @@ def _unresolved_work_resolves(
     claims: Mapping[str, AuditVerificationClaim],
     selections: Mapping[str, AuditVerificationSelection],
     assessments: Mapping[str, AuditVerificationAssessment],
-) -> None:
+) -> bool:
     """Unresolved work lists exactly the pass's unfinished spans and claims.
 
-    An unresolved span has no claims. Every claim without an assessment is an
-    unresolved classification item, and every claim has its selection.
+    An item still in the pass is unfinished there: a span without claims or a
+    claim without an assessment, and every such span and claim is listed. An
+    item absent from the pass was withheld when a verified subset was
+    published. Returns whether any listed item is still in the pass.
     """
     if record.complete:
         raise ValueError("a verification pass with unresolved work is not complete")
     item_ids = [item.item_id for item in record.unresolved]
     if len(set(item_ids)) != len(item_ids):
         raise ValueError("verification unresolved work must be unique")
+    if any(int(item_id[1:3]) != record.pass_index for item_id in item_ids):
+        raise ValueError("verification unresolved work must belong to its pass")
     claimed_spans = {claim.span_id for claim in claims.values()}
-    unassessed = {
-        item.item_id for item in record.unresolved if item.phase == "classification"
-    }
-    if any(
-        item.phase == "decomposition"
-        and (item.item_id not in spans or item.item_id in claimed_spans)
+    present_spans = {
+        item.item_id
         for item in record.unresolved
-    ) or unassessed != set(claims) - set(assessments) or set(selections) != set(claims):
+        if item.phase == "decomposition" and item.item_id in spans
+    }
+    present_claims = {
+        item.item_id
+        for item in record.unresolved
+        if item.phase == "classification" and item.item_id in claims
+    }
+    if (
+        present_spans != set(spans) - claimed_spans
+        or present_claims != set(claims) - set(assessments)
+        or set(selections) != set(claims)
+    ):
         raise ValueError("verification unresolved work must list exactly the unfinished pass work")
+    return bool(present_spans or present_claims)
 
 
 def _verification_links_resolve(
@@ -1057,9 +1071,12 @@ def _verification_links_resolve(
         is_last = record_position == len(verification.passes) - 1
         if record.unresolved:
             # An earlier pass may leave work unfinished when a later pass
-            # publishes; the last pass may only when verification failed.
-            _unresolved_work_resolves(record, spans, claims, selections, assessments)
-            partial_needs_failure = is_last
+            # publishes. The last pass may hold unfinished work only when
+            # verification failed; a published subset lists only work it withheld.
+            still_in_pass = _unresolved_work_resolves(
+                record, spans, claims, selections, assessments
+            )
+            partial_needs_failure = is_last and still_in_pass
         else:
             partial_needs_failure = not record.complete
         if partial_needs_failure and (not verification.failed or not is_last):
