@@ -174,50 +174,56 @@ def _published_sentence_words(audit_path: Path) -> int | None:
     return sum(len(str(sentence.get("text", "")).split()) for sentence in sentences)
 
 
-def _saved_merge_inputs(replay_dir: Path, document: Any) -> tuple[list[Any], tuple[Any, ...]]:
+def _saved_merge_inputs(
+    replay_dir: Path, document: Any, counter: Any
+) -> tuple[list[Any], tuple[Any, ...]]:
     """Load a saved trial's segments and leaves, revalidated against ``document``.
 
-    Segments must be the document's own text at their recorded offsets, and
-    every leaf must pass the current leaf provenance check for its segment.
+    Every envelope used must match its recorded payload digest. The segmentation
+    passes the same strict checks the cached-segmentation decoder applies, under
+    the token counter and segment budget it was made with. Every leaf must pass
+    the current leaf provenance check for its segment.
     """
+    from summarizer.cache import _canonical_json
     from summarizer.leaf import core_text, validate_provenance
-    from summarizer.segmentation import BoundaryKind, SourceSegment
+    from summarizer.segmentation import BoundaryKind, SourceSegment, _validate_segments
     from summarizer.summaries import SummaryNode
 
-    envelopes = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted(replay_dir.glob("cache/objects/*/*.json"))
-    ]
-    segmentations = [item["payload"] for item in envelopes if item["descriptor"]["stage"] == "segmentation"]
+    envelopes = []
+    for path in sorted(replay_dir.glob("cache/objects/*/*.json")):
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+        if envelope["descriptor"]["stage"] not in ("segmentation", "leaf"):
+            continue
+        digest = hashlib.sha256(_canonical_json(envelope["payload"])).hexdigest()
+        if digest != envelope.get("payload_sha256"):
+            raise ValueError(f"saved cache object {path.name} does not match its payload digest")
+        envelopes.append(envelope)
+    segmentations = [item for item in envelopes if item["descriptor"]["stage"] == "segmentation"]
     if len(segmentations) != 1:
         raise ValueError(f"expected one saved segmentation, found {len(segmentations)}")
+    descriptor = segmentations[0]["descriptor"]
+    if descriptor.get("counter_identity") != counter.identity:
+        raise ValueError(
+            f"saved segmentation used counter {descriptor.get('counter_identity')}, not {counter.identity}"
+        )
     segments = [
         SourceSegment(**{**item, "boundary_kind": BoundaryKind(item["boundary_kind"])})
-        for item in segmentations[0]
+        for item in segmentations[0]["payload"]
     ]
-    segments.sort(key=lambda item: item.order)
-    if [segment.order for segment in segments] != list(range(len(segments))):
-        raise ValueError("saved segment orders are not 0..n-1")
-    cursor = 0
-    for segment in segments:
-        if segment.source_id != document.source_id:
-            raise ValueError(f"{segment.segment_id} belongs to another source")
-        if document.text[segment.context_start : segment.context_end] != segment.text:
-            raise ValueError(f"{segment.segment_id} no longer matches the source text")
-        if segment.core_start != cursor:
-            raise ValueError(f"{segment.segment_id} core starts at {segment.core_start}, expected {cursor}")
-        cursor = segment.core_end
-    if cursor != len(document.text):
-        raise ValueError(f"saved segment cores end at {cursor} of {len(document.text)} characters")
-    by_id = {segment.segment_id: segment for segment in segments}
-    saved = {
-        item["descriptor"]["work_id"]: item["payload"]
-        for item in envelopes
-        if item["descriptor"]["stage"] == "leaf"
-    }
-    if set(saved) != set(by_id):
+    _validate_segments(
+        document,
+        segments,
+        counter,
+        descriptor["behavior"]["segmentation"]["max_tokens"],
+        strict_cached=True,
+    )
+    leaf_envelopes = [item for item in envelopes if item["descriptor"]["stage"] == "leaf"]
+    saved = {item["descriptor"]["work_id"]: item["payload"] for item in leaf_envelopes}
+    if len(saved) != len(leaf_envelopes):
+        raise ValueError("saved leaves repeat a segment")
+    if set(saved) != {segment.segment_id for segment in segments}:
         raise ValueError(
-            f"saved leaves cover {len(saved)} of {len(by_id)} segments; replay needs all of them"
+            f"saved leaves cover {len(saved)} of {len(segments)} segments; replay needs all of them"
         )
     leaves = []
     for segment in segments:
@@ -295,11 +301,12 @@ def _worker(config_path: Path) -> int:
             ),
         )
         source_document = read_source(source)
+        counter = resolve_token_counter(provider="ollama", model=config["model"])
         if config.get("replay_from"):
             import summarizer.pipeline as pipeline_module
 
             saved_segments, saved_leaves = _saved_merge_inputs(
-                Path(config["replay_from"]), source_document
+                Path(config["replay_from"]), source_document, counter
             )
             # Only the leaf inputs are substituted; merge onwards is unchanged.
             # The count is recorded when the pipeline actually takes the leaves.
@@ -309,7 +316,6 @@ def _worker(config_path: Path) -> int:
 
             pipeline_module.cached_segment_document = lambda *_args, **_kwargs: saved_segments
             pipeline_module.summarize_segments = replayed_leaves
-        counter = resolve_token_counter(provider="ollama", model=config["model"])
         provider = OllamaProvider(host=config["proxy_url"])
         selected_context = provider.configure_context_window(
             config["model"], strategy.context_window, timeout_seconds=app.timeout_seconds
