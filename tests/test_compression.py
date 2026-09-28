@@ -227,7 +227,7 @@ def test_an_unpunctuated_run_is_sent_in_bounded_chunks_with_their_allowances() -
 
     source = "alpha " * 1_000 + "\u5b57" * 2_500
     provider = Recording()
-    compress_to_target(
+    result = compress_to_target(
         source,
         provider,
         source_id="a" * 64,
@@ -257,3 +257,7 @@ def test_an_unpunctuated_run_is_sent_in_bounded_chunks_with_their_allowances() -
     assert [request.max_output_tokens for request in provider.requests] == [
         len(chunk) + 64 for chunk in chunks
     ]
+    # Slices of the unspaced run rejoin without a separator, and pieces of the
+    # one long sentence rejoin with a space rather than a paragraph break.
+    assert "\u5b57" * 2_500 in result.text
+    assert "\n\n" not in result.text

@@ -391,8 +391,8 @@ def _compress_pass(
 ) -> tuple[str, tuple[GenerationResult, ...]]:
     chunks = _compression_chunks(text)
     generations: list[GenerationResult] = []
-    outputs: list[str] = []
-    for index, chunk in enumerate(chunks, start=1):
+    output = ""
+    for index, (separator, chunk) in enumerate(chunks, start=1):
         compressed, generation = _compress_chunk(
             chunk,
             provider,
@@ -406,35 +406,40 @@ def _compress_pass(
             strict_names=strict_names,
             limits=limits,
         )
-        outputs.append(compressed)
+        output = f"{output}{separator}{compressed}" if output else compressed
         if generation is not None:
             generations.append(generation)
-    return "\n\n".join(outputs), tuple(generations)
+    return output, tuple(generations)
 
 
-def _compression_chunks(text: str) -> list[str]:
-    """Sentence chunks, with any chunk over the limit split between words.
+def _compression_chunks(text: str) -> list[tuple[str, str]]:
+    """Return `(separator, chunk)` pairs that rejoin into the pass's output.
 
-    A sentence longer than the limit would otherwise be sent as one request
-    of unbounded size, which its request budget would have to refuse. A word
-    longer than the limit, as in unspaced scripts, is cut into slices.
+    Sentence chunks are separated by a blank line. A sentence longer than the
+    limit would otherwise be sent as one request of unbounded size, which its
+    request budget would have to refuse, so it is split between words and its
+    pieces rejoin with a space. A word longer than the limit, as in unspaced
+    scripts or a long identifier, is cut into slices that rejoin with no
+    separator, so a slice kept verbatim restores the original word.
     """
-    chunks: list[str] = []
+    chunks: list[tuple[str, str]] = []
     for chunk in chunk_text_by_sentences(text, CHUNK_CHAR_LIMIT):
         if len(chunk) <= CHUNK_CHAR_LIMIT:
-            chunks.append(chunk)
+            chunks.append(("\n\n", chunk))
             continue
         current = ""
+        current_separator = "\n\n"
         for word in chunk.split():
             for start in range(0, len(word), CHUNK_CHAR_LIMIT):
                 piece = word[start : start + CHUNK_CHAR_LIMIT]
-                if current and len(current) + 1 + len(piece) > CHUNK_CHAR_LIMIT:
-                    chunks.append(current)
-                    current = piece
+                joiner = " " if start == 0 else ""
+                if current and len(current) + len(joiner) + len(piece) > CHUNK_CHAR_LIMIT:
+                    chunks.append((current_separator, current))
+                    current, current_separator = piece, joiner
                 else:
-                    current = f"{current} {piece}" if current else piece
+                    current = f"{current}{joiner}{piece}" if current else piece
         if current:
-            chunks.append(current)
+            chunks.append((current_separator, current))
     return chunks
 
 
