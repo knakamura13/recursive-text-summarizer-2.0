@@ -38,12 +38,23 @@ JSON paths read by the web application (offsets are code points, i.e. Python
     the order verification first saw them, with `text`, `verdict`
     (`contradicted`, `insufficiently_supported`, `not_meaningfully_verifiable`,
     or `unverified`), and a readable `reason`.
+  - `substitutions[]`, absent when none was proposed: with `strict_numbers`
+    on, each rejected draft sentence swapped for a source sentence, with
+    `original_text`, `original_verdict`, `replacement_text`, the verifier's
+    `replacement_verdict` from a pass over the swapped draft (`unverified` when
+    that pass could not run), and `action` (`replaced` only when supported and
+    published, else `removed`).
 - `warnings[]`: `verified_sentence_subset`, `verified_content_unit_fallback`,
   or, in a failure audit written without a publication,
   `verified_content_unit_fallback_failed`.
 - `verification.passes[]`: the claim verdicts (`assessments[].claim_id`, the
-  work id of the claim item events) and evidence identifiers of the check
-  that produced the published text.
+  work id of the claim item events) and evidence identifiers of every
+  completed check, ending with the check that produced the published text. An assessment
+  may carry `reassessment`: the claim's first verdict (`original_verdict`,
+  `original_findings`) before the verifier looked again because its only
+  flagged difference was an allowed `tolerance` (`rounded_number` or
+  `shortened_name`); the assessment's own verdict is that second look.
+  `selections[].retrieval_method` is one of the methods verification defines.
 """
 
 from __future__ import annotations
@@ -74,7 +85,7 @@ from summarizer.hierarchy import TreeNode
 from summarizer.providers.base import GenerationResult
 from summarizer.safety import redact_text
 from summarizer.segmentation import SourceSegment
-from summarizer.verification import ClaimVerdict
+from summarizer.verification import RETRIEVAL_METHODS, ClaimVerdict
 
 if TYPE_CHECKING:
     from summarizer.verification import VerificationResult
@@ -113,6 +124,7 @@ _VERIFICATION_PROMPT_VERSION = frozenset(
         "verification-classification/4",
         "verification-classification/5",
         "verification-classification/6",
+        "verification-reassessment/1",
         "verification-repair/1",
     }
 )
@@ -325,13 +337,15 @@ class AuditVerificationSelection(_AuditRecord):
     examined_ids: tuple[str, ...]
     omitted_ids: tuple[str, ...]
     token_cost: int
-    retrieval_method: Literal[
-        "lexical-overlap/1",
-        "lexical-overlap-required/3",
-        "lexical-overlap/1-escalation",
-        "lexical-overlap/1-escalated",
-    ]
+    retrieval_method: str
     retrieval_complete: bool
+
+    @field_validator("retrieval_method")
+    @classmethod
+    def _known_retrieval_method(cls, value: str) -> str:
+        if value not in RETRIEVAL_METHODS:
+            raise ValueError("audit retrieval_method must be a supported method")
+        return value
 
 
 class AuditVerificationFinding(_AuditRecord):
@@ -343,6 +357,18 @@ class AuditVerificationFinding(_AuditRecord):
         "not_meaningfully_verifiable",
     ]
     evidence_ids: tuple[str, ...]
+
+
+class AuditVerificationReassessment(_AuditRecord):
+    """The first verdict on a rejected claim the verifier looked at again.
+
+    Its only flagged difference was a rounded number or a shortened name the
+    run allows; the owning assessment holds the verifier's second verdict.
+    """
+
+    tolerance: Literal["rounded_number", "shortened_name"]
+    original_verdict: Literal["insufficiently_supported"]
+    original_findings: tuple[AuditVerificationFinding, ...]
 
 
 class AuditVerificationAssessment(_AuditRecord):
@@ -357,10 +383,20 @@ class AuditVerificationAssessment(_AuditRecord):
     verifier_model: str
     prompt_version: str
     findings: tuple[AuditVerificationFinding, ...]
+    reassessment: AuditVerificationReassessment | None = None
 
     _valid_provider = field_validator("verifier_provider")(_audit_identity)
     _valid_model = field_validator("verifier_model")(_audit_model_identity)
     _valid_prompt_version = field_validator("prompt_version")(_audit_prompt_version)
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_reassessment(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        data = handler(self)
+        if data.get("reassessment") is None:
+            data.pop("reassessment", None)
+        return data
 
 
 class AuditVerificationPass(_AuditRecord):
@@ -615,12 +651,44 @@ class AuditRemovedSentence(_AuditRecord):
     _valid_text = field_validator("text", "reason", mode="before")(_audit_prose)
 
 
+class AuditSubstitution(_AuditRecord):
+    """A rejected draft sentence, the source sentence proposed for it, and the outcome.
+
+    The replacement publishes only when a verification pass over the new draft
+    supports it; otherwise it is removed with that pass's verdict, or
+    `unverified` when the pass could not run.
+    """
+
+    original_text: str
+    original_verdict: Literal["insufficiently_supported", "not_meaningfully_verifiable"]
+    replacement_text: str
+    replacement_verdict: Literal[
+        "supported",
+        "contradicted",
+        "insufficiently_supported",
+        "not_meaningfully_verifiable",
+        "unverified",
+    ]
+    action: Literal["replaced", "removed"]
+
+    _valid_text = field_validator("original_text", "replacement_text", mode="before")(
+        _audit_prose
+    )
+
+    @model_validator(mode="after")
+    def _action_matches_verdict(self) -> AuditSubstitution:
+        if (self.action == "replaced") != (self.replacement_verdict == "supported"):
+            raise ValueError("only a supported replacement may be published")
+        return self
+
+
 class AuditPublication(_AuditRecord):
     """How the published summary was chosen and what supports each sentence."""
 
     kind: PublicationKind
     sentences: tuple[AuditPublishedSentence, ...]
     removed_sentences: tuple[AuditRemovedSentence, ...]
+    substitutions: tuple[AuditSubstitution, ...] = ()
 
     @model_validator(mode="after")
     def _sentences_are_ordered(self) -> AuditPublication:
@@ -635,7 +703,22 @@ class AuditPublication(_AuditRecord):
             ):
                 raise ValueError("published sentences must be ordered and disjoint")
             previous = sentence
+        published = " ".join(" ".join(sentence.text.split()) for sentence in self.sentences)
+        for substitution in self.substitutions:
+            if substitution.action == "replaced" and (
+                " ".join(substitution.replacement_text.split()) not in published
+            ):
+                raise ValueError("a replaced sentence must be published")
         return self
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_substitutions(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        data = handler(self)
+        if not data.get("substitutions"):
+            data.pop("substitutions", None)
+        return data
 
 
 class _AuditArtifactBase(_AuditRecord):
@@ -951,7 +1034,16 @@ def _verification_links_resolve(
                     "verification findings must resolve to their assessment"
                 )
             selection = selections[assessment.claim_id]
-            for finding in assessment.findings:
+            reassessed = (
+                assessment.reassessment.original_findings
+                if assessment.reassessment is not None
+                else ()
+            )
+            for finding in (*assessment.findings, *reassessed):
+                if finding.claim_id != assessment.claim_id:
+                    raise ValueError(
+                        "verification findings must resolve to their assessment"
+                    )
                 if not set(finding.evidence_ids) <= set(selection.examined_ids):
                     raise ValueError("verification finding evidence must be examined")
         if set(spans_by_id) & set(spans) or set(claims_by_id) & set(claims):
@@ -996,7 +1088,9 @@ def _publication_links_resolve(
         if any(evidence.segment_id not in segment_ids for evidence in sentence.evidence):
             raise ValueError("sentence evidence must resolve to source segments")
     if not verification.enabled and (
-        publication.kind != "editorial" or publication.removed_sentences
+        publication.kind != "editorial"
+        or publication.removed_sentences
+        or publication.substitutions
     ):
         raise ValueError("an unverified publication must be the unchanged editorial draft")
 
@@ -1501,6 +1595,22 @@ def _audit_verification(
                                 evidence_ids=finding.evidence_ids,
                             )
                             for finding in assessment.findings
+                        ),
+                        reassessment=(
+                            AuditVerificationReassessment(
+                                tolerance=assessment.reassessment.tolerance.value,
+                                original_verdict=assessment.reassessment.original_verdict.value,
+                                original_findings=tuple(
+                                    AuditVerificationFinding(
+                                        claim_id=finding.claim_id,
+                                        verdict=finding.verdict.value,
+                                        evidence_ids=finding.evidence_ids,
+                                    )
+                                    for finding in assessment.reassessment.original_findings
+                                ),
+                            )
+                            if assessment.reassessment is not None
+                            else None
                         ),
                     )
                     for assessment in item.assessments

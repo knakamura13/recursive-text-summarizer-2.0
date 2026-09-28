@@ -232,3 +232,22 @@ def test_repair_triggers_must_share_the_target_span_pass() -> None:
             triggering_claim_ids=("V02C000001",),
             action=RepairAction.REMOVE,
         )
+
+
+def test_an_unknown_retrieval_method_is_rejected_by_producer_and_audit() -> None:
+    from pydantic import ValidationError
+
+    from summarizer.audit import AuditVerificationSelection
+
+    with pytest.raises(ValueError, match="unknown retrieval method"):
+        EvidenceSelection("V01C000001", (), (), (), 0, "numbered-source-sentence", True)
+    with pytest.raises(ValidationError, match="supported method"):
+        AuditVerificationSelection(
+            claim_id="V01C000001",
+            selected_ids=(),
+            examined_ids=(),
+            omitted_ids=(),
+            token_cost=0,
+            retrieval_method="numbered-source-sentence",
+            retrieval_complete=True,
+        )

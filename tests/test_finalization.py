@@ -7,10 +7,7 @@ import pytest
 from summarizer.direct import whole_document_segment
 from summarizer.finalization import (
     FinalizationVerificationError,
-    _effective_claim_verdict,
-    _published_sentences,
     _subset_from_first_pass,
-    _verify_publication,
     _verified_content_unit_draft,
     finalize_summary,
 )
@@ -903,9 +900,6 @@ def _failed_draft(text: str, sentences: tuple[tuple[str, tuple[ClaimVerdict, ...
 
 def test_subset_publishes_passing_sentences_without_second_verification() -> None:
     draft = "Keep this sentence. Drop this sentence."
-    index = build_source_lexical_index(
-        provenance_ids=("D000001",), source={"D000001": "source"}
-    )
     result = _subset_from_first_pass(
         _failed_draft(
             draft,
@@ -914,7 +908,6 @@ def test_subset_publishes_passing_sentences_without_second_verification() -> Non
                 ("Drop this sentence.", (ClaimVerdict.INSUFFICIENTLY_SUPPORTED,)),
             ),
         ),
-        source_index=index,
     )
 
     assert result is not None
@@ -924,9 +917,6 @@ def test_subset_publishes_passing_sentences_without_second_verification() -> Non
 
 def test_subset_returns_none_when_every_sentence_fails() -> None:
     draft = "First failure. Second failure."
-    index = build_source_lexical_index(
-        provenance_ids=("D000001",), source={"D000001": "source"}
-    )
     result = _subset_from_first_pass(
         _failed_draft(
             draft,
@@ -935,16 +925,12 @@ def test_subset_returns_none_when_every_sentence_fails() -> None:
                 ("Second failure.", (ClaimVerdict.CONTRADICTED,)),
             ),
         ),
-        source_index=index,
     )
 
     assert result is None
 
 
 def test_subset_does_not_salvage_a_contract_failure() -> None:
-    index = build_source_lexical_index(
-        provenance_ids=("D000001",), source={"D000001": "source"}
-    )
     result = _subset_from_first_pass(
         SimpleNamespace(
             failed=True,
@@ -953,86 +939,9 @@ def test_subset_does_not_salvage_a_contract_failure() -> None:
                 SimpleNamespace(failed=True, spans=(), claims=(), assessments=(), bundles=()),
             ),
         ),
-        source_index=index,
     )
 
     assert result is None
-
-
-def _lenient_bundle(anchor: str, evidence: str):
-    index = build_source_lexical_index(
-        provenance_ids=("S000001",), source={"S000001": evidence}
-    )
-    item = Claim(
-        claim_id="V01C000001",
-        span_id="V01S000001",
-        ordinal=1,
-        anchor=anchor,
-        is_fallback=True,
-    )
-    bundle = select_claim_evidence(
-        item,
-        source_index=index,
-        counter=ConservativeUtf8TokenCounter(),
-        max_tokens=1000,
-    )
-    return item, index, {item.claim_id: bundle}
-
-
-def test_lenient_numbers_keep_a_rounded_sentence() -> None:
-    item, index, bundles = _lenient_bundle(
-        "They built a stunning nearly 1000 foot skyscraper.",
-        "They built a stunning 963.6 foot skyscraper.",
-    )
-    assert _effective_claim_verdict(
-        item,
-        ClaimVerdict.CONTRADICTED,
-        bundles,
-        index,
-        strict_numbers=False,
-    ) is ClaimVerdict.SUPPORTED
-    assert _effective_claim_verdict(
-        item,
-        ClaimVerdict.CONTRADICTED,
-        bundles,
-        index,
-        strict_numbers=True,
-    ) is ClaimVerdict.CONTRADICTED
-
-
-def test_lenient_numbers_still_drop_a_different_fact() -> None:
-    item, index, bundles = _lenient_bundle(
-        "Nearly 1000 people died.",
-        "963 people were rescued.",
-    )
-    assert _effective_claim_verdict(
-        item,
-        ClaimVerdict.CONTRADICTED,
-        bundles,
-        index,
-        strict_numbers=False,
-    ) is ClaimVerdict.CONTRADICTED
-
-
-def test_lenient_names_keep_a_shortened_name() -> None:
-    item, index, bundles = _lenient_bundle(
-        "Professional skier Saugstad wore a backpack.",
-        "Professional skier Elyse Saugstad wore a backpack.",
-    )
-    assert _effective_claim_verdict(
-        item,
-        ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
-        bundles,
-        index,
-        strict_names=False,
-    ) is ClaimVerdict.SUPPORTED
-    assert _effective_claim_verdict(
-        item,
-        ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
-        bundles,
-        index,
-        strict_names=True,
-    ) is ClaimVerdict.INSUFFICIENTLY_SUPPORTED
 
 
 def _draft_span(span_id: str, ordinal: int, text: str, start: int) -> DraftSpan:
@@ -1046,294 +955,302 @@ def _draft_span(span_id: str, ordinal: int, text: str, start: int) -> DraftSpan:
     )
 
 
-def test_lenient_subset_publishes_with_supported_evidence() -> None:
-    kept = "They built a stunning nearly 1000 foot skyscraper."
-    dropped = "Nearly 1000 people died."
-    draft = f"{kept} {dropped}"
-    kept_source = "They built a stunning 963.6 foot skyscraper."
-    dropped_source = "963 people were rescued."
-    index = build_source_lexical_index(
-        provenance_ids=("S000001", "S000002"),
-        source={"S000001": kept_source, "S000002": dropped_source},
-    )
-    spans = (
-        _draft_span("V01S000001", 1, f"{kept} ", 0),
-        _draft_span("V01S000002", 2, dropped, len(kept) + 1),
-    )
-    claims = (
-        Claim("V01C000001", "V01S000001", 1, kept, False),
-        Claim("V01C000002", "V01S000002", 1, dropped, False),
-    )
-    bundles = tuple(
-        select_claim_evidence(
-            claim,
-            source_index=index,
-            counter=ConservativeUtf8TokenCounter(),
-            max_tokens=1000,
+class _ScriptedVerifier:
+    """An editor that returns `draft`, and a verifier that asks `decide` per claim.
+
+    `decide(claim, request)` returns a verdict. A supported or contradicted
+    claim quotes its own sentence when the evidence contains it verbatim.
+    """
+
+    def __init__(self, draft: str, decide) -> None:
+        self.draft = draft
+        self.decide = decide
+        self.requests = []
+
+    def generate(self, request):
+        self.requests.append(request)
+        if request.operation_id == "editorial-final":
+            payload = {"text": self.draft}
+        elif request.operation_id.startswith("verification-decompose:"):
+            spans = json.loads(request.input_text.splitlines()[1])
+            payload = {"spans": [{"span_id": span["span_id"], "anchors": []} for span in spans]}
+        else:
+            claims = json.loads(request.input_text.splitlines()[1])["claims"]
+            findings = []
+            for claim in claims:
+                verdict = self.decide(claim, request)
+                evidence = []
+                if verdict in {"supported", "contradicted"}:
+                    item = claim["evidence"][0]
+                    quote = claim["span_text"].strip()
+                    evidence = [{
+                        "segment_id": item["segment_id"],
+                        "exact_quote": quote if quote in item["text"] else item["text"],
+                    }]
+                findings.append(
+                    {"claim_id": claim["claim_id"], "verdict": verdict, "evidence": evidence}
+                )
+            payload = {"findings": findings}
+        return GenerationResult(json.dumps(payload), "fake", request.model)
+
+
+def _finalize_draft(tmp_path, *, source: str, draft: str, decide, **switches):
+    counter = ConservativeUtf8TokenCounter()
+    document = ingest_text(source)
+    segment = whole_document_segment(document, counter)
+    summary = SummaryNode.model_validate({
+        "summary": draft,
+        "content_units": [],
+        "entities": [], "qualifications": [], "contradictions": [],
+        "quotations": [], "provenance": [segment.segment_id], "level": 0,
+    })
+    root = TreeNode("L0N0001", 0, 0, summary, (), (segment.segment_id,))
+    provider = _ScriptedVerifier(draft, decide)
+    audit_path = tmp_path / "audit.json"
+
+    def run():
+        return finalize_summary(
+            summary,
+            provider,
+            source_id=document.source_id,
+            model="test-model",
+            timeout_seconds=30,
+            target_words=len(draft.split()),
+            strategy="direct",
+            segments=(segment,),
+            nodes=(root,),
+            root_node_id=root.node_id,
+            audit_path=audit_path,
+            counter=counter,
+            source_cores={segment.segment_id: segment.text},
+            verification=VerificationConfig(enabled=True, **switches),
+            verification_context_window_tokens=10_000,
         )
-        for claim in claims
-    )
-    assessments = tuple(
-        ClaimAssessment(
-            claim_id=claim.claim_id,
-            verdict=ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
-            findings=(
-                BatchFinding(
-                    claim_id=claim.claim_id,
-                    verdict=ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
-                    evidence_ids=(),
-                    exact_quotes=(),
-                ),
-            ),
-            pass_index=1,
-            verifier_provider="test",
-            verifier_model="test",
-            prompt_version="verification-classification/1",
-        )
-        for claim in claims
-    )
-    passed = VerificationPassResult(
-        spans=spans,
-        claims=claims,
-        assessments=assessments,
-        selections=tuple(bundle.selection for bundle in bundles),
-        bundles=bundles,
-        generations=(),
-        phase_generations=(),
-        diagnostic_codes=(),
-        failed=False,
-    )
-    result = _subset_from_first_pass(
-        VerificationResult(
-            text=draft,
-            passes=(assessments,),
-            selections=(passed.selections,),
-            repairs=(),
-            generations=(),
-            diagnostic_codes=(),
-            exhausted=False,
-            failed=True,
-            pass_results=(passed,),
-        ),
-        source_index=index,
-    )
 
-    assert result is not None
-    assert result.text == kept
-    published = _published_sentences(result.text, result, passages=None)
-    assert published[0].text == kept
-    assert published[0].verdict == "supported"
-    assert published[0].evidence[0].quote == kept_source
+    return run, provider, audit_path
 
 
-def test_subset_publishes_when_leniency_keeps_every_sentence() -> None:
-    first = "The harbour opened in May."
-    second = "They built a stunning nearly 1000 foot skyscraper."
-    draft = f"{first} {second}"
-    index = build_source_lexical_index(
-        provenance_ids=("S000001", "S000002"),
-        source={
-            "S000001": "The harbour opened in May.",
-            "S000002": "They built a stunning 963.6 foot skyscraper.",
-        },
-    )
-    spans = (
-        _draft_span("V01S000001", 1, f"{first} ", 0),
-        _draft_span("V01S000002", 2, second, len(first) + 1),
-    )
-    claims = (
-        Claim("V01C000001", "V01S000001", 1, first, False),
-        Claim("V01C000002", "V01S000002", 1, second, False),
-    )
-    bundles = tuple(
-        select_claim_evidence(
-            claim,
-            source_index=index,
-            counter=ConservativeUtf8TokenCounter(),
-            max_tokens=1000,
-        )
-        for claim in claims
-    )
-    assessments = (
-        ClaimAssessment(
-            claim_id=claims[0].claim_id,
-            verdict=ClaimVerdict.SUPPORTED,
-            findings=(
-                BatchFinding(
-                    claim_id=claims[0].claim_id,
-                    verdict=ClaimVerdict.SUPPORTED,
-                    evidence_ids=("S000001",),
-                    exact_quotes=("The harbour opened in May.",),
-                ),
-            ),
-            pass_index=1,
-            verifier_provider="test",
-            verifier_model="test",
-            prompt_version="verification-classification/1",
-        ),
-        ClaimAssessment(
-            claim_id=claims[1].claim_id,
-            verdict=ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
-            findings=(
-                BatchFinding(
-                    claim_id=claims[1].claim_id,
-                    verdict=ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
-                    evidence_ids=(),
-                    exact_quotes=(),
-                ),
-            ),
-            pass_index=1,
-            verifier_provider="test",
-            verifier_model="test",
-            prompt_version="verification-classification/1",
-        ),
-    )
-    passed = VerificationPassResult(
-        spans=spans,
-        claims=claims,
-        assessments=assessments,
-        selections=tuple(bundle.selection for bundle in bundles),
-        bundles=bundles,
-        generations=(),
-        phase_generations=(),
-        diagnostic_codes=(),
-        failed=False,
-    )
-    result = _subset_from_first_pass(
-        VerificationResult(
-            text=draft,
-            passes=(assessments,),
-            selections=(passed.selections,),
-            repairs=(),
-            generations=(),
-            diagnostic_codes=("insufficient_support",),
-            exhausted=False,
-            failed=True,
-            pass_results=(passed,),
-        ),
-        source_index=index,
-    )
-
-    assert result is not None
-    assert first in result.text
-    assert second in result.text
-    published = _published_sentences(result.text, result, passages=None)
-    assert [sentence.text for sentence in published] == [first, second]
+def _reassessment_requests(provider) -> list:
+    return [
+        request
+        for request in provider.requests
+        if "allowed_difference" in request.input_text
+    ]
 
 
-_NUMBERED_KEPT = "The harbour opened in May."
-_NUMBERED_SOURCE = "The crew counted 16 divers on the reef."
+def test_a_reversed_payer_is_not_published_through_matching_words_and_number(
+    tmp_path,
+) -> None:
+    def decide(claim, request):
+        if "allowed_difference" in claim:
+            return "contradicted"
+        return "insufficiently_supported"
+
+    run, provider, audit_path = _finalize_draft(
+        tmp_path,
+        source="Alpha paid Beta 7 dollars.",
+        draft="Beta paid Alpha 7 dollars.",
+        decide=decide,
+    )
+
+    with pytest.raises(FinalizationVerificationError):
+        run()
+
+    assert len(_reassessment_requests(provider)) == 1
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert "publication" not in audit
+    assessment = audit["verification"]["passes"][-1]["assessments"][0]
+    assert assessment["verdict"] == "contradicted"
+    assert assessment["prompt_version"] == "verification-reassessment/1"
+    assert assessment["reassessment"]["original_verdict"] == "insufficiently_supported"
+    assert assessment["reassessment"]["tolerance"] == "rounded_number"
 
 
-def _subset_after_a_numbered_paraphrase(*, strict_numbers: bool):
-    kept = _NUMBERED_KEPT
-    paraphrase = "The event impacted sixteen divers on the reef."
-    contradicted = "Nearly 1000 people died."
-    source_sentence = _NUMBERED_SOURCE
-    rescued = "963 people were rescued."
-    draft = f"{kept} {paraphrase} {contradicted}"
-    index = build_source_lexical_index(
-        provenance_ids=("S000001", "S000002", "S000003"),
-        source={
-            "S000001": kept,
-            "S000002": source_sentence,
-            "S000003": rescued,
-        },
-    )
-    texts = (kept, paraphrase, contradicted)
-    spans = []
-    cursor = 0
-    for index_number, text in enumerate(texts, start=1):
-        piece = text if index_number == len(texts) else f"{text} "
-        spans.append(_draft_span(f"V01S{index_number:06d}", index_number, piece, cursor))
-        cursor += len(piece)
-    claims = tuple(
-        Claim(f"V01C{number:06d}", f"V01S{number:06d}", 1, text, False)
-        for number, text in enumerate(texts, start=1)
-    )
-    bundles = tuple(
-        select_claim_evidence(
-            claim,
-            source_index=index,
-            counter=ConservativeUtf8TokenCounter(),
-            max_tokens=1000,
-        )
-        for claim in claims
-    )
-    verdicts = (
-        ClaimVerdict.SUPPORTED,
-        ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
-        ClaimVerdict.CONTRADICTED,
-    )
-    quotes = ((kept,), (), (rescued,))
-    evidence_ids = (("S000001",), (), ("S000003",))
-    assessments = tuple(
-        ClaimAssessment(
-            claim_id=claim.claim_id,
-            verdict=verdict,
-            findings=(
-                BatchFinding(
-                    claim_id=claim.claim_id,
-                    verdict=verdict,
-                    evidence_ids=ids,
-                    exact_quotes=quote,
-                ),
-            ),
-            pass_index=1,
-            verifier_provider="test",
-            verifier_model="test",
-            prompt_version="verification-classification/1",
-        )
-        for claim, verdict, ids, quote in zip(claims, verdicts, evidence_ids, quotes, strict=True)
-    )
-    passed = VerificationPassResult(
-        spans=tuple(spans),
-        claims=claims,
-        assessments=assessments,
-        selections=tuple(bundle.selection for bundle in bundles),
-        bundles=bundles,
-        generations=(),
-        phase_generations=(),
-        diagnostic_codes=(),
-        failed=False,
-    )
-    return _subset_from_first_pass(
-        VerificationResult(
-            text=draft,
-            passes=(assessments,),
-            selections=(passed.selections,),
-            repairs=(),
-            generations=(),
-            diagnostic_codes=("insufficient_support", "contradicted"),
-            exhausted=False,
-            failed=True,
-            pass_results=(passed,),
-        ),
-        source_index=index,
-        source_cores={
-            "S000001": kept,
-            "S000002": source_sentence,
-            "S000003": rescued,
-        },
+@pytest.mark.parametrize("strict_numbers", [False, True])
+def test_a_rounded_number_publishes_only_on_the_verifiers_second_look(
+    tmp_path, strict_numbers
+) -> None:
+    source = "They built a stunning 963.6 foot skyscraper beside the river."
+
+    def decide(claim, request):
+        return "supported" if "allowed_difference" in claim else "insufficiently_supported"
+
+    run, provider, audit_path = _finalize_draft(
+        tmp_path,
+        source=source,
+        draft="They built a stunning nearly 1000 foot skyscraper beside the river.",
+        decide=decide,
         strict_numbers=strict_numbers,
     )
 
+    if strict_numbers:
+        with pytest.raises(FinalizationVerificationError):
+            run()
+        assert _reassessment_requests(provider) == []
+        return
 
-def test_strict_numbers_replaces_a_rejected_numbered_paraphrase_with_the_source_sentence() -> None:
-    result = _subset_after_a_numbered_paraphrase(strict_numbers=True)
+    result = run()
+    assert "nearly 1000 foot" in result.text
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert audit["publication"]["kind"] == "editorial"
+    sentence = audit["publication"]["sentences"][0]
+    assert sentence["verdict"] == "supported"
+    assert sentence["evidence"][0]["quote"] == source
+    assessment = audit["verification"]["passes"][-1]["assessments"][0]
+    assert assessment["reassessment"]["original_verdict"] == "insufficiently_supported"
 
-    assert result is not None
-    published = _published_sentences(result.text, result, passages=None)
-    assert [sentence.text for sentence in published] == [_NUMBERED_KEPT, _NUMBERED_SOURCE]
-    assert published[1].verdict == "supported"
-    assert published[1].evidence[0].quote == _NUMBERED_SOURCE
-    assert "died" not in result.text
+
+_HARBOUR = "The harbour opened in May."
+_PARAPHRASE = "The event impacted sixteen divers on the reef."
+_SOURCE_SENTENCE = "The crew counted 16 divers on the reef."
 
 
-def test_without_strict_numbers_a_rejected_numbered_paraphrase_is_not_replaced() -> None:
-    result = _subset_after_a_numbered_paraphrase(strict_numbers=False)
+@pytest.mark.parametrize("replacement_verdict", ["supported", "insufficiently_supported"])
+def test_strict_numbers_publishes_a_source_sentence_only_after_it_is_verified(
+    tmp_path, replacement_verdict
+) -> None:
+    def decide(claim, request):
+        text = claim["span_text"].strip()
+        if text == _HARBOUR:
+            return "supported"
+        if text == _SOURCE_SENTENCE:
+            return replacement_verdict
+        return "insufficiently_supported"
 
-    assert result is not None
-    published = _published_sentences(result.text, result, passages=None)
-    assert [sentence.text for sentence in published] == [_NUMBERED_KEPT]
-    assert _NUMBERED_SOURCE not in result.text
+    run, provider, audit_path = _finalize_draft(
+        tmp_path,
+        source=f"{_HARBOUR} {_SOURCE_SENTENCE}",
+        draft=f"{_HARBOUR} {_PARAPHRASE}",
+        decide=decide,
+        strict_numbers=True,
+    )
+
+    result = run()
+
+    assert "verification-decompose:V02" in [request.operation_id for request in provider.requests]
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    publication = audit["publication"]
+    assert publication["kind"] == "verified_subset"
+    assert [item["pass_index"] for item in audit["verification"]["passes"]] == [1, 2]
+    replaced = replacement_verdict == "supported"
+    assert publication["substitutions"] == [{
+        "original_text": _PARAPHRASE,
+        "original_verdict": "insufficiently_supported",
+        "replacement_text": _SOURCE_SENTENCE,
+        "replacement_verdict": replacement_verdict,
+        "action": "replaced" if replaced else "removed",
+    }]
+    assert _PARAPHRASE in [item["text"] for item in publication["removed_sentences"]]
+    if replaced:
+        assert result.text == f"{_HARBOUR} {_SOURCE_SENTENCE}"
+        assert publication["sentences"][1]["evidence"][0]["quote"] == _SOURCE_SENTENCE
+    else:
+        assert result.text == _HARBOUR
+
+
+def test_without_strict_numbers_a_rejected_numbered_sentence_is_only_dropped(
+    tmp_path,
+) -> None:
+    def decide(claim, request):
+        return "supported" if claim["span_text"].strip() == _HARBOUR else "insufficiently_supported"
+
+    run, provider, audit_path = _finalize_draft(
+        tmp_path,
+        source=f"{_HARBOUR} {_SOURCE_SENTENCE}",
+        draft=f"{_HARBOUR} {_PARAPHRASE}",
+        decide=decide,
+    )
+
+    result = run()
+
+    assert result.text == _HARBOUR
+    assert "verification-decompose:V02" not in [
+        request.operation_id for request in provider.requests
+    ]
+    assert "substitutions" not in json.loads(audit_path.read_text(encoding="utf-8"))["publication"]
+
+
+def test_a_contradiction_elsewhere_keeps_the_supported_sentence_and_its_quote(
+    tmp_path,
+) -> None:
+    def decide(claim, request):
+        return "supported" if claim["span_text"].strip() == _HARBOUR else "contradicted"
+
+    run, _provider, audit_path = _finalize_draft(
+        tmp_path,
+        source=f"{_HARBOUR} The mayor resigned.",
+        draft=f"{_HARBOUR} The mayor stayed.",
+        decide=decide,
+    )
+
+    result = run()
+
+    assert result.text == _HARBOUR
+    publication = json.loads(audit_path.read_text(encoding="utf-8"))["publication"]
+    assert publication["sentences"][0]["evidence"][0]["quote"] == _HARBOUR
+    assert publication["removed_sentences"][0]["verdict"] == "contradicted"
+
+
+def test_an_inconclusive_second_look_keeps_the_claim_rejected(tmp_path) -> None:
+    def decide(claim, request):
+        if "allowed_difference" in claim:
+            return "not_meaningfully_verifiable"
+        return "insufficiently_supported"
+
+    run, provider, _audit_path = _finalize_draft(
+        tmp_path,
+        source="They built a stunning 963.6 foot skyscraper beside the river.",
+        draft="They built a stunning nearly 1000 foot skyscraper beside the river.",
+        decide=decide,
+    )
+
+    with pytest.raises(FinalizationVerificationError):
+        run()
+    assert len(_reassessment_requests(provider)) == 1
+
+
+def test_a_sentence_the_source_sentence_check_rejects_does_not_publish_on_its_first_verdict(
+    tmp_path,
+) -> None:
+    def decide(claim, request):
+        first_pass = "V01C" in claim["claim_id"]
+        if claim["span_text"].strip() == _HARBOUR and first_pass:
+            return "supported"
+        return "insufficiently_supported"
+
+    run, _provider, audit_path = _finalize_draft(
+        tmp_path,
+        source=f"{_HARBOUR} {_SOURCE_SENTENCE}",
+        draft=f"{_HARBOUR} {_PARAPHRASE}",
+        decide=decide,
+        strict_numbers=True,
+    )
+
+    with pytest.raises(FinalizationVerificationError):
+        run()
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert [item["pass_index"] for item in audit["verification"]["passes"]] == [1, 2]
+
+
+def test_a_mixed_draft_publishes_only_complete_sentences_at_their_published_offsets(
+    tmp_path,
+) -> None:
+    opening = "New research shows a growing number of U.S."
+    split_rest = "renters struggle with rent."
+    closing = "One in five renters paid late."
+
+    def decide(claim, request):
+        return "insufficiently_supported" if claim["span_text"].strip() == opening else "supported"
+
+    run, _provider, audit_path = _finalize_draft(
+        tmp_path,
+        source=f"{opening} {split_rest} {closing}",
+        draft=f"{opening} {split_rest} {closing}",
+        decide=decide,
+    )
+
+    result = run()
+
+    assert result.text == closing
+    sentences = json.loads(audit_path.read_text(encoding="utf-8"))["publication"]["sentences"]
+    assert [result.text[item["start"] : item["end"]] for item in sentences] == [closing]

@@ -358,7 +358,7 @@ def test_unusable_escalation_keeps_recorded_verdicts() -> None:
         runtime=VerificationRuntime(ScriptedProvider(), ConservativeUtf8TokenCounter(), "model", 30, 10_000),
         config=VerificationConfig(enabled=True, evidence_tokens=80),
     )
-    kept = _passing_sentence_text(published, source_index=source_index)
+    kept = _passing_sentence_text(published)
     assert kept == "The value is 42."
 
 
@@ -1203,7 +1203,9 @@ def test_verify_and_repair_exhaustion_with_insufficiently_supported_fails_closed
         runtime=VerificationRuntime(
             ScriptedProvider(), ConservativeUtf8TokenCounter(), "model", 30, 10_000
         ),
-        config=VerificationConfig(enabled=True, max_repair_passes=1),
+        config=VerificationConfig(
+            enabled=True, max_repair_passes=1, strict_numbers=True, strict_names=True
+        ),
     )
 
     # Baseline: fails closed to original draft

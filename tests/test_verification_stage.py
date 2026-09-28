@@ -235,7 +235,7 @@ def test_verify_once_downgrades_nonexact_quotes_after_one_retry() -> None:
         source_id="a" * 64,
         source_index=index(),
         runtime=runtime(provider),
-        config=VerificationConfig(enabled=True),
+        config=VerificationConfig(enabled=True, strict_numbers=True, strict_names=True),
         pass_index=1,
         terminalize_errors=True,
     )
