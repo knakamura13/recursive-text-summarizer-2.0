@@ -203,6 +203,12 @@ class GgufTokenCounter:
     Special tokens are not recognised in counted text, so a marker such as
     ``<|turn>`` inside a document counts as its pieces. That can only count
     more than the model does, never fewer.
+
+    Ollama wraps the system and user messages in its chat template, 14 tokens
+    for gemma4, which this counter does not see. Request measurement also
+    counts the JSON schema, which Ollama sends as a grammar rather than
+    prompt tokens. On all 1,742 recorded requests the schema count exceeded
+    the template by at least 19 tokens, before any safety margin.
     """
 
     tokenizer: Any
