@@ -62,7 +62,7 @@ from summarizer.compression import (
     _in_band,
     _under_floor,
 )
-from summarizer.editorial import write_editorial
+from summarizer.editorial import EDITORIAL_WORK_ID, write_editorial
 from summarizer.grounding import SourcePassage, serialize_source_passage
 from summarizer.hierarchy import TreeNode
 from summarizer.ingestion import SourceDocument
@@ -106,6 +106,9 @@ from summarizer.verification import (
 # Evidence passages are never split below this many tokens.
 _MIN_PASSAGE_TOKENS = 32
 _PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n(?:[ \t]*\n)*")
+# Work the finalization stage plans for itself: compression passes, the
+# editorial call and verification.
+_FINALIZATION_WORK_ID = re.compile(r"C\d{2}K\d{6}|editorial-final|V\d+")
 _PUBLISHABLE_VERDICTS = frozenset(
     {ClaimVerdict.SUPPORTED, ClaimVerdict.NOT_MEANINGFULLY_VERIFIABLE}
 )
@@ -701,6 +704,7 @@ def _prepare_root_for_editorial(
     strict_numbers: bool = False,
     strict_names: bool = False,
     limits: RequestLimits | None = None,
+    reserve_work: Callable[[tuple[str, ...]], None] | None = None,
 ) -> tuple[SummaryNode, tuple[GenerationResult, ...]]:
     source_text = _compression_source_text(
         root,
@@ -724,6 +728,7 @@ def _prepare_root_for_editorial(
         strict_numbers=strict_numbers,
         strict_names=strict_names,
         limits=limits,
+        reserve_work=reserve_work,
     )
     return root.model_copy(update={"summary": compressed.text}), compressed.generations
 
@@ -1438,6 +1443,36 @@ def _verify_publication(
     )
 
 
+def _finalization_work_planner(
+    coordinator: object,
+) -> Callable[[tuple[str, ...]], None] | None:
+    """Return a callback that appends finalization work to the run's plan.
+
+    Compression, editorial and verification work is planned in the order it
+    runs, each pass just before it starts, as merge levels are. The plan is
+    append-only and completed work must follow it, so the number of
+    compression passes need not be known in advance. On resume the recorded
+    plan already holds these ids and every call is a no-op.
+    """
+    session = getattr(coordinator, "session", None)
+    if session is None:
+        return None
+    plan = session.manifest.work_ids
+    first = next(
+        (index for index, work_id in enumerate(plan) if _FINALIZATION_WORK_ID.fullmatch(work_id)),
+        len(plan),
+    )
+    prefix = plan[:first]
+    planned: list[str] = []
+
+    def reserve(work_ids: tuple[str, ...]) -> None:
+        planned.extend(work_ids)
+        session.ensure_work_prefix((*prefix, *planned))
+
+    return reserve
+
+
+
 def _finalize_summary(
     root: SummaryNode,
     provider: ModelProvider,
@@ -1477,6 +1512,7 @@ def _finalize_summary(
     formatting cannot leave a citation dangling from the recorded sources.
     """
     runtime_observer = get_observer(observer)
+    reserve_work = _finalization_work_planner(getattr(provider, "cache_coordinator", None))
     compression_generations: tuple[GenerationResult, ...] = ()
     if source_cores is not None:
         root, compression_generations = _prepare_root_for_editorial(
@@ -1491,7 +1527,10 @@ def _finalize_summary(
             strict_numbers=verification.strict_numbers,
             strict_names=verification.strict_names,
             limits=request_limits,
+            reserve_work=reserve_work,
         )
+    if reserve_work is not None:
+        reserve_work((EDITORIAL_WORK_ID, *(("V01",) if verification.enabled else ())))
     runtime_observer.emit(StageEvent(StageName.WRITING, "active"))
     editorial = write_editorial(
         root,

@@ -164,3 +164,65 @@ def test_draft_still_invalid_after_reasks_fails_the_editorial_item(response: str
     assert response not in str(error.value)
     assert [state for state, _, _ in events] == ["active", "retrying", "retrying", "failed"]
     assert events[-1][2] == str(error.value)
+
+
+class _Characters:
+    identity = "test:characters"
+    exact = True
+    monotonic = True
+
+    def count(self, text: str) -> int:
+        return len(text)
+
+
+def _limits():
+    from summarizer.budget import ContextWindow, RequestLimits
+    from summarizer.config import StrategyConfig
+
+    return RequestLimits(
+        window=ContextWindow(tokens=32_768, assumed=False),
+        config=StrategyConfig(),
+        counter=_Characters(),
+        correction_headroom=0,
+    )
+
+
+def _root_with_summary(summary: str) -> SummaryNode:
+    return root().model_copy(update={"summary": summary})
+
+
+def test_a_draft_longer_than_the_output_allowance_is_refused_before_any_call() -> None:
+    from summarizer.budget import BudgetFailure, RequestBudgetError
+
+    provider = Provider()
+    # 4,100 counted tokens plus the answer object exceed the 4,096 allowance.
+    with pytest.raises(RequestBudgetError) as caught:
+        write_editorial(
+            _root_with_summary("x" * 4_100),
+            provider,
+            source_id=SOURCE_ID,
+            model="m",
+            timeout_seconds=30,
+            target_words=100,
+            limits=_limits(),
+        )
+
+    assert caught.value.failure is BudgetFailure.OUTPUT_CANNOT_HOLD_DRAFT
+    assert "4164 output tokens" in str(caught.value)
+    assert provider.requests == []
+
+
+def test_a_draft_that_fits_the_output_allowance_is_sent() -> None:
+    provider = Provider()
+
+    write_editorial(
+        _root_with_summary("x" * 4_000),
+        provider,
+        source_id=SOURCE_ID,
+        model="m",
+        timeout_seconds=30,
+        target_words=100,
+        limits=_limits(),
+    )
+
+    assert [request.max_output_tokens for request in provider.requests] == [4_096]

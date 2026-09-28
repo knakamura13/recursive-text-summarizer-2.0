@@ -260,6 +260,9 @@ class BudgetFailure(str, Enum):
     # The input capacity cannot hold the two largest-sized children a merge
     # needs to make progress.
     MERGE_PAIR_EXCEEDS_CAPACITY = "merge_pair_exceeds_capacity"
+    # The output allowance is smaller than the draft the request asks the
+    # model to rewrite in full, so its answer would be cut off.
+    OUTPUT_CANNOT_HOLD_DRAFT = "output_cannot_hold_draft"
 
 
 @dataclass(frozen=True)

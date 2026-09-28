@@ -9,8 +9,10 @@ from dataclasses import dataclass
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from summarizer.budget import (
+    BudgetFailure,
     OverheadMeasurement,
     RequestBudget,
+    RequestBudgetError,
     RequestLimits,
     editorial_output_allowance,
     measure_request_tokens,
@@ -33,6 +35,9 @@ from summarizer.summaries import SummaryNode
 EDITORIAL_PROMPT_VERSION = "editorial-prompt/3"
 EDITORIAL_SCHEMA_NAME = "final_editorial_draft"
 EDITORIAL_WORK_ID = "editorial-final"
+# The `{"text": ...}` answer object around the rewritten draft, as for a
+# compression chunk.
+_FINAL_DRAFT_WRAPPER_TOKENS = 64
 
 _INSTRUCTIONS = """\
 Write one standalone final summary from the grounded summary record supplied as
@@ -211,6 +216,16 @@ def write_editorial(
     )
     if budget is not None:
         budget.require_request(measure_request_tokens(request, limits.counter))
+        draft_tokens = limits.counter.count(root.summary) + _FINAL_DRAFT_WRAPPER_TOKENS
+        if draft_tokens > budget.output_allowance_tokens:
+            raise RequestBudgetError(
+                BudgetFailure.OUTPUT_CANNOT_HOLD_DRAFT,
+                budget,
+                f"the draft to rewrite needs {draft_tokens} output tokens "
+                f"({draft_tokens - _FINAL_DRAFT_WRAPPER_TOKENS} for its text and "
+                f"{_FINAL_DRAFT_WRAPPER_TOKENS} for the answer object), more than "
+                f"the {budget.output_allowance_tokens}-token output allowance",
+            )
     coordinator = getattr(provider, "cache_coordinator", None)
     if coordinator is not None and not isinstance(coordinator, CacheCoordinator):
         raise TypeError("cache_coordinator must be a CacheCoordinator")
