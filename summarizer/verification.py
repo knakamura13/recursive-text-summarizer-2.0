@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Literal, TypeVar
@@ -527,8 +527,18 @@ def _failed_verification_pass(
     pass_index: int,
     code: str,
     failed_phase: GenerationPhase | None = None,
+    reassessment_positions: Collection[int] = (),
+    failed_in_reassessment: bool = False,
 ) -> VerificationPassResult:
     """Retain redacted partial pass metadata after an expected verifier failure."""
+
+    def version(index: int) -> str:
+        if index < decomposition_generation_count:
+            return DECOMPOSITION_PROMPT_VERSION
+        if index in reassessment_positions:
+            return REASSESSMENT_PROMPT_VERSION
+        return CLASSIFICATION_PROMPT_VERSION
+
     return VerificationPassResult(
         spans=tuple(spans),
         claims=tuple(claims),
@@ -543,9 +553,7 @@ def _failed_verification_pass(
                 else GenerationPhase.CLASSIFICATION,
                 pass_index,
                 generation,
-                DECOMPOSITION_PROMPT_VERSION
-                if index < decomposition_generation_count
-                else CLASSIFICATION_PROMPT_VERSION,
+                version(index),
             )
             for index, generation in enumerate(generations)
         )
@@ -555,7 +563,9 @@ def _failed_verification_pass(
                     failed_phase,
                     pass_index,
                     None,
-                    _phase_prompt_version(failed_phase),
+                    REASSESSMENT_PROMPT_VERSION
+                    if failed_in_reassessment
+                    else _phase_prompt_version(failed_phase),
                 ),
             )
             if failed_phase is not None
@@ -1819,8 +1829,13 @@ def verify_draft_once(
     classification_diagnostics: list[str] = []
     generations = list(decomposition_generations)
 
+    reassessment_positions: set[int] = set()
+
     def classification_failure(
-        code: str, *, failed_phase: GenerationPhase | None = None
+        code: str,
+        *,
+        failed_phase: GenerationPhase | None = None,
+        failed_in_reassessment: bool = False,
     ) -> VerificationPassResult:
         claim_progress.fail_open(code)
         return _failed_verification_pass(
@@ -1832,6 +1847,8 @@ def verify_draft_once(
             pass_index=pass_index,
             code=code,
             failed_phase=failed_phase,
+            reassessment_positions=frozenset(reassessment_positions),
+            failed_in_reassessment=failed_in_reassessment,
         )
 
     def escalates(claim: Claim) -> bool:
@@ -2144,7 +2161,6 @@ def verify_draft_once(
     # one more verifier look with that difference named. The second verdict is
     # the verifier's own: shared words or numbers never publish a claim.
     reassessments: dict[str, ClaimReassessment] = {}
-    reassessment_positions: set[int] = set()
     for claim in claims:
         pending = deferred.pop(claim.claim_id, None)
         if pending is None:
@@ -2201,6 +2217,7 @@ def verify_draft_once(
                 return classification_failure(
                     "classification_provider_failed",
                     failed_phase=GenerationPhase.CLASSIFICATION,
+                    failed_in_reassessment=True,
                 )
             generations.append(generation)
             reassessment_positions.add(len(generations) - 1)
@@ -2237,6 +2254,17 @@ def verify_draft_once(
             classification_diagnostics.append("reassessment_failed")
             claim_progress.completed(claim.claim_id, original_verdict)
             continue
+        second_verdict = reduce_batch_findings(
+            claim.claim_id,
+            parsed,
+            retrieval_complete=bundle.selection.retrieval_complete,
+        )[0]
+        if second_verdict not in {ClaimVerdict.SUPPORTED, ClaimVerdict.CONTRADICTED}:
+            # The claim was already judged checkable, so only a decision on
+            # the evidence replaces the first verdict.
+            classification_diagnostics.append("reassessment_inconclusive")
+            claim_progress.completed(claim.claim_id, original_verdict)
+            continue
         reassessments[claim.claim_id] = ClaimReassessment(
             tolerance=tolerance,
             original_verdict=original_verdict,
@@ -2245,14 +2273,7 @@ def verify_draft_once(
         findings_by_claim[claim.claim_id] = list(parsed)
         finding_generations[claim.claim_id] = generation
         unresolved_escalations.discard(claim.claim_id)
-        claim_progress.completed(
-            claim.claim_id,
-            reduce_batch_findings(
-                claim.claim_id,
-                parsed,
-                retrieval_complete=bundle.selection.retrieval_complete,
-            )[0],
-        )
+        claim_progress.completed(claim.claim_id, second_verdict)
 
     assessments: list[ClaimAssessment] = []
     diagnostic_codes: list[str] = [

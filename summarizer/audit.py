@@ -48,8 +48,8 @@ JSON paths read by the web application (offsets are code points, i.e. Python
   or, in a failure audit written without a publication,
   `verified_content_unit_fallback_failed`.
 - `verification.passes[]`: the claim verdicts (`assessments[].claim_id`, the
-  work id of the claim item events) and evidence identifiers of every check
-  run, ending with the check that produced the published text. An assessment
+  work id of the claim item events) and evidence identifiers of every
+  completed check, ending with the check that produced the published text. An assessment
   may carry `reassessment`: the claim's first verdict (`original_verdict`,
   `original_findings`) before the verifier looked again because its only
   flagged difference was an allowed `tolerance` (`rounded_number` or

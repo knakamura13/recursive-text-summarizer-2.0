@@ -1337,6 +1337,7 @@ def _verify_publication(
     if result.failed:
         progress.phase("Removing unsupported sentences")
         subset: VerificationResult | None = None
+        swapped_draft_checked = False
         ordered_cores = _ordered_source_cores(source_cores, segments)
         if config.strict_numbers and ordered_cores:
             candidate, substitutions = _reassessed_substitutions(
@@ -1349,9 +1350,13 @@ def _verify_publication(
                 progress=progress,
             )
             if candidate is not None:
+                # The swapped draft was checked, so only that newest check may
+                # publish; earlier verdicts on its sentences no longer count.
                 ledger.record(candidate)
+                result = candidate
                 subset = _subset_from_first_pass(candidate, changed=True)
-        if subset is None:
+                swapped_draft_checked = True
+        if subset is None and not swapped_draft_checked:
             subset = _subset_from_first_pass(result)
         if subset is not None:
             result = subset

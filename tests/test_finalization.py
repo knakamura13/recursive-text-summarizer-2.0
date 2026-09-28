@@ -1189,3 +1189,44 @@ def test_a_contradiction_elsewhere_keeps_the_supported_sentence_and_its_quote(
     publication = json.loads(audit_path.read_text(encoding="utf-8"))["publication"]
     assert publication["sentences"][0]["evidence"][0]["quote"] == _HARBOUR
     assert publication["removed_sentences"][0]["verdict"] == "contradicted"
+
+
+def test_an_inconclusive_second_look_keeps_the_claim_rejected(tmp_path) -> None:
+    def decide(claim, request):
+        if "allowed_difference" in claim:
+            return "not_meaningfully_verifiable"
+        return "insufficiently_supported"
+
+    run, provider, _audit_path = _finalize_draft(
+        tmp_path,
+        source="They built a stunning 963.6 foot skyscraper beside the river.",
+        draft="They built a stunning nearly 1000 foot skyscraper beside the river.",
+        decide=decide,
+    )
+
+    with pytest.raises(FinalizationVerificationError):
+        run()
+    assert len(_reassessment_requests(provider)) == 1
+
+
+def test_a_sentence_the_source_sentence_check_rejects_does_not_publish_on_its_first_verdict(
+    tmp_path,
+) -> None:
+    def decide(claim, request):
+        first_pass = "V01C" in claim["claim_id"]
+        if claim["span_text"].strip() == _HARBOUR and first_pass:
+            return "supported"
+        return "insufficiently_supported"
+
+    run, _provider, audit_path = _finalize_draft(
+        tmp_path,
+        source=f"{_HARBOUR} {_SOURCE_SENTENCE}",
+        draft=f"{_HARBOUR} {_PARAPHRASE}",
+        decide=decide,
+        strict_numbers=True,
+    )
+
+    with pytest.raises(FinalizationVerificationError):
+        run()
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert [item["pass_index"] for item in audit["verification"]["passes"]] == [1, 2]
