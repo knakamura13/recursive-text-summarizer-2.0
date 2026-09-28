@@ -449,6 +449,21 @@ def test_audit_v2_rejects_unresolved_work_that_was_finished() -> None:
         _artifact(verification=finished_but_unresolved)
 
 
+def test_audit_v2_rejects_a_published_result_whose_last_pass_left_work_unresolved() -> None:
+    complete = _verification("D000001")
+    unfinished = replace(
+        complete.pass_results[0],
+        assessments=(),
+        unresolved=(UnresolvedWork("V01C000001", GenerationPhase.CLASSIFICATION, "omitted"),),
+    )
+    published = replace(
+        complete, passes=((),), pass_results=(unfinished,), repairs=(), failed=False
+    )
+
+    with pytest.raises((AuditError, ValueError), match="partial pass"):
+        _artifact(verification=published)
+
+
 def test_audit_v2_serializes_terminal_decomposition_failure_without_claim_prose() -> None:
     generation = GenerationResult("malformed provider prose", "provider", "model")
     result = VerificationResult(

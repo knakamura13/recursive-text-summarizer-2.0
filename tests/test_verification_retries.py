@@ -18,6 +18,9 @@ from summarizer.verification import (
     UnresolvedWork,
     VerificationConfig,
     VerificationRuntime,
+    _measure_request_tokens,
+    _resolve_work,
+    _response_correction,
     build_source_lexical_index,
     verify_and_repair,
     verify_draft_once,
@@ -189,3 +192,68 @@ def test_an_unfinished_sentence_is_never_published_but_checked_ones_are() -> Non
     assert _passing_sentence_text(result) == " ".join(
         fact for index, fact in enumerate(FACTS) if index != 2
     )
+
+
+def test_an_item_near_capacity_is_re_asked_alone_with_its_own_correction() -> None:
+    """A group's longer correction note must not turn a fitting item into a capacity failure."""
+    notes = {
+        "b": "claim-decomposition: anchor not in span",
+        "d": "claim-decomposition: missing span result",
+    }
+    asked: list[tuple[str, ...]] = []
+
+    def build(items, correction):
+        return GenerationRequest(
+            model="model",
+            instructions="x" * (2_000 if "b" in items else 10) + correction,
+            input_text="|".join(items),
+            timeout_seconds=30,
+            operation_id="verification-decompose:V01",
+        )
+
+    def parse(_text, items):
+        # "a" and "c" answer at once, "d" on its re-ask, "b" never.
+        answered = {"a", "c"} | ({"d"} if len(asked) > 1 else set())
+        return (
+            {item: [] for item in items if item in answered},
+            {},
+            {item: notes[item] for item in items if item not in answered},
+        )
+
+    class Provider:
+        def generate(self, request):
+            asked.append(tuple(request.input_text.split("|")))
+            return GenerationResult(text="{}", provider="scripted", model="model")
+
+    counter = ConservativeUtf8TokenCounter()
+    own = _measure_request_tokens(
+        build(("b",), _response_correction([notes["b"]], phase=GenerationPhase.DECOMPOSITION)), counter
+    )
+    joined = _measure_request_tokens(
+        build(("b",), _response_correction(list(notes.values()), phase=GenerationPhase.DECOMPOSITION)), counter
+    )
+    assert own < joined
+    config = VerificationConfig(
+        enabled=True, request_tokens=(own + joined) // 2, output_reserve_tokens=1, safety_margin_tokens=0
+    )
+
+    resolution = _resolve_work(
+        (("a", "b", "c", "d"),),
+        item_id=lambda item: item,
+        build_request=build,
+        parse=parse,
+        phase=GenerationPhase.DECOMPOSITION,
+        runtime=VerificationRuntime(
+            provider=Provider(),
+            counter=counter,
+            model="model",
+            timeout_seconds=30,
+            context_window_tokens=100_000,
+        ),
+        config=config,
+        before_call=lambda _items, _retry: None,
+        generations=[],
+    )
+
+    assert asked == [("a", "b", "c", "d"), ("d",), ("b",)]
+    assert resolution.unresolved == {"b": "invalid_response"}

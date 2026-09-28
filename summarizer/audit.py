@@ -933,22 +933,29 @@ def _unresolved_work_resolves(
     record: AuditVerificationPass,
     spans: Mapping[str, AuditVerificationSpan],
     claims: Mapping[str, AuditVerificationClaim],
+    selections: Mapping[str, AuditVerificationSelection],
     assessments: Mapping[str, AuditVerificationAssessment],
 ) -> None:
-    """Each unresolved span has no claims and each unresolved claim no verdict."""
+    """Unresolved work lists exactly the pass's unfinished spans and claims.
+
+    An unresolved span has no claims. Every claim without an assessment is an
+    unresolved classification item, and every claim has its selection.
+    """
     if record.complete:
         raise ValueError("a verification pass with unresolved work is not complete")
     item_ids = [item.item_id for item in record.unresolved]
     if len(set(item_ids)) != len(item_ids):
         raise ValueError("verification unresolved work must be unique")
     claimed_spans = {claim.span_id for claim in claims.values()}
-    for item in record.unresolved:
-        if item.phase == "decomposition":
-            resolves = item.item_id in spans and item.item_id not in claimed_spans
-        else:
-            resolves = item.item_id in claims and item.item_id not in assessments
-        if not resolves:
-            raise ValueError("verification unresolved work must resolve to unfinished pass work")
+    unassessed = {
+        item.item_id for item in record.unresolved if item.phase == "classification"
+    }
+    if any(
+        item.phase == "decomposition"
+        and (item.item_id not in spans or item.item_id in claimed_spans)
+        for item in record.unresolved
+    ) or unassessed != set(claims) - set(assessments) or set(selections) != set(claims):
+        raise ValueError("verification unresolved work must list exactly the unfinished pass work")
 
 
 def _verification_links_resolve(
@@ -1047,11 +1054,15 @@ def _verification_links_resolve(
             raise ValueError(
                 "verification pass completion must match recorded coverage"
             )
+        is_last = record_position == len(verification.passes) - 1
         if record.unresolved:
-            _unresolved_work_resolves(record, spans, claims, assessments)
-        elif not record.complete and (
-            not verification.failed or record_position != len(verification.passes) - 1
-        ):
+            # An earlier pass may leave work unfinished when a later pass
+            # publishes; the last pass may only when verification failed.
+            _unresolved_work_resolves(record, spans, claims, selections, assessments)
+            partial_needs_failure = is_last
+        else:
+            partial_needs_failure = not record.complete
+        if partial_needs_failure and (not verification.failed or not is_last):
             raise ValueError(
                 "only a terminal failed verification may have a partial pass"
             )

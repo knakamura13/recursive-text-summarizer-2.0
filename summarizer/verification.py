@@ -1745,7 +1745,9 @@ def _resolve_work(
             for item in group:
                 if measure((item,)) <= capacity:
                     fitting.append(item)
-                elif item_id(item) not in lenient:
+                elif len(group) == 1 and item_id(item) not in lenient:
+                    # Only an item's own correction decides capacity; a group's
+                    # longer note leaves the item for the one-at-a-time round.
                     unresolved[item_id(item)] = "capacity"
             if not fitting:
                 continue
