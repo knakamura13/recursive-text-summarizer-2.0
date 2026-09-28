@@ -155,6 +155,21 @@ _NOTICE_TEXT: dict[str, tuple[Literal["info", "warning", "error"], str]] = {
         "warning",
         "An extra evidence check was unusable, so that claim kept its first result.",
     ),
+    "decomposition_incomplete": (
+        "warning",
+        "The verifier did not split some sentences into claims after re-asking, "
+        "so those sentences were left out.",
+    ),
+    "classification_incomplete": (
+        "warning",
+        "The verifier did not finish checking some claims after re-asking, "
+        "so their sentences were left out.",
+    ),
+    "verification_incomplete": (
+        "warning",
+        "Verification left some sentences unchecked; only checked, supported "
+        "sentences can be published.",
+    ),
 }
 
 

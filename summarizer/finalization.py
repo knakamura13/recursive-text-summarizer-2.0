@@ -153,8 +153,10 @@ class FinalizationVerificationError(RuntimeError):
 
 
 def _all_claims_supported(result: VerificationPassResult) -> bool:
+    """Every span was decomposed and every claim was supported."""
     return (
         not result.failed
+        and not getattr(result, "unresolved", ())
         and bool(result.assessments)
         and all(
             assessment.verdict is ClaimVerdict.SUPPORTED
@@ -242,7 +244,13 @@ def _assembled_addition_supported(
         return True
     claims = getattr(result, "claims", ())
     spans = getattr(result, "spans", ())
-    if result.failed or not result.assessments or not claims or not spans:
+    if (
+        result.failed
+        or getattr(result, "unresolved", ())
+        or not result.assessments
+        or not claims
+        or not spans
+    ):
         return False
     if any(
         assessment.verdict is ClaimVerdict.CONTRADICTED
@@ -613,6 +621,9 @@ def _subset_from_first_pass(
         generations=getattr(passed, "generations", ()),
         phase_generations=getattr(passed, "phase_generations", ()),
         diagnostic_codes=getattr(passed, "diagnostic_codes", ()),
+        # Unfinished spans and claims are never kept, so each entry names work
+        # this publication withheld; the audit keeps its id and reason.
+        unresolved=getattr(passed, "unresolved", ()),
     )
     prior = tuple(result.pass_results[:-1])
     return VerificationResult(

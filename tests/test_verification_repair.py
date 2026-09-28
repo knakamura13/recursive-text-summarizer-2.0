@@ -13,9 +13,11 @@ from summarizer.verification import (
     Claim,
     ClaimVerdict,
     DraftSpan,
+    GenerationPhase,
     RepairAction,
     RepairProposal,
     RepairWorkItem,
+    UnresolvedWork,
     VerificationConfig,
     VerificationResponseError,
     VerificationRuntime,
@@ -445,15 +447,18 @@ def test_verify_and_repair_terminalizes_malformed_initial_decomposition() -> Non
 
     assert result.failed
     assert result.text == draft
-    assert result.failure_codes == ("decomposition_failed",)
+    assert result.failure_codes == ("verification_incomplete",)
+    assert result.pass_results[0].unresolved == (
+        UnresolvedWork("V01S000001", GenerationPhase.DECOMPOSITION, "invalid_response"),
+    )
     assert [(item.phase, item.prompt_version) for item in result.phase_generations] == [
-        ("decomposition", "verification-decomposition/2"),
-        ("decomposition", "verification-decomposition/2"),
+        ("decomposition", "verification-decomposition/3"),
+        ("decomposition", "verification-decomposition/3"),
     ]
 
 
-def test_verify_and_repair_terminalizes_invalid_span_anchor_result_after_repair() -> None:
-    """A duplicate-anchor response remains a closed failure after retry."""
+def test_verify_and_repair_restores_draft_when_repaired_span_is_never_decomposed() -> None:
+    """A repaired span the decomposer keeps omitting is unresolved, so the repair is rejected."""
     draft = "The value is 42."
 
     class ScriptedProvider:
@@ -463,8 +468,8 @@ def test_verify_and_repair_terminalizes_invalid_span_anchor_result_after_repair(
                     *contradicted_atomic_and_fallback(1, "value is 41"),
                     '{"repairs":[{"span_id":"V01S000001","original_hash":"%s","action":"replace","replacement":"The value is 41."}]}'
                     % hashlib.sha256(draft.encode()).hexdigest(),
-                    '{"spans":[{"span_id":"V02S000001","anchors":["value","value"]}]}',
-                    '{"spans":[{"span_id":"V02S000001","anchors":["value","value"]}]}',
+                    '{"spans":[]}',
+                    '{"spans":[]}',
                 )
             )
 
@@ -483,7 +488,10 @@ def test_verify_and_repair_terminalizes_invalid_span_anchor_result_after_repair(
 
     assert result.failed
     assert result.text == draft
-    assert result.failure_codes == ("anchor_failed",)
+    assert result.failure_codes == ("verification_incomplete",)
+    assert result.pass_results[-1].unresolved == (
+        UnresolvedWork("V02S000001", GenerationPhase.DECOMPOSITION, "omitted"),
+    )
     assert [item.phase for item in result.phase_generations] == [
         "decomposition", "classification", "repair", "decomposition", "decomposition",
     ]
@@ -565,7 +573,7 @@ def test_post_repair_malformed_pass_does_not_consume_another_repair_attempt() ->
     assert result.failed
     assert result.text == draft
     assert provider.calls == 5
-    assert result.failure_codes == ("decomposition_failed",)
+    assert result.failure_codes == ("verification_incomplete",)
 
 
 def test_verify_and_repair_uses_each_configured_repair_pass_at_most_once() -> None:
@@ -794,6 +802,7 @@ def test_verify_and_repair_discards_nested_repairs_when_continuation_fails() -> 
                             ]
                         }
                     ),
+                    "not-json",
                     "not-json",
                     "not-json",
                 )
