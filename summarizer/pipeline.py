@@ -13,9 +13,9 @@ from summarizer.budget import (
     BudgetError,
     BudgetReport,
     measure_overhead,
+    plan_request,
     resolve_context_window,
     select_strategy,
-    usable_input_capacity,
 )
 from summarizer.cache import CacheStore
 from summarizer.checkpoint import CheckpointStore, RunPlan
@@ -176,7 +176,8 @@ def _hierarchical_capacity(
     window = resolve_context_window(
         provider=app.provider, model=app.model, explicit=strategy.context_window
     )
-    return usable_input_capacity(
+    return plan_request(
+        "leaf",
         window=window,
         overhead=measure_overhead(
             counter,
@@ -187,8 +188,10 @@ def _hierarchical_capacity(
                 else 0
             ),
         ),
+        output_allowance=report.reserved_output_tokens,
+        correction_headroom=report.correction_headroom_tokens,
         config=strategy,
-    )
+    ).input_capacity
 
 
 def leaf_segmentation(
