@@ -372,6 +372,29 @@ class VerificationGeneration:
             raise ValueError("verification generation prompt_version must not be blank")
 
 
+UnresolvedReason = Literal["omitted", "invalid_response", "capacity"]
+
+
+@dataclass(frozen=True)
+class UnresolvedWork:
+    """A span or claim the verifier never finished, after its bounded retries.
+
+    A decomposition item is a span id: the span has no claims. A classification
+    item is a claim id: the claim has no assessment. Neither ever publishes.
+    """
+
+    item_id: str
+    phase: GenerationPhase
+    reason: UnresolvedReason
+
+    def __post_init__(self) -> None:
+        pattern = _SPAN_ID if self.phase is GenerationPhase.DECOMPOSITION else _CLAIM_ID
+        if self.phase is GenerationPhase.REPAIR or not pattern.fullmatch(self.item_id):
+            raise ValueError("unresolved work must name a span or claim of its phase")
+        if self.reason not in {"omitted", "invalid_response", "capacity"}:
+            raise ValueError("unresolved work reason is unknown")
+
+
 @dataclass(frozen=True)
 class VerificationPassResult:
     spans: tuple[DraftSpan, ...]
@@ -383,6 +406,7 @@ class VerificationPassResult:
     phase_generations: tuple[VerificationGeneration, ...]
     diagnostic_codes: tuple[str, ...]
     failed: bool = False
+    unresolved: tuple[UnresolvedWork, ...] = ()
 
 
 def _phase_prompt_version(phase: GenerationPhase) -> str:
@@ -937,12 +961,7 @@ def pack_work_items(
     measure_request: Callable[[tuple[_WorkItem, ...]], int] | None = None,
 ) -> tuple[tuple[_WorkItem, ...], ...]:
     """Pack indivisible work items under both configured and runtime limits."""
-    capacity = min(
-        config.request_tokens,
-        runtime.context_window_tokens
-        - config.output_reserve_tokens
-        - config.safety_margin_tokens,
-    )
+    capacity = _request_capacity(runtime, config)
     if capacity <= 0:
         raise VerificationCapacityError("verification runtime has no usable input capacity")
     batches: list[tuple[_WorkItem, ...]] = []
@@ -1072,8 +1091,8 @@ class _RepairResponse(BaseModel):
     repairs: list[_Repair]
 
 
-DECOMPOSITION_PROMPT_VERSION = "verification-decomposition/2"
-CLASSIFICATION_PROMPT_VERSION = "verification-classification/6"
+DECOMPOSITION_PROMPT_VERSION = "verification-decomposition/3"
+CLASSIFICATION_PROMPT_VERSION = "verification-classification/7"
 REASSESSMENT_PROMPT_VERSION = "verification-reassessment/1"
 _REASSESSMENT_INSTRUCTION = (
     " The claim carries allowed_difference, one wording change this run accepts. "
@@ -1384,9 +1403,8 @@ def _validated_response(text: str, schema: type[BaseModel], *, subject: str) -> 
         ) from error
 
 
-def _response_correction(error: VerificationResponseError, *, phase: GenerationPhase) -> str:
-    """Give the model a closed, source-free explanation of its failed contract."""
-    reason = str(error)
+def _correction_rule(reason: str, *, phase: GenerationPhase) -> str:
+    """Name the closed contract rule a rejected response broke."""
     if phase is GenerationPhase.DECOMPOSITION:
         if "anchor not in span" in reason:
             rule = "Each anchor must be an exact substring of its own span text."
@@ -1410,7 +1428,22 @@ def _response_correction(error: VerificationResponseError, *, phase: GenerationP
         rule = "Do not repeat an identical segment_id and exact_quote pair within one finding."
     else:
         rule = "Return one JSON object matching the required schema and evidence rules."
-    return f"The previous response was rejected. {rule} Regenerate the complete response."
+    return rule
+
+
+def _response_correction(reasons: Sequence[str], *, phase: GenerationPhase) -> str:
+    """Give the model a closed, source-free explanation of its failed contract."""
+    rules = " ".join(dict.fromkeys(_correction_rule(reason, phase=phase) for reason in reasons))
+    return f"The previous response was rejected. {rules} Regenerate the complete response."
+
+
+def _request_capacity(runtime: VerificationRuntime, config: VerificationConfig) -> int:
+    return min(
+        config.request_tokens,
+        runtime.context_window_tokens
+        - config.output_reserve_tokens
+        - config.safety_margin_tokens,
+    )
 
 
 def _corrected_request(
@@ -1423,15 +1456,9 @@ def _corrected_request(
 ) -> GenerationRequest:
     corrected = replace(
         request,
-        instructions=f"{request.instructions} {_response_correction(error, phase=phase)}",
+        instructions=f"{request.instructions} {_response_correction((str(error),), phase=phase)}",
     )
-    capacity = min(
-        config.request_tokens,
-        runtime.context_window_tokens
-        - config.output_reserve_tokens
-        - config.safety_margin_tokens,
-    )
-    if _measure_request_tokens(corrected, runtime.counter) > capacity:
+    if _measure_request_tokens(corrected, runtime.counter) > _request_capacity(runtime, config):
         raise VerificationCapacityError("corrected verification request exceeds capacity")
     return corrected
 
@@ -1484,6 +1511,45 @@ def parse_claim_anchors(
     return tuple(claims)
 
 
+def _validated_finding(
+    finding: _Finding,
+    claim: Claim,
+    legal_evidence: Mapping[str, str],
+    *,
+    downgrade_invalid_quotes: bool = False,
+) -> BatchFinding:
+    """Check one finding against the evidence selected for its own claim."""
+    evidence_ids: list[str] = []
+    quotes: list[str] = []
+    invalid_quote = False
+    for evidence in finding.evidence:
+        if (evidence.segment_id, evidence.exact_quote) in zip(evidence_ids, quotes):
+            raise VerificationResponseError("claim-verification: duplicate evidence")
+        passage = legal_evidence.get(evidence.segment_id)
+        if passage is None:
+            raise VerificationResponseError("claim-verification: unselected evidence")
+        if not evidence.exact_quote.strip() or evidence.exact_quote not in passage:
+            if not downgrade_invalid_quotes:
+                raise VerificationResponseError("claim-verification: quote not in evidence")
+            invalid_quote = True
+        evidence_ids.append(evidence.segment_id)
+        quotes.append(evidence.exact_quote)
+    try:
+        return BatchFinding(
+            claim_id=claim.claim_id,
+            verdict=(
+                ClaimVerdict.INSUFFICIENTLY_SUPPORTED
+                if invalid_quote else finding.verdict
+            ),
+            evidence_ids=() if invalid_quote else tuple(evidence_ids),
+            exact_quotes=() if invalid_quote else tuple(quotes),
+        )
+    except ValueError as error:
+        raise VerificationResponseError(
+            f"claim-verification: invalid finding ({_sanitize(error)})"
+        ) from error
+
+
 def parse_claim_findings(
     text: str,
     *,
@@ -1497,44 +1563,216 @@ def parse_claim_findings(
     result_ids = [finding.claim_id for finding in response.findings]
     if len(result_ids) != len(set(result_ids)) or set(result_ids) != legal_claims:
         raise VerificationResponseError("claim-verification: claim results do not match")
-
-    findings: list[BatchFinding] = []
     by_id = {finding.claim_id: finding for finding in response.findings}
-    for claim in claims:
-        finding = by_id[claim.claim_id]
-        legal_evidence = selected.get(claim.claim_id, {})
-        evidence_ids: list[str] = []
-        quotes: list[str] = []
-        invalid_quote = False
-        for evidence in finding.evidence:
-            if (evidence.segment_id, evidence.exact_quote) in zip(evidence_ids, quotes):
-                raise VerificationResponseError("claim-verification: duplicate evidence")
-            passage = legal_evidence.get(evidence.segment_id)
-            if passage is None:
-                raise VerificationResponseError("claim-verification: unselected evidence")
-            if not evidence.exact_quote.strip() or evidence.exact_quote not in passage:
-                if not downgrade_invalid_quotes:
-                    raise VerificationResponseError("claim-verification: quote not in evidence")
-                invalid_quote = True
-            evidence_ids.append(evidence.segment_id)
-            quotes.append(evidence.exact_quote)
-        try:
-            findings.append(
-                BatchFinding(
-                    claim_id=claim.claim_id,
-                    verdict=(
-                        ClaimVerdict.INSUFFICIENTLY_SUPPORTED
-                        if invalid_quote else finding.verdict
-                    ),
-                    evidence_ids=() if invalid_quote else tuple(evidence_ids),
-                    exact_quotes=() if invalid_quote else tuple(quotes),
-                )
+    return tuple(
+        _validated_finding(
+            by_id[claim.claim_id],
+            claim,
+            selected.get(claim.claim_id, {}),
+            downgrade_invalid_quotes=downgrade_invalid_quotes,
+        )
+        for claim in claims
+    )
+
+
+_MISSING_SPAN = "claim-decomposition: missing span result"
+_MISSING_CLAIM = "claim-verification: claim results do not match"
+_OMISSION_REASONS = frozenset(
+    {_MISSING_SPAN, "claim-decomposition: duplicate span result", _MISSING_CLAIM}
+)
+
+# Each parsed batch yields the items it resolved, a lenient fallback for items
+# rejected only for a repairable detail, and the rejection reason of every
+# other item.
+_BatchParse = tuple[dict[str, object], dict[str, object], dict[str, str]]
+
+
+def _parse_anchor_batch(text: str, batch: Sequence[DraftSpan]) -> _BatchParse:
+    """Accept each span's anchors on their own merits.
+
+    A span that is missing or repeated is rejected. A span with a repeated or
+    non-substring anchor is rejected but keeps its valid anchors as a fallback;
+    its whole-span claim still checks every word.
+    """
+    try:
+        response = _validated_response(text, _AnchorResponse, subject="claim-decomposition")
+    except VerificationResponseError as error:
+        return {}, {}, {span.span_id: str(error) for span in batch}
+    assert isinstance(response, _AnchorResponse)
+    found: dict[str, list[_AnchorGroup]] = {}
+    for group in response.spans:
+        found.setdefault(group.span_id, []).append(group)
+    accepted: dict[str, object] = {}
+    lenient: dict[str, object] = {}
+    rejected: dict[str, str] = {}
+    for span in batch:
+        groups = found.get(span.span_id, [])
+        if len(groups) != 1:
+            rejected[span.span_id] = (
+                _MISSING_SPAN if not groups else "claim-decomposition: duplicate span result"
             )
-        except ValueError as error:
-            raise VerificationResponseError(
-                f"claim-verification: invalid finding ({_sanitize(error)})"
-            ) from error
-    return tuple(findings)
+            continue
+        anchors = groups[0].anchors
+        valid = [anchor for anchor in dict.fromkeys(anchors) if anchor in span.text]
+        if len(valid) == len(anchors):
+            accepted[span.span_id] = valid
+            continue
+        rejected[span.span_id] = (
+            "claim-decomposition: duplicate anchor"
+            if len(set(anchors)) != len(anchors)
+            else "claim-decomposition: anchor not in span"
+        )
+        lenient[span.span_id] = valid
+    return accepted, lenient, rejected
+
+
+def _parse_finding_batch(
+    text: str,
+    batch: Sequence[Claim],
+    selected: Mapping[str, Mapping[str, str]],
+) -> _BatchParse:
+    """Accept each claim's finding on its own evidence.
+
+    A claim that is missing, repeated, or cites evidence outside its own
+    selection is rejected. A finding whose only fault is an inexact quotation
+    falls back to insufficiently_supported with no evidence.
+    """
+    try:
+        response = _validated_response(text, _FindingResponse, subject="claim-verification")
+    except VerificationResponseError as error:
+        return {}, {}, {claim.claim_id: str(error) for claim in batch}
+    assert isinstance(response, _FindingResponse)
+    found: dict[str, list[_Finding]] = {}
+    for finding in response.findings:
+        found.setdefault(finding.claim_id, []).append(finding)
+    accepted: dict[str, object] = {}
+    lenient: dict[str, object] = {}
+    rejected: dict[str, str] = {}
+    for claim in batch:
+        findings = found.get(claim.claim_id, [])
+        if len(findings) != 1:
+            rejected[claim.claim_id] = _MISSING_CLAIM
+            continue
+        legal = selected.get(claim.claim_id, {})
+        try:
+            accepted[claim.claim_id] = _validated_finding(findings[0], claim, legal)
+        except VerificationResponseError as error:
+            rejected[claim.claim_id] = str(error)
+            if str(error) != "claim-verification: quote not in evidence":
+                continue
+            try:
+                lenient[claim.claim_id] = _validated_finding(
+                    findings[0], claim, legal, downgrade_invalid_quotes=True
+                )
+            except VerificationResponseError:
+                pass
+    return accepted, lenient, rejected
+
+
+@dataclass(frozen=True)
+class _Resolution:
+    """What bounded asking resolved, and every item it could not."""
+
+    values: dict[str, object]
+    generation_of: dict[str, GenerationResult]
+    lenient_ids: frozenset[str]
+    unresolved: dict[str, UnresolvedReason]
+
+
+def _resolve_work(
+    batches: Sequence[tuple[_WorkItem, ...]],
+    *,
+    item_id: Callable[[_WorkItem], str],
+    build_request: Callable[[tuple[_WorkItem, ...], str], GenerationRequest],
+    parse: Callable[[str, tuple[_WorkItem, ...]], _BatchParse],
+    phase: GenerationPhase,
+    runtime: VerificationRuntime,
+    config: VerificationConfig,
+    before_call: Callable[[tuple[_WorkItem, ...], bool], None],
+    generations: list[GenerationResult],
+) -> _Resolution:
+    """Ask for every item once, then re-ask only the items still missing.
+
+    Missing items keep their ids and are asked again in groups half the size of
+    the largest first batch, then one at a time, so no item is asked more than
+    three times. Each re-ask names the rules the earlier answers broke. After
+    its last ask, an item rejected only for a repairable detail takes its
+    lenient fallback; any other item is unresolved. Every generation is
+    appended to `generations` as it arrives; provider errors propagate.
+    """
+    order = [item for batch in batches for item in batch]
+    values: dict[str, object] = {}
+    generation_of: dict[str, GenerationResult] = {}
+    lenient: dict[str, tuple[object, GenerationResult]] = {}
+    errors: dict[str, str] = {}
+    unresolved: dict[str, UnresolvedReason] = {}
+
+    def ask(batch: tuple[_WorkItem, ...], correction: str) -> None:
+        before_call(batch, bool(correction))
+        generation = runtime.provider.generate(build_request(batch, correction))
+        generations.append(generation)
+        accepted, fallback, rejected = parse(generation.text, batch)
+        for key, value in accepted.items():
+            values[key] = value
+            generation_of[key] = generation
+            lenient.pop(key, None)
+        for key, value in fallback.items():
+            lenient[key] = (value, generation)
+        errors.update(rejected)
+
+    for batch in batches:
+        ask(batch, "")
+    largest = max((len(batch) for batch in batches), default=1)
+    group_sizes = [max(1, -(-largest // 2))]
+    if group_sizes[0] > 1:
+        group_sizes.append(1)
+    capacity = _request_capacity(runtime, config)
+    for size in group_sizes:
+        missing = [
+            item for item in order
+            if item_id(item) not in values and item_id(item) not in unresolved
+        ]
+        for start in range(0, len(missing), size):
+            group = tuple(missing[start:start + size])
+            correction = _response_correction(
+                [errors[item_id(item)] for item in group], phase=phase
+            )
+
+            def measure(items: tuple[_WorkItem, ...], correction: str = correction) -> int:
+                return _measure_request_tokens(build_request(items, correction), runtime.counter)
+
+            fitting = []
+            for item in group:
+                if measure((item,)) <= capacity:
+                    fitting.append(item)
+                elif item_id(item) not in lenient:
+                    unresolved[item_id(item)] = "capacity"
+            if not fitting:
+                continue
+            for retry in pack_work_items(
+                tuple(fitting),
+                render_request=lambda items: "",
+                measure_request=measure,
+                runtime=runtime,
+                config=config,
+            ):
+                ask(retry, correction)
+    lenient_ids: set[str] = set()
+    for item in order:
+        key = item_id(item)
+        if key in values or key in unresolved:
+            continue
+        if key in lenient:
+            values[key], generation_of[key] = lenient[key]
+            lenient_ids.add(key)
+            continue
+        unresolved[key] = "omitted" if errors[key] in _OMISSION_REASONS else "invalid_response"
+    return _Resolution(
+        values=values,
+        generation_of=generation_of,
+        lenient_ids=frozenset(lenient_ids),
+        unresolved=unresolved,
+    )
 
 
 def reduce_batch_findings(
@@ -1622,6 +1860,11 @@ class _ClaimProgress:
         self._open.pop(claim_id, None)
         self._emit(claim_id, "completed", verdict.value)
 
+    def failed(self, claim_id: str, code: str) -> None:
+        """End one claim the pass could not assess."""
+        self._open.pop(claim_id, None)
+        self._emit(claim_id, "failed", code)
+
     def fail_open(self, code: str) -> None:
         """End every still-active claim when its pass fails."""
         for claim_id in tuple(self._open):
@@ -1683,93 +1926,61 @@ def verify_draft_once(
         )
     decomposition_generations: list[GenerationResult] = []
     decomposition_diagnostics: list[str] = []
-    groups: list[dict[str, object]] = []
-    for batch in decomposition_batches:
-        request = build_decomposition_request(batch, source_id=source_id, runtime=runtime, max_output_tokens=config.output_reserve_tokens)
-        for attempt in range(2):
-            progress.raise_if_stopped("before claim decomposition")
-            try:
-                generation = runtime.provider.generate(request)
-            except (ProviderError, VerificationResponseError):
-                if not terminalize_errors:
-                    raise
-                return _failed_verification_pass(
-                    spans=spans, claims=(), bundles={},
-                    generations=decomposition_generations,
-                    decomposition_generation_count=len(decomposition_generations),
-                    pass_index=pass_index,
-                    code="decomposition_provider_failed",
-                    failed_phase=GenerationPhase.DECOMPOSITION,
-                )
-            decomposition_generations.append(generation)
-            error_code = "decomposition_failed"
-            try:
-                parsed = _validated_response(
-                    generation.text, _AnchorResponse, subject="claim-decomposition"
-                )
-                assert isinstance(parsed, _AnchorResponse)
-                if {group.span_id for group in parsed.spans} != {span.span_id for span in batch}:
-                    raise VerificationResponseError("claim-decomposition: batch spans do not match")
-                error_code = "anchor_failed"
-                parse_claim_anchors(generation.text, spans=batch, pass_index=pass_index)
-            except VerificationResponseError as error:
-                if attempt == 0:
-                    try:
-                        request = _corrected_request(
-                            request, error, phase=GenerationPhase.DECOMPOSITION,
-                            runtime=runtime, config=config,
-                        )
-                    except VerificationCapacityError:
-                        if not terminalize_errors:
-                            raise
-                        return _failed_verification_pass(
-                            spans=spans, claims=(), bundles={},
-                            generations=decomposition_generations,
-                            decomposition_generation_count=len(decomposition_generations),
-                            pass_index=pass_index,
-                            code="decomposition_capacity_failed",
-                            failed_phase=GenerationPhase.DECOMPOSITION,
-                        )
-                    continue
-                if str(error) == "claim-decomposition: anchor not in span" and isinstance(parsed, _AnchorResponse):
-                    span_texts = {span.span_id: span.text for span in batch}
-                    parsed = _AnchorResponse.model_validate({
-                        "spans": [
-                            {
-                                "span_id": group.span_id,
-                                "anchors": [
-                                    anchor for anchor in group.anchors
-                                    if anchor in span_texts[group.span_id]
-                                ],
-                            }
-                            for group in parsed.spans
-                        ]
-                    })
-                    decomposition_diagnostics.append("invalid_anchors_omitted")
-                else:
-                    if not terminalize_errors:
-                        raise
-                    return _failed_verification_pass(
-                        spans=spans, claims=(), bundles={},
-                        generations=decomposition_generations,
-                        decomposition_generation_count=len(decomposition_generations),
-                        pass_index=pass_index, code=error_code,
-                    )
-            groups.extend(group.model_dump() for group in parsed.spans)
-            break
-    try:
-        claims = parse_claim_anchors(
-            json.dumps({"spans": groups}), spans=spans, pass_index=pass_index
+
+    def build_decomposition(items: tuple[DraftSpan, ...], correction: str) -> GenerationRequest:
+        request = build_decomposition_request(
+            items, source_id=source_id, runtime=runtime,
+            max_output_tokens=config.output_reserve_tokens,
         )
-    except VerificationResponseError:
+        if not correction:
+            return request
+        return replace(request, instructions=f"{request.instructions} {correction}")
+
+    try:
+        decomposed = _resolve_work(
+            decomposition_batches,
+            item_id=lambda span: span.span_id,
+            build_request=build_decomposition,
+            parse=_parse_anchor_batch,
+            phase=GenerationPhase.DECOMPOSITION,
+            runtime=runtime,
+            config=config,
+            before_call=lambda _items, retry: progress.raise_if_stopped(
+                "before re-asking claim decomposition" if retry else "before claim decomposition"
+            ),
+            generations=decomposition_generations,
+        )
+    except (ProviderError, VerificationResponseError):
         if not terminalize_errors:
             raise
         return _failed_verification_pass(
             spans=spans, claims=(), bundles={},
             generations=decomposition_generations,
             decomposition_generation_count=len(decomposition_generations),
-            pass_index=pass_index, code="anchor_failed",
+            pass_index=pass_index,
+            code="decomposition_provider_failed",
+            failed_phase=GenerationPhase.DECOMPOSITION,
         )
+    if decomposed.lenient_ids:
+        decomposition_diagnostics.append("invalid_anchors_omitted")
+    if decomposed.unresolved:
+        decomposition_diagnostics.append("decomposition_incomplete")
+    resolved_spans = tuple(span for span in spans if span.span_id in decomposed.values)
+    claims = parse_claim_anchors(
+        json.dumps({
+            "spans": [
+                {"span_id": span.span_id, "anchors": decomposed.values[span.span_id]}
+                for span in resolved_spans
+            ]
+        }),
+        spans=resolved_spans,
+        pass_index=pass_index,
+    )
+    unresolved: list[UnresolvedWork] = [
+        UnresolvedWork(span.span_id, GenerationPhase.DECOMPOSITION, decomposed.unresolved[span.span_id])
+        for span in spans
+        if span.span_id in decomposed.unresolved
+    ]
     span_texts = {span.span_id: span.text for span in spans}
     progress.phase("Selecting evidence")
     bundles: dict[str, EvidenceBundle] = {}
@@ -1892,90 +2103,82 @@ def verify_draft_once(
 
     claims_by_id = {claim.claim_id: claim for claim in claims}
 
-    for batch in batches:
-        batch_claims = tuple(item[0] for item in batch)
+    selected = {
+        claim.claim_id: {
+            passage.segment_id: passage.text for passage in bundles[claim.claim_id].passages
+        }
+        for claim in claims
+    }
+
+    def build_classification(
+        items: tuple[tuple[Claim, EvidenceBundle], ...], correction: str
+    ) -> GenerationRequest:
         request = build_classification_request(
-            batch_claims,
-            evidence={item[0].claim_id: item[1] for item in batch},
+            tuple(item[0] for item in items),
+            evidence={item[0].claim_id: item[1] for item in items},
             spans=span_texts,
             source_id=source_id,
             runtime=runtime, max_output_tokens=config.output_reserve_tokens,
         )
-        selected = {
-            item[0].claim_id: {
-                passage.segment_id: passage.text for passage in item[1].passages
-            }
-            for item in batch
-        }
-        progress.raise_if_stopped("before claim verification")
-        claim_progress.active(batch_claims)
-        for attempt in range(2):
-            if attempt:
-                progress.raise_if_stopped("before re-asking claim verification")
-            try:
-                generation = runtime.provider.generate(request)
-            except (ProviderError, VerificationResponseError):
-                if not terminalize_errors:
-                    raise
-                return classification_failure(
-                    "classification_provider_failed",
-                    failed_phase=GenerationPhase.CLASSIFICATION,
-                )
-            generations.append(generation)
-            try:
-                parsed = parse_claim_findings(
-                    generation.text, claims=batch_claims, selected=selected,
-                )
-            except VerificationResponseError as error:
-                if attempt == 0:
-                    try:
-                        request = _corrected_request(
-                            request, error, phase=GenerationPhase.CLASSIFICATION,
-                            runtime=runtime, config=config,
-                        )
-                    except VerificationCapacityError:
-                        if not terminalize_errors:
-                            raise
-                        return classification_failure(
-                            "classification_capacity_failed",
-                            failed_phase=GenerationPhase.CLASSIFICATION,
-                        )
-                    continue
-                if str(error) == "claim-verification: quote not in evidence":
-                    try:
-                        parsed = parse_claim_findings(
-                            generation.text,
-                            claims=batch_claims,
-                            selected=selected,
-                            downgrade_invalid_quotes=True,
-                        )
-                    except VerificationResponseError:
-                        if not terminalize_errors:
-                            raise
-                        return classification_failure("classification_failed")
-                    classification_diagnostics.append(
-                        "invalid_evidence_quotes_downgraded"
-                    )
-                    break
-                if not terminalize_errors:
-                    raise
-                return classification_failure("classification_failed")
-            break
-        for finding in parsed:
-            findings_by_claim[finding.claim_id].append(finding)
-            finding_generations[finding.claim_id] = generation
-        for claim in batch_claims:
-            if not escalates(claim):
-                finish(
+        if not correction:
+            return request
+        return replace(request, instructions=f"{request.instructions} {correction}")
+
+    def before_classification(
+        items: tuple[tuple[Claim, EvidenceBundle], ...], retry: bool
+    ) -> None:
+        progress.raise_if_stopped(
+            "before re-asking claim verification" if retry else "before claim verification"
+        )
+        claim_progress.active(tuple(item[0] for item in items))
+
+    try:
+        classified = _resolve_work(
+            batches,
+            item_id=lambda item: item[0].claim_id,
+            build_request=build_classification,
+            parse=lambda text, items: _parse_finding_batch(
+                text, tuple(item[0] for item in items), selected
+            ),
+            phase=GenerationPhase.CLASSIFICATION,
+            runtime=runtime,
+            config=config,
+            before_call=before_classification,
+            generations=generations,
+        )
+    except (ProviderError, VerificationResponseError):
+        if not terminalize_errors:
+            raise
+        return classification_failure(
+            "classification_provider_failed",
+            failed_phase=GenerationPhase.CLASSIFICATION,
+        )
+    if classified.lenient_ids:
+        classification_diagnostics.append("invalid_evidence_quotes_downgraded")
+    if classified.unresolved:
+        classification_diagnostics.append("classification_incomplete")
+    unresolved.extend(
+        UnresolvedWork(claim.claim_id, GenerationPhase.CLASSIFICATION, classified.unresolved[claim.claim_id])
+        for claim in claims
+        if claim.claim_id in classified.unresolved
+    )
+    for claim in claims:
+        if claim.claim_id in classified.unresolved:
+            claim_progress.failed(claim.claim_id, "classification_incomplete")
+            continue
+        findings_by_claim[claim.claim_id].append(classified.values[claim.claim_id])
+        finding_generations[claim.claim_id] = classified.generation_of[claim.claim_id]
+    assessed = tuple(claim for claim in claims if claim.claim_id not in classified.unresolved)
+    for claim in assessed:
+        if not escalates(claim):
+            finish(
+                claim.claim_id,
+                reduce_batch_findings(
                     claim.claim_id,
-                    reduce_batch_findings(
-                        claim.claim_id,
-                        findings_by_claim[claim.claim_id],
-                        retrieval_complete=bundles[
-                            claim.claim_id
-                        ].selection.retrieval_complete,
-                    )[0],
-                )
+                    findings_by_claim[claim.claim_id],
+                    retrieval_complete=bundles[claim.claim_id].selection.retrieval_complete,
+                )[0],
+            )
 
     # Re-check each omitted complete core under the same bounded request contract
     # before reducing a contradicted claim's findings. An unusable second look
@@ -1995,7 +2198,7 @@ def verify_draft_once(
             return ClaimVerdict.CONTRADICTED
         return verdict
 
-    for claim in claims:
+    for claim in assessed:
         if not escalates(claim):
             continue
         progress.phase("Escalating evidence")
@@ -2292,7 +2495,7 @@ def verify_draft_once(
         *decomposition_diagnostics,
         *classification_diagnostics,
     ]
-    for claim in claims:
+    for claim in assessed:
         bundle = bundles[claim.claim_id]
         findings = tuple(findings_by_claim[claim.claim_id])
         verdict, codes = reduce_batch_findings(
@@ -2342,6 +2545,7 @@ def verify_draft_once(
             if position >= len(decomposition_generations)
         ),
         diagnostic_codes=tuple(dict.fromkeys(diagnostic_codes)),
+        unresolved=tuple(unresolved),
     )
 
 
@@ -2373,7 +2577,7 @@ def verify_and_repair(
     return coordinator.resolve(
         stage="verification",
         work_id="V01",
-        prompt_version="verification/6",
+        prompt_version="verification/7",
         schema_version="verification/1",
         input_value={
             "source_id": source_id,
@@ -2476,6 +2680,19 @@ def _verify_and_repair(
             exhausted=False,
             phase_generations=first.phase_generations,
             failure_codes=first.diagnostic_codes,
+        )
+    if first.unresolved:
+        # Unfinished spans or claims never publish, and a repair would be
+        # re-verified by a pass that cannot be trusted to finish either.
+        return _terminal_result(
+            text=draft,
+            pass_results=(first,),
+            repairs=(),
+            generations=first.generations,
+            phase_generations=first.phase_generations,
+            diagnostic_codes=(*first.diagnostic_codes, "verification_incomplete"),
+            failure_codes=("verification_incomplete",),
+            exhausted=False,
         )
     contradicted = tuple(
         assessment
@@ -2732,11 +2949,13 @@ def _verify_and_repair(
             ),
             failure_codes=second.diagnostic_codes,
         )
-    failed = any(
+    incomplete = bool(second.unresolved)
+    failed = incomplete or any(
         assessment.verdict in {ClaimVerdict.CONTRADICTED, ClaimVerdict.INSUFFICIENTLY_SUPPORTED}
         for assessment in second.assessments
     )
-    if failed and not second.failed and config.max_repair_passes > 1:
+    terminal_code = "verification_incomplete" if incomplete else "repair_reverification_failed"
+    if failed and not incomplete and config.max_repair_passes > 1:
         continued = _verify_and_repair(
             repaired,
             source_id=source_id,
@@ -2814,7 +3033,7 @@ def _verify_and_repair(
             diagnostic_codes=(
                 *first.diagnostic_codes,
                 *second.diagnostic_codes,
-                "repair_reverification_failed",
+                terminal_code,
             ),
             exhausted=True,
             phase_generations=(
@@ -2830,7 +3049,7 @@ def _verify_and_repair(
                 ),
                 *second.phase_generations,
             ),
-            failure_codes=("repair_reverification_failed",),
+            failure_codes=(terminal_code,),
         )
     return VerificationResult(
         text=repaired,

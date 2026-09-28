@@ -7,8 +7,9 @@ from summarizer.tokenization import ConservativeUtf8TokenCounter
 from summarizer.verification import (
     BatchFinding,
     ClaimVerdict,
+    GenerationPhase,
+    UnresolvedWork,
     VerificationConfig,
-    VerificationResponseError,
     VerificationRuntime,
     _redact_finding,
     build_decomposition_request,
@@ -125,18 +126,24 @@ def test_verify_once_is_disabled_without_provider_calls() -> None:
     assert provider.requests == []
 
 
-def test_verify_once_rejects_malformed_provider_output() -> None:
+def test_verify_once_leaves_a_span_unresolved_after_malformed_answers() -> None:
     provider = Provider(["not json", "not json"])
 
-    with pytest.raises(VerificationResponseError):
-        verify_draft_once(
-            "The measured value is 42.",
-            source_id="a" * 64,
-            source_index=index(),
-            runtime=runtime(provider),
-            config=VerificationConfig(enabled=True),
-            pass_index=1,
-        )
+    result = verify_draft_once(
+        "The measured value is 42.",
+        source_id="a" * 64,
+        source_index=index(),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+    )
+
+    assert not result.failed
+    assert result.claims == ()
+    assert result.unresolved == (
+        UnresolvedWork("V01S000001", GenerationPhase.DECOMPOSITION, "invalid_response"),
+    )
+    assert result.diagnostic_codes == ("decomposition_incomplete",)
     assert len(provider.requests) == 2
 
 
@@ -195,7 +202,7 @@ def test_verify_once_retries_unselected_evidence_with_specific_feedback() -> Non
     assert "V01S000001" not in provider.requests[2].instructions
 
 
-def test_verify_once_stops_after_one_invalid_classification_retry() -> None:
+def test_verify_once_leaves_a_claim_unresolved_after_one_invalid_classification_retry() -> None:
     provider = Provider(
         [
             '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
@@ -214,8 +221,11 @@ def test_verify_once_stops_after_one_invalid_classification_retry() -> None:
         terminalize_errors=True,
     )
 
-    assert result.failed
-    assert result.diagnostic_codes == ("classification_failed",)
+    assert not result.failed
+    assert result.unresolved == (
+        UnresolvedWork("V01C000001", GenerationPhase.CLASSIFICATION, "invalid_response"),
+    )
+    assert result.diagnostic_codes == ("classification_incomplete",)
     assert len(result.generations) == 3
     assert len(provider.requests) == 3
     assert result.assessments == ()

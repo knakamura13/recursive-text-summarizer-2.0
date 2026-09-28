@@ -55,6 +55,11 @@ JSON paths read by the web application (offsets are code points, i.e. Python
   flagged difference was an allowed `tolerance` (`rounded_number` or
   `shortened_name`); the assessment's own verdict is that second look.
   `selections[].retrieval_method` is one of the methods verification defines.
+  A pass may carry `unresolved[]`, absent when empty: each span
+  (`phase` `decomposition`) or claim (`phase` `classification`) the verifier
+  never finished after its bounded re-asks, by `item_id`, with `reason`
+  `omitted`, `invalid_response`, or `capacity`. Such a pass is never
+  `complete`, and its unresolved sentences are never published.
 """
 
 from __future__ import annotations
@@ -118,12 +123,14 @@ _VERIFICATION_PROMPT_VERSION = frozenset(
     {
         "verification-decomposition/1",
         "verification-decomposition/2",
+        "verification-decomposition/3",
         "verification-classification/1",
         "verification-classification/2",
         "verification-classification/3",
         "verification-classification/4",
         "verification-classification/5",
         "verification-classification/6",
+        "verification-classification/7",
         "verification-reassessment/1",
         "verification-repair/1",
     }
@@ -399,6 +406,14 @@ class AuditVerificationAssessment(_AuditRecord):
         return data
 
 
+class AuditVerificationUnresolved(_AuditRecord):
+    """A span or claim verification never finished; it never publishes."""
+
+    item_id: str
+    phase: Literal["decomposition", "classification"]
+    reason: Literal["omitted", "invalid_response", "capacity"]
+
+
 class AuditVerificationPass(_AuditRecord):
     pass_index: int
     complete: bool
@@ -406,6 +421,16 @@ class AuditVerificationPass(_AuditRecord):
     claims: tuple[AuditVerificationClaim, ...]
     selections: tuple[AuditVerificationSelection, ...]
     assessments: tuple[AuditVerificationAssessment, ...]
+    unresolved: tuple[AuditVerificationUnresolved, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_unresolved(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        data = handler(self)
+        if not data.get("unresolved"):
+            data.pop("unresolved", None)
+        return data
 
 
 class AuditVerificationRepair(_AuditRecord):
@@ -904,6 +929,28 @@ class AuditArtifact:
         return _AUDIT_ARTIFACT_ADAPTER.validate_json(value)
 
 
+def _unresolved_work_resolves(
+    record: AuditVerificationPass,
+    spans: Mapping[str, AuditVerificationSpan],
+    claims: Mapping[str, AuditVerificationClaim],
+    assessments: Mapping[str, AuditVerificationAssessment],
+) -> None:
+    """Each unresolved span has no claims and each unresolved claim no verdict."""
+    if record.complete:
+        raise ValueError("a verification pass with unresolved work is not complete")
+    item_ids = [item.item_id for item in record.unresolved]
+    if len(set(item_ids)) != len(item_ids):
+        raise ValueError("verification unresolved work must be unique")
+    claimed_spans = {claim.span_id for claim in claims.values()}
+    for item in record.unresolved:
+        if item.phase == "decomposition":
+            resolves = item.item_id in spans and item.item_id not in claimed_spans
+        else:
+            resolves = item.item_id in claims and item.item_id not in assessments
+        if not resolves:
+            raise ValueError("verification unresolved work must resolve to unfinished pass work")
+
+
 def _verification_links_resolve(
     verification: AuditVerification, segment_ids: set[str]
 ) -> None:
@@ -1000,7 +1047,9 @@ def _verification_links_resolve(
             raise ValueError(
                 "verification pass completion must match recorded coverage"
             )
-        if not record.complete and (
+        if record.unresolved:
+            _unresolved_work_resolves(record, spans, claims, assessments)
+        elif not record.complete and (
             not verification.failed or record_position != len(verification.passes) - 1
         ):
             raise ValueError(
@@ -1545,6 +1594,7 @@ def _audit_verification(
                 pass_index=pass_index,
                 complete=(
                     not item.failed
+                    and not item.unresolved
                     and {selection.claim_id for selection in item.selections}
                     == {claim.claim_id for claim in item.claims}
                     and {assessment.claim_id for assessment in item.assessments}
@@ -1614,6 +1664,12 @@ def _audit_verification(
                         ),
                     )
                     for assessment in item.assessments
+                ),
+                unresolved=tuple(
+                    AuditVerificationUnresolved(
+                        item_id=work.item_id, phase=work.phase.value, reason=work.reason
+                    )
+                    for work in item.unresolved
                 ),
             )
         )

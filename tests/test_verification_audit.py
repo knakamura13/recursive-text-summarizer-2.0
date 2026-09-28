@@ -22,6 +22,7 @@ from summarizer.verification import (
     GenerationPhase,
     RepairAction,
     RepairEvent,
+    UnresolvedWork,
     VerificationGeneration,
     VerificationPassResult,
     VerificationResult,
@@ -405,6 +406,47 @@ def test_audit_v2_marks_terminal_malformed_classification_pass_incomplete() -> N
     assert verification["passes"][0]["claims"]
     assert verification["passes"][0]["assessments"] == []
     assert verification["failure_codes"] == ["classification_failed"]
+
+
+def test_audit_v2_records_an_unassessed_claim_as_unresolved() -> None:
+    complete = _verification("D000001")
+    partial_pass = replace(
+        complete.pass_results[0],
+        assessments=(),
+        unresolved=(UnresolvedWork("V01C000001", GenerationPhase.CLASSIFICATION, "omitted"),),
+    )
+    partial = replace(
+        complete,
+        passes=((),),
+        pass_results=(partial_pass,),
+        repairs=(),
+        failed=True,
+        failure_codes=("verification_incomplete",),
+    )
+
+    record = json.loads(serialize_audit(_artifact(verification=partial)))["verification"]["passes"][0]
+
+    assert record["complete"] is False
+    assert record["unresolved"] == [
+        {"item_id": "V01C000001", "phase": "classification", "reason": "omitted"}
+    ]
+
+
+def test_audit_v2_rejects_unresolved_work_that_was_finished() -> None:
+    complete = _verification("D000001")
+    finished_but_unresolved = replace(
+        complete,
+        pass_results=(
+            replace(
+                complete.pass_results[0],
+                unresolved=(UnresolvedWork("V01C000001", GenerationPhase.CLASSIFICATION, "omitted"),),
+            ),
+        ),
+        failed=True,
+    )
+
+    with pytest.raises((AuditError, ValueError), match="unresolved work"):
+        _artifact(verification=finished_but_unresolved)
 
 
 def test_audit_v2_serializes_terminal_decomposition_failure_without_claim_prose() -> None:

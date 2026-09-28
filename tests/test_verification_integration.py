@@ -861,7 +861,11 @@ def test_terminal_verification_failure_writes_audit_before_reader_output(tmp_pat
 
     body = json.loads(audit_path.read_text())
     assert body["verification"]["failed"] is True
-    assert body["verification"]["failure_codes"] == ["decomposition_failed"]
+    assert body["verification"]["failure_codes"] == ["verification_incomplete"]
+    assert body["verification"]["passes"][0]["complete"] is False
+    assert body["verification"]["passes"][0]["unresolved"] == [
+        {"item_id": "V01S000001", "phase": "decomposition", "reason": "invalid_response"}
+    ]
     assert body["citations"] == []
     assert "Sources:" not in audit_path.read_text()
 
