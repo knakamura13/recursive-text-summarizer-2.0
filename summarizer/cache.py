@@ -59,7 +59,13 @@ _WORK_ID = re.compile(
 )
 _STRATEGIES = frozenset({"auto", "direct", "hierarchical"})
 _BOOLEAN_FIELDS = frozenset(
-    {"counter_exact", "include_citations", "verification_enabled"}
+    {
+        "counter_exact",
+        "include_citations",
+        "strict_names",
+        "strict_numbers",
+        "verification_enabled",
+    }
 )
 _POSITIVE_INTEGER_FIELDS = frozenset(
     {
@@ -115,6 +121,8 @@ _BEHAVIOR_GROUPS = {
             "output_reserve_tokens",
             "request_tokens",
             "safety_margin_tokens",
+            "strict_names",
+            "strict_numbers",
             "verification_enabled",
         }
     ),

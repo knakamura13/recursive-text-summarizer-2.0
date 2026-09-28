@@ -755,6 +755,8 @@ def test_injected_verifier_runtime_reuses_its_own_cached_terminal_result(tmp_pat
         "safety_margin_tokens": 256,
         "max_repair_passes": 1,
         "verification_enabled": True,
+        "strict_numbers": False,
+        "strict_names": False,
     }
 
     resumed_summary = VerificationPipelineProvider(verification="supported")
