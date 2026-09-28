@@ -513,6 +513,8 @@ def _reassessed_substitutions(
         pass_results=(*result.pass_results, reassessed),
         phase_generations=(*result.phase_generations, *reassessed.phase_generations),
         warning_codes=result.warning_codes,
+        limitation_codes=result.limitation_codes,
+        failure_codes=result.failure_codes,
     )
     return candidate, records
 
