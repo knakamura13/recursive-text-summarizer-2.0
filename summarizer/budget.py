@@ -381,6 +381,13 @@ def plan_request(
         output_allowance_tokens=output_allowance,
         safety_margin_tokens=safety_margin(window.tokens, config),
     )
+    if budget.usable_context_tokens <= 0:
+        raise RequestBudgetError(
+            BudgetFailure.NO_INPUT_CAPACITY,
+            budget,
+            f"a safety margin of {budget.safety_margin_tokens} tokens leaves no "
+            f"usable context in a window of {window.tokens}",
+        )
     if output_allowance >= budget.usable_context_tokens:
         raise RequestBudgetError(
             BudgetFailure.OUTPUT_EXCEEDS_CONTEXT,

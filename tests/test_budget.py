@@ -228,6 +228,24 @@ def test_output_larger_than_context_is_a_configuration_failure() -> None:
         assert term in message
 
 
+def test_a_margin_that_consumes_the_window_is_not_blamed_on_output() -> None:
+    config = StrategyConfig(safety_margin_tokens=256, safety_margin_fraction=0)
+
+    with pytest.raises(RequestBudgetError) as error:
+        plan_request(
+            "direct",
+            window=window(200),
+            overhead=NO_OVERHEAD,
+            output_allowance=1,
+            correction_headroom=0,
+            config=config,
+        )
+
+    assert error.value.failure is BudgetFailure.NO_INPUT_CAPACITY
+    assert "safety margin of 256 tokens leaves no usable context" in str(error.value)
+
+
+
 def test_non_positive_capacity_reports_every_term() -> None:
     """Reachable on default local configuration, so it must be a named error.
 
