@@ -89,35 +89,73 @@ def blind_map(root: Path, versions: list[str], documents: list[str]) -> dict[str
     return mapping
 
 
-def _trace_summary(trial_dir: Path) -> dict[str, Any]:
-    files = sorted(trial_dir.rglob("request-*.json"))
-    statuses: list[int] = []
-    elapsed: list[float] = []
-    cap_hit = False
-    for path in files:
+def _request_rows(trial_dir: Path) -> list[dict[str, Any]]:
+    """Return the proxy's text-free request rows, deriving them for old traces."""
+    rows: list[dict[str, Any]] = []
+    for path in sorted(trial_dir.rglob("requests.jsonl")):
+        rows.extend(read_jsonl(path)[0])
+    if rows:
+        return rows
+    for path in sorted(trial_dir.rglob("request-*.json")):
         record = read_json(path)
         if not record:
             continue
-        status = _number(record.get("status"))
-        if status is not None:
-            statuses.append(int(status))
-        time_s = _number(record.get("elapsed_seconds"))
-        if time_s is not None:
-            elapsed.append(float(time_s))
         response = record.get("response")
-        if isinstance(response, str):
+        try:
+            response = json.loads(response) if isinstance(response, str) else {}
+        except json.JSONDecodeError:
+            response = {}
+        options = {}
+        for key in ("original_request", "effective_request"):
             try:
-                response = json.loads(response)
+                options[key] = (json.loads(record.get(key) or "{}").get("options") or {})
             except json.JSONDecodeError:
-                response = {}
-        if isinstance(response, dict) and response.get("done_reason") in ("length", "max_tokens"):
-            cap_hit = True
+                options[key] = {}
+        rows.append({
+            "status": record.get("status"), "elapsed_seconds": record.get("elapsed_seconds"),
+            "original_options": options["original_request"], "effective_options": options["effective_request"],
+            "done_reason": response.get("done_reason") if isinstance(response, dict) else None,
+            "error": response.get("error") if isinstance(response, dict) else None,
+            "eval_count": response.get("eval_count") if isinstance(response, dict) else None,
+            "prompt_eval_count": response.get("prompt_eval_count") if isinstance(response, dict) else None,
+        })
+    return rows
+
+
+def _trace_summary(trial_dir: Path) -> dict[str, Any]:
+    rows = _request_rows(trial_dir)
+    statuses = [int(s) for s in (_number(row.get("status")) for row in rows) if s is not None]
+    elapsed = [float(t) for t in (_number(row.get("elapsed_seconds")) for row in rows) if t is not None]
+    truncated = sum(row.get("done_reason") in ("length", "max_tokens") for row in rows)
+
+    def predicts(key: str) -> dict[str, int]:
+        counts: dict[str, int] = defaultdict(int)
+        for row in rows:
+            counts[str((row.get(key) or {}).get("num_predict"))] += 1
+        return dict(sorted(counts.items()))
+
+    prompt_tokens = [v for v in (_number(row.get("prompt_eval_count")) for row in rows) if v is not None]
+    output_tokens = [v for v in (_number(row.get("eval_count")) for row in rows) if v is not None]
     return {
-        "request_attempts": len(files),
+        "request_attempts": len(rows),
         "successful_requests": sum(200 <= status < 300 for status in statuses),
         "failed_requests": sum(status < 200 or status >= 300 for status in statuses),
         "trace_elapsed_seconds": round(sum(elapsed), 3) if elapsed else None,
-        "output_capacity_hit": cap_hit if files else None,
+        "output_capacity_hit": bool(truncated) if rows else None,
+        "truncated_requests": truncated if rows else None,
+        "repeated_requests": sum(row.get("repeat_of") is not None for row in rows) if rows else None,
+        "num_predict_overridden": sum(
+            (row.get("original_options") or {}).get("num_predict") is not None
+            and (row.get("original_options") or {}).get("num_predict")
+            != (row.get("effective_options") or {}).get("num_predict")
+            for row in rows
+        ) if rows else None,
+        "original_num_predict": predicts("original_options") if rows else None,
+        "effective_num_predict": predicts("effective_options") if rows else None,
+        "effective_num_ctx": sorted({str((row.get("effective_options") or {}).get("num_ctx")) for row in rows}) if rows else None,
+        "max_prompt_tokens": max(prompt_tokens) if prompt_tokens else None,
+        "max_output_tokens_generated": max(output_tokens) if output_tokens else None,
+        "request_errors": sorted({str(row["error"])[:200] for row in rows if row.get("error")}) if rows else None,
     }
 
 
@@ -156,7 +194,8 @@ def collect_trial(trial_path: Path, mapping: dict[str, dict[str, str]]) -> dict[
         source_id = Path(source_id).stem
     source_id = str(source_id or trial.get("document") or "unknown")
     actual_version = str(trial.get("version") or run.get("version") or "unknown")
-    label = mapping.get(source_id, {}).get(actual_version)
+    # The working tree is not one of the blinded pinned versions.
+    label = "worktree" if actual_version == "worktree" else mapping.get(source_id, {}).get(actual_version)
     if label is None:
         # Unknown/malformed versions remain explicitly unlabelled, never expose their name.
         label = "unmapped"
@@ -203,6 +242,12 @@ def collect_trial(trial_path: Path, mapping: dict[str, dict[str, str]]) -> dict[
         "final_words": final_words, "context_tokens": context,
         "output_capacity_tokens": capacity,
         "output_capacity_hit": trace["output_capacity_hit"],
+        **{key: trace[key] for key in (
+            "truncated_requests", "repeated_requests", "num_predict_overridden", "original_num_predict",
+            "effective_num_predict", "effective_num_ctx", "max_prompt_tokens", "max_output_tokens_generated",
+            "request_errors")},
+        "failure_class": run.get("failure_class"), "failure_stage": run.get("failure_stage"),
+        "terminal_stage": run.get("terminal_stage"), "replayed_leaves": run.get("replayed_leaves"),
         "audit_truncated": audit["audit_truncated"],
         "audit_present": audit["audit_present"], "audit_valid": audit["audit_valid"],
         "pass_count": _number(run.get("pass_count")) if run.get("pass_count") is not None else (len(passes) or None),
@@ -414,6 +459,28 @@ def write_combined_pilot(root: Path, mapping: dict[str, dict[str, str]]) -> list
     return written
 
 
+def make_requests_markdown(rows: list[dict[str, Any]]) -> str:
+    """Tabulate working-tree trials' outcomes and effective requests, text-free."""
+    lines = ["# Working-tree effective requests", "",
+             "Only request metadata and outcomes; no source, prompt or summary text.", "",
+             "| Phase | Document | Target | Seed | Replayed leaves | Status | Terminal stage | Failure class (stage) | Published words | Requests | Repeats | Truncated | num_predict overridden | Effective num_predict (count) | num_ctx | Max prompt tokens | Max output tokens | Elapsed s |",
+             "|:---|:---|---:|---:|---:|:---|:---|:---|---:|---:|---:|---:|---:|:---|:---|---:|---:|---:|"]
+    for r in rows:
+        terminal = r.get("terminal_stage") or {}
+        failure = f"{r['failure_class']} ({r['failure_stage']})" if r.get("failure_class") else None
+        predicts = ", ".join(f"{k}×{v}" for k, v in (r.get("effective_num_predict") or {}).items()) or None
+        vals = [r["phase"], r["document"], r["target_words"], r["seed"], r.get("replayed_leaves"), r["status"],
+                f"{terminal.get('stage')} {terminal.get('state')}" if terminal else None, failure,
+                r["final_words"], r["request_attempts"], r.get("repeated_requests"), r.get("truncated_requests"),
+                r.get("num_predict_overridden"), predicts, ", ".join(r.get("effective_num_ctx") or []) or None,
+                r.get("max_prompt_tokens"), r.get("max_output_tokens_generated"), r["elapsed_seconds"]]
+        lines.append("| " + " | ".join(_fmt(v) for v in vals) + " |")
+    errors = sorted({error for r in rows for error in (r.get("request_errors") or [])})
+    if errors:
+        lines += ["", "Request errors:", "", *(f"- `{error}`" for error in errors)]
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="private study artifact root")
@@ -429,9 +496,19 @@ def main() -> int:
     mapping = blind_map(root, versions, documents or list(MANIFEST["sources"]))
     row_entries = [(path, collect_trial(path, mapping)) for path, item in trials if item is not None and (not args.phase or item.get("phase") in args.phase)]
     row_entries.sort(key=lambda pair: (pair[1]["phase"], pair[1]["document"], pair[1]["target_words"] or 0, pair[1]["seed"] or 0, pair[1]["condition"]))
-    rows = [row for _, row in row_entries]
     output = root / "results"
     output.mkdir(parents=True, exist_ok=True)
+    # Working-tree trials are not part of the blinded comparison; they get
+    # their own report so the frozen study outputs are never rewritten by them.
+    worktree_rows = [row for _, row in row_entries if row["condition"] == "worktree"]
+    row_entries = [(path, row) for path, row in row_entries if row["condition"] != "worktree"]
+    if worktree_rows:
+        (output / "effective-requests.json").write_text(json.dumps({"study": MANIFEST["study"], "rows": worktree_rows}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        (output / "effective-requests.md").write_text(make_requests_markdown(worktree_rows), encoding="utf-8")
+        print(f"Collected {len(worktree_rows)} working-tree trial(s); outputs: {output / 'effective-requests.json'} and {output / 'effective-requests.md'}")
+    if not row_entries:
+        return 0
+    rows = [row for _, row in row_entries]
     summary_files = write_side_by_side(root, row_entries)
     if args.combine_pilot:
         summary_files.extend(write_combined_pilot(root, mapping))
