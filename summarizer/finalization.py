@@ -52,6 +52,7 @@ from summarizer.checkpoint import (
     PublicationState,
     RunManifest,
 )
+from summarizer.budget import RequestLimits
 from summarizer.compression import (
     compress_to_target,
     overlapping_numbered_source_sentences,
@@ -688,6 +689,7 @@ def _prepare_root_for_editorial(
     segments: Sequence[SourceSegment],
     strict_numbers: bool = False,
     strict_names: bool = False,
+    limits: RequestLimits | None = None,
 ) -> tuple[SummaryNode, tuple[GenerationResult, ...]]:
     source_text = _compression_source_text(
         root,
@@ -710,6 +712,7 @@ def _prepare_root_for_editorial(
         coordinator=coordinator,
         strict_numbers=strict_numbers,
         strict_names=strict_names,
+        limits=limits,
     )
     return root.model_copy(update={"summary": compressed.text}), compressed.generations
 
@@ -1436,7 +1439,7 @@ def _finalize_summary(
     segments: Sequence[SourceSegment],
     nodes: Sequence[TreeNode],
     root_node_id: str,
-    max_output_tokens: int | None = None,
+    request_limits: RequestLimits | None = None,
     include_citations: bool = False,
     audit_configuration: Mapping[str, object] | None = None,
     audit_path: Path | None = None,
@@ -1476,6 +1479,7 @@ def _finalize_summary(
             segments=segments,
             strict_numbers=verification.strict_numbers,
             strict_names=verification.strict_names,
+            limits=request_limits,
         )
     runtime_observer.emit(StageEvent(StageName.WRITING, "active"))
     editorial = write_editorial(
@@ -1485,7 +1489,7 @@ def _finalize_summary(
         model=model,
         timeout_seconds=timeout_seconds,
         target_words=target_words,
-        max_output_tokens=max_output_tokens,
+        limits=request_limits,
         observer=runtime_observer,
     )
     runtime_observer.emit(StageEvent(StageName.WRITING, "completed"))
@@ -1637,7 +1641,7 @@ def finalize_summary(
     segments: Sequence[SourceSegment],
     nodes: Sequence[TreeNode],
     root_node_id: str,
-    max_output_tokens: int | None = None,
+    request_limits: RequestLimits | None = None,
     include_citations: bool = False,
     audit_configuration: Mapping[str, object] | None = None,
     audit_path: Path | None = None,
@@ -1666,7 +1670,7 @@ def finalize_summary(
         segments=segments,
         nodes=nodes,
         root_node_id=root_node_id,
-        max_output_tokens=max_output_tokens,
+        request_limits=request_limits,
         include_citations=include_citations,
         audit_configuration=audit_configuration,
         audit_path=audit_path,

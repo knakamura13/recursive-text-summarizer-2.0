@@ -112,8 +112,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-output-tokens",
         type=int,
-        default=1024,
-        help="tokens reserved for the response when sizing a request",
+        default=4096,
+        help="output allowance sent with each summary request and reserved when sizing it",
     )
     parser.add_argument(
         "--safety-margin-tokens",

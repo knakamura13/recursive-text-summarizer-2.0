@@ -315,7 +315,7 @@ def test_main_reports_unavailable_selected_ollama_service(
         return RecordingProvider(ProviderConnectionError("Ollama connection failed"))
 
     exit_code = main(
-        ["--provider", "ollama", "--max-retries", "1"],
+        ["--provider", "ollama", "--max-retries", "1", "--context-window", "32768"],
         provider_factory=provider_factory,
         counter_factory=counter_factory,
     )

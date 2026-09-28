@@ -5,7 +5,12 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from threading import Lock
 
-from summarizer.budget import BudgetError
+from summarizer.budget import (
+    BudgetError,
+    RequestBudget,
+    RequestLimits,
+    measure_request_tokens,
+)
 from summarizer.cache import CacheDescriptor
 from summarizer.grounding import (
     GroundingPolicy,
@@ -18,7 +23,6 @@ from summarizer.merge import (
     build_merge_request,
     child_fence_tokens,
     measure_merge_overhead,
-    measure_merge_request_tokens,
     parse_merged_summary,
     serialize_child,
     serialize_source_passage_block,
@@ -164,11 +168,34 @@ def measure_child_tokens(node: SummaryNode, counter: TokenCounter) -> int:
     return counter.count(serialize_child(node)) + child_fence_tokens(counter)
 
 
+def plan_merge_request(
+    limits: RequestLimits,
+    *,
+    level: int,
+    provider_schema_reserve: int = 0,
+    evidence: int = 0,
+) -> RequestBudget:
+    """Budget one merge request at `level`, or raise `RequestBudgetError`.
+
+    Shared by the hierarchy and by preflight, so both refuse the same
+    configurations with the same arithmetic.
+    """
+    return limits.plan(
+        "merge",
+        overhead=measure_merge_overhead(
+            limits.counter,
+            level=level,
+            provider_schema_reserve=provider_schema_reserve,
+        ),
+        evidence=evidence,
+    )
+
+
 def merge_fanout(
     children: Sequence[SummaryNode],
     counter: TokenCounter,
     *,
-    capacity: int,
+    budget: RequestBudget,
     ceiling: int | None = None,
 ) -> tuple[int, str]:
     """Derive how many children fit one merge request, and say why.
@@ -176,12 +203,11 @@ def merge_fanout(
     Sized from the largest child rather than the average, so a group is never
     assembled that only fits on average.
 
-    Raises `BudgetError` when the capacity cannot hold a *pair*, rather than
-    returning two anyway: a merge of one is not a merge, and reporting two
-    would assemble a request of twice the size it was sized against. That is
-    reachable on the default local configuration, and on a provider that
-    truncates an oversized prompt silently it would be undetectable content
-    loss rather than an error.
+    Raises `RequestBudgetError` when the budget cannot hold a *pair*, rather
+    than returning two anyway: a merge of one is not a merge, and reporting
+    two would assemble a request of twice the size it was sized against. On a
+    provider that truncates an oversized prompt silently that would be
+    undetectable content loss rather than an error.
     """
     if not children:
         raise ValueError("fanout requires at least one child")
@@ -191,20 +217,9 @@ def merge_fanout(
 
     costs = [measure_child_tokens(child, counter) for child in children]
     largest = max(costs)
+    budget.require_merge_pair(largest)
+    capacity = budget.input_capacity
     measured = capacity // largest if largest else len(children)
-
-    # A merge level cannot be narrower than a pair, so a capacity that admits
-    # only one child admits no merge at all. Reporting a fanout of 2 here -
-    # which an earlier revision did - assembles a request of twice the size it
-    # was sized against, and on a provider that truncates silently that is
-    # undetectable content loss rather than an error.
-    if measured < 2:
-        worst = costs.index(largest)
-        raise BudgetError(
-            f"a merge request cannot hold two summaries: child {worst} costs "
-            f"{largest} tokens and a pair costs {2 * largest} against a "
-            f"capacity of {capacity}"
-        )
 
     if ceiling is not None and ceiling < measured:
         return ceiling, (
@@ -248,10 +263,9 @@ def build_hierarchy(
     source_id: str,
     covered: Sequence[Sequence[str]],
     attributable: Mapping[str, str],
-    usable_tokens: int,
+    limits: RequestLimits,
     model: str,
     timeout_seconds: float,
-    max_output_tokens: int | None = None,
     max_merge_children: int | None = None,
     grounding_policy: GroundingPolicy | None = None,
     coordinator: CacheCoordinator | None = None,
@@ -265,10 +279,10 @@ def build_hierarchy(
     quotation from it may be drawn from - injected rather than held in module
     state, so a run carries its own material and nothing leaks between runs.
 
-    `usable_tokens` is the whole input budget for a request. The merge
-    instructions, schema, and outer delimiters are subtracted here rather than
-    by the caller, because the budget calculator measures a *leaf* request and
-    a caller passing that figure straight through would under-reserve.
+    `limits` supplies the run's context window, output allowance, margin and
+    correction headroom. Each level plans its own merge budget from them, with
+    the merge instructions, schema, delimiters and any fixed grounding reserve
+    measured here, because the strategy decision measured a *leaf* request.
 
     Termination rests on a fanout of at least two, which `merge_fanout`
     guarantees by refusing a capacity that cannot hold a pair. The node count
@@ -348,24 +362,12 @@ def build_hierarchy(
     while len(current) > 1:
         runtime.raise_if_stopped("during merging")
         level += 1
-        overhead = measure_merge_overhead(
-            counter,
+        budget = plan_merge_request(
+            limits,
             level=level,
             provider_schema_reserve=provider_schema_reserve,
+            evidence=0 if adaptive_grounding else configured_policy.max_tokens,
         )
-        child_capacity = usable_tokens - overhead
-        if not adaptive_grounding:
-            child_capacity -= configured_policy.max_tokens
-        if child_capacity <= 0:
-            reserve = (
-                configured_policy.max_tokens if not adaptive_grounding else 0
-            )
-            raise BudgetError(
-                f"no room for generated children in a grounded merge request at "
-                f"level {level}: {usable_tokens} usable tokens leave no room after "
-                f"{overhead} tokens of merge overhead and {reserve} "
-                "tokens reserved for source grounding"
-            )
         # An adaptive default has no fixed source reserve, so a fanout sized
         # purely from children can leave no room for a group's mandatory
         # source evidence. Retry with a narrower fanout when that happens;
@@ -376,7 +378,7 @@ def build_hierarchy(
             fanout, reason = merge_fanout(
                 [node.summary for node in current],
                 counter,
-                capacity=child_capacity,
+                budget=budget,
                 ceiling=ceiling,
             )
             groups = group_children(len(current), fanout)
@@ -412,11 +414,10 @@ def build_hierarchy(
                             source_id=source_id,
                             model=model,
                             timeout_seconds=timeout_seconds,
-                            max_output_tokens=max_output_tokens,
                             counter=counter,
-                            usable_tokens=usable_tokens,
+                            budget=budget,
                             grounding_policy=(
-                                GroundingPolicy(max_tokens=usable_tokens)
+                                GroundingPolicy(max_tokens=budget.request_capacity)
                                 if adaptive_grounding
                                 else configured_policy
                             ),
@@ -587,9 +588,8 @@ def _prepare_merge(
     source_id: str,
     model: str,
     timeout_seconds: float,
-    max_output_tokens: int | None,
     counter: TokenCounter,
-    usable_tokens: int,
+    budget: RequestBudget,
     grounding_policy: GroundingPolicy,
     configured_grounding_policy: GroundingPolicy,
     coordinator: CacheCoordinator | None,
@@ -628,11 +628,11 @@ def _prepare_merge(
                     source_id=source_id,
                     model=model,
                     timeout_seconds=timeout_seconds,
-                    max_output_tokens=max_output_tokens,
+                    max_output_tokens=budget.output_allowance_tokens,
                 ),
                 audit_work_id=node_id,
             )
-            return measure_merge_request_tokens(
+            return measure_request_tokens(
                 candidate,
                 counter,
                 provider_schema_reserve=provider_schema_reserve,
@@ -673,19 +673,16 @@ def _prepare_merge(
         source_id=source_id,
         model=model,
         timeout_seconds=timeout_seconds,
-        max_output_tokens=max_output_tokens,
+        max_output_tokens=budget.output_allowance_tokens,
     )
     request = replace(request, audit_work_id=node_id)
-    request_tokens = measure_merge_request_tokens(
-        request,
-        counter,
-        provider_schema_reserve=provider_schema_reserve,
-    )
-    if request_tokens > usable_tokens:
-        raise BudgetError(
-            f"grounded merge request at {node_id} costs {request_tokens} tokens "
-            f"against a usable capacity of {usable_tokens}"
+    budget.require_request(
+        measure_request_tokens(
+            request,
+            counter,
+            provider_schema_reserve=provider_schema_reserve,
         )
+    )
     descriptor = None
     if coordinator is not None and coordinator.session is not None:
         descriptor = coordinator.descriptor_for(
@@ -706,7 +703,7 @@ def _prepare_merge(
                 "max_output_tokens": request.max_output_tokens,
                 "grounding_max_tokens": configured_grounding_policy.max_tokens,
                 "effective_grounding_max_tokens": grounding_policy.max_tokens,
-                "usable_tokens": usable_tokens,
+                "usable_tokens": budget.request_capacity,
             },
             behavior={
                 "grounding": {"max_tokens": configured_grounding_policy.max_tokens},
@@ -728,7 +725,9 @@ def _prepare_merge(
             reserve_tokens=(
                 None if adaptive_grounding else grounding_policy.max_tokens
             ),
-            request_capacity_tokens=(usable_tokens if adaptive_grounding else None),
+            request_capacity_tokens=(
+                budget.request_capacity if adaptive_grounding else None
+            ),
         ),
         descriptor=descriptor,
     )

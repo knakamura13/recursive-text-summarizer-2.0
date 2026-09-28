@@ -77,7 +77,7 @@ class RunConfig(ApiModel):
     max_repair_passes: int = Field(1, ge=0, le=5)
     citations: bool = True
     context_window: int | None = Field(None, ge=1024, le=4_194_304)
-    max_output_tokens: int = Field(1024, ge=128, le=131_072)
+    max_output_tokens: int = Field(4096, ge=128, le=131_072)
     safety_margin_tokens: int = Field(256, ge=0, le=131_072)
     safety_margin_fraction: float = Field(0.02, ge=0.0, le=0.5)
     chunk_tokens: int | None = Field(None, ge=128)

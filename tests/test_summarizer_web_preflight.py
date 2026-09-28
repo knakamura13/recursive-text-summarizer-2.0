@@ -127,7 +127,8 @@ def test_models_that_are_not_installed_block_the_run(
     seed_document(text=SHORT_TEXT)
 
     missing = _preflight(client, model=MODEL)
-    untagged = _preflight(client, model="llama3.2")
+    # An 8,192-token model needs a smaller output allowance than the default.
+    untagged = _preflight(client, model="llama3.2", max_output_tokens=1024)
 
     assert missing["ok"] is False
     assert _codes(missing["errors"]) == ["model_not_installed"]
@@ -145,7 +146,8 @@ def test_unreachable_ollama_is_a_warning_with_the_assumed_window(
     seed_document(text=SHORT_TEXT)
     ollama.unreachable = True
 
-    result = _preflight(client)
+    # The assumed 8,192-token window needs a smaller allowance than the default.
+    result = _preflight(client, max_output_tokens=1024)
 
     assert result["ok"] is True
     assert _codes(result["warnings"]) == ["ollama_unreachable"]
@@ -164,7 +166,7 @@ def test_a_model_without_context_length_requires_an_explicit_window(
     seed_document(text=SHORT_TEXT)
 
     unknown = _preflight(client)
-    configured = _preflight(client, context_window=8192)
+    configured = _preflight(client, context_window=8192, max_output_tokens=1024)
 
     assert unknown["ok"] is False
     assert _codes(unknown["errors"]) == ["context_window_unknown"]
@@ -204,7 +206,7 @@ def test_a_configured_window_above_the_model_maximum_is_invalid(
     seed_document(text=SHORT_TEXT)
 
     too_large = _preflight(client, context_window=16_384)
-    fits = _preflight(client, context_window=8192)
+    fits = _preflight(client, context_window=8192, max_output_tokens=1024)
 
     assert too_large["ok"] is False
     assert _codes(too_large["errors"]) == ["invalid_config"]
@@ -221,7 +223,7 @@ def test_budget_failures_block_the_run(client: TestClient, ollama: FakeOllama) -
     seed_document(text=LONG_TEXT)
 
     direct = _preflight(client, strategy="direct")
-    tiny_window = _preflight(client, context_window=8192)
+    tiny_window = _preflight(client, context_window=8192, max_output_tokens=1024)
 
     assert direct["ok"] is False
     assert _codes(direct["errors"]) == ["budget"]
@@ -258,3 +260,19 @@ def test_a_request_without_a_document_id_is_invalid(client: TestClient) -> None:
 
     assert response.status_code == 422
     assert response.json()["code"] == "invalid_request"
+
+
+def test_an_editorial_target_the_window_cannot_hold_blocks_the_run(
+    client: TestClient, ollama: FakeOllama
+) -> None:
+    seed_document(text=SHORT_TEXT)
+
+    result = _preflight(client, context_window=8192, max_output_tokens=1024, target_words=5000)
+
+    assert result["ok"] is False
+    assert _codes(result["errors"]) == ["budget"]
+    message = result["errors"][0]["message"]
+    # The run refuses the same request with the same arithmetic.
+    assert "Editorial request is infeasible (output_exceeds_context)" in message
+    assert "output allowance 16024" in message
+    assert "choose fewer target words" in message

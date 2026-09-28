@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 
 from pydantic import ValidationError
 
+from summarizer.budget import OverheadMeasurement
 from summarizer.grounding import SourcePassage, serialize_source_passage
 from summarizer.leaf import (
     LeafSummaryError,
@@ -122,7 +123,7 @@ def serialize_child(node: SummaryNode) -> str:
 
 def measure_merge_overhead(
     counter: TokenCounter, *, level: int = 1, provider_schema_reserve: int = 0
-) -> int:
+) -> OverheadMeasurement:
     """Measure what a merge request costs before any child is added.
 
     The budget calculator measures a *leaf* request, and a merge request is
@@ -163,30 +164,10 @@ def measure_merge_overhead(
     schema = counter.count(
         json.dumps(leaf_summary_schema(), separators=(",", ":"), sort_keys=True)
     )
-    return (
-        counter.count(probe)
-        + outer
-        + schema
-        + MAX_QUOTE_CANDIDATE_JSON_BYTES
-        + provider_schema_reserve
-    )
-
-
-def measure_merge_request_tokens(
-    request: GenerationRequest,
-    counter: TokenCounter,
-    *,
-    provider_schema_reserve: int = 0,
-) -> int:
-    """Measure the complete request shape used for hierarchy budget checks."""
-    schema = json.dumps(
-        request.response_schema, separators=(",", ":"), sort_keys=True
-    )
-    return (
-        counter.count(request.instructions)
-        + counter.count(request.input_text)
-        + counter.count(schema)
-        + provider_schema_reserve
+    return OverheadMeasurement(
+        instructions=counter.count(probe),
+        schema=schema + MAX_QUOTE_CANDIDATE_JSON_BYTES + provider_schema_reserve,
+        fencing=outer,
     )
 
 

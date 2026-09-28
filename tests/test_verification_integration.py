@@ -751,7 +751,7 @@ def test_injected_verifier_runtime_reuses_its_own_cached_terminal_result(tmp_pat
     assert envelope["descriptor"]["behavior"]["verification"] == {
         "evidence_tokens": 4096,
         "request_tokens": 8192,
-        "output_reserve_tokens": 1024,
+        "output_reserve_tokens": 4096,
         "safety_margin_tokens": 256,
         "max_repair_passes": 1,
         "verification_enabled": True,
@@ -1031,3 +1031,80 @@ def test_runtime_budget_exhaustion_writes_terminal_audit_before_raising(tmp_path
     assert body["verification"]["failed"] is True
     assert body["verification"]["failure_codes"] == ["decomposition_capacity_failed"]
     assert body["citations"] == []
+
+
+@pytest.mark.parametrize("hierarchical", [False, True])
+def test_every_request_carries_its_budgeted_output_allowance(hierarchical: bool) -> None:
+    """Each stage transmits the allowance its budget reserved, re-asks included."""
+
+    class RejectFirstSummary(VerificationPipelineProvider):
+        rejected = False
+
+        def generate(self, request: GenerationRequest) -> GenerationResult:
+            operation = request.operation_id or ""
+            if not self.rejected and (operation == "D000001" or operation.startswith("S")):
+                self.rejected = True
+                self.requests.append(request)
+                return GenerationResult("not json", "fake", request.model)
+            return super().generate(request)
+
+    provider = RejectFirstSummary(verification="supported")
+    run_pipeline(
+        ingest_text("The source confirms the value is 41. " * 12),
+        provider,
+        CharacterCounter(),
+        app=app(),
+        strategy=strategy(hierarchical=hierarchical),
+        config=PipelineConfig(
+            target_words=40,
+            segmentation=SegmentationConfig(max_tokens=35) if hierarchical else None,
+            max_merge_children=2,
+            verification=VerificationConfig(enabled=True),
+        ),
+    )
+
+    def stage(request: GenerationRequest) -> str:
+        operation = request.operation_id or ""
+        for prefix in ("merge-", "editorial-", "verification-", "compression:"):
+            if operation.startswith(prefix):
+                return prefix[:-1]
+        return "summary"
+
+    stages = {stage(request) for request in provider.requests}
+    assert stages >= {"summary", "compression", "editorial", "verification"} | (
+        {"merge"} if hierarchical else set()
+    )
+    summaries = [request for request in provider.requests if stage(request) == "summary"]
+    # The rejected first summary and its re-ask are both present.
+    assert len(summaries) == len({request.operation_id for request in summaries}) + 1
+    for request in provider.requests:
+        expected = {
+            "summary": 1,
+            "merge": 1,
+            "editorial": 3 * 40 + 1_024,
+            "verification": VerificationConfig().output_reserve_tokens,
+            "compression": len(request.input_text.split("\n", 1)[1].rsplit("\n", 1)[0]) + 64,
+        }[stage(request)]
+        assert request.max_output_tokens == expected, request.operation_id
+
+
+def test_an_infeasible_editorial_target_is_refused_before_any_call() -> None:
+    from summarizer.budget import BudgetFailure, RequestBudgetError
+
+    provider = VerificationPipelineProvider(verification="supported")
+
+    with pytest.raises(RequestBudgetError) as error:
+        run_pipeline(
+            ingest_text("The source confirms the value is 41."),
+            provider,
+            CharacterCounter(),
+            app=app(),
+            strategy=strategy(),
+            # 3 * 40_000 + 1_024 output tokens cannot fit a 100,000-token window.
+            config=PipelineConfig(target_words=40_000),
+        )
+
+    assert error.value.failure is BudgetFailure.OUTPUT_EXCEEDS_CONTEXT
+    assert error.value.budget.stage == "editorial"
+    assert error.value.budget.output_allowance_tokens == 121_024
+    assert provider.requests == []

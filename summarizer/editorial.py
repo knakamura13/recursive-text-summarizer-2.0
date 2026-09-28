@@ -8,6 +8,13 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
+from summarizer.budget import (
+    OverheadMeasurement,
+    RequestBudget,
+    RequestLimits,
+    editorial_output_allowance,
+    measure_request_tokens,
+)
 from summarizer.leaf import _describe, _extract_json_object, _sanitize
 from summarizer.providers.base import GenerationRequest, GenerationResult, ModelProvider
 from summarizer.reask import INVALID_OUTPUT_ERRORS, generate_validated, rejection_reason
@@ -126,6 +133,32 @@ def build_editorial_request(
     )
 
 
+def plan_editorial_request(
+    limits: RequestLimits, *, source_id: str, target_words: int
+) -> RequestBudget:
+    """Budget the editorial request, or raise `RequestBudgetError`.
+
+    Everything but the grounded root is known before any summary exists, so
+    a run can refuse an infeasible target before its first model call.
+    """
+    begin = _fence(source_id, "GROUNDED-ROOT-BEGIN")
+    end = _fence(source_id, "GROUNDED-ROOT-END")
+    counter = limits.counter
+    return limits.plan(
+        "editorial",
+        overhead=OverheadMeasurement(
+            instructions=counter.count(
+                _INSTRUCTIONS.format(target_words=target_words, begin=begin, end=end)
+            ),
+            schema=counter.count(
+                json.dumps(final_draft_schema(), separators=(",", ":"))
+            ),
+            fencing=counter.count(f"{begin}\n\n{end}"),
+        ),
+        output_allowance=editorial_output_allowance(target_words, limits.config),
+    )
+
+
 def parse_final_draft(text: str, *, subject: str = EDITORIAL_WORK_ID) -> FinalDraft:
     try:
         payload = json.loads(_extract_json_object(text))
@@ -149,7 +182,7 @@ def write_editorial(
     model: str,
     timeout_seconds: float,
     target_words: int,
-    max_output_tokens: int | None = None,
+    limits: RequestLimits | None = None,
     observer: RuntimeObserver | None = None,
 ) -> EditorialResult:
     """Write the final draft, re-asking while the model's answer is invalid.
@@ -157,15 +190,27 @@ def write_editorial(
     The call reports to `observer` as the `editorial-final` WRITING item. An
     answer still invalid after the re-asks raises `ItemFailedError`; a result
     obtained on a re-ask is cached under the original request's descriptor.
+
+    With `limits`, the request carries the editorial output allowance and is
+    refused before any call when the assembled request exceeds its budget.
     """
+    budget = (
+        None
+        if limits is None
+        else plan_editorial_request(
+            limits, source_id=source_id, target_words=target_words
+        )
+    )
     request = build_editorial_request(
         root,
         source_id=source_id,
         model=model,
         timeout_seconds=timeout_seconds,
         target_words=target_words,
-        max_output_tokens=max_output_tokens,
+        max_output_tokens=None if budget is None else budget.output_allowance_tokens,
     )
+    if budget is not None:
+        budget.require_request(measure_request_tokens(request, limits.counter))
     coordinator = getattr(provider, "cache_coordinator", None)
     if coordinator is not None and not isinstance(coordinator, CacheCoordinator):
         raise TypeError("cache_coordinator must be a CacheCoordinator")

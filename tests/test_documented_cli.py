@@ -48,7 +48,7 @@ def test_help_lists_every_documented_flag() -> None:
     for description in (
         "how to execute",
         "the model's total context size",
-        "tokens reserved for the response when sizing a request",
+        "output allowance sent with each summary request",
         "minimum tokens held back from the context window",
         "fraction of the context window held back",
         "force hierarchical",

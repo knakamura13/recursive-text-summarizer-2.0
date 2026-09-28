@@ -39,7 +39,9 @@ INVALID_OUTPUT_ERRORS: tuple[type[Exception], ...] = (
 )
 
 # Public so a request budget can reserve room for the longest correction note.
-MAX_REASON_CHARS = 400
+# Bytes rather than characters: every token counter here charges at most one
+# token per UTF-8 byte, so a byte cap is a token cap.
+MAX_REASON_BYTES = 400
 _MAX_LOCATION_PART_CHARS = 40
 
 _Parsed = TypeVar("_Parsed")
@@ -84,7 +86,11 @@ def rejection_reason(error: BaseException) -> str:
         text = f"response failed validation ({details})"
     else:
         text = str(error)
-    return _collapse(text, MAX_REASON_CHARS) or type(error).__name__
+    reason = " ".join(text.split()) or type(error).__name__
+    encoded = reason.encode("utf-8")
+    if len(encoded) <= MAX_REASON_BYTES:
+        return reason
+    return f"{encoded[: MAX_REASON_BYTES - 3].decode('utf-8', errors='ignore')}..."
 
 
 def reask_request(request: GenerationRequest, reason: str) -> GenerationRequest:
