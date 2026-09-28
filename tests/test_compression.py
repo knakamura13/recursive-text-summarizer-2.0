@@ -138,6 +138,47 @@ def test_passes_stop_and_keep_the_longer_text_when_a_pass_no_longer_shortens() -
     assert result.passes == 1
 
 
+class Scheduled:
+    """Drop a scheduled number of words in each pass over one chunk."""
+
+    def __init__(self, drops: dict[int, int]) -> None:
+        self.drops = drops
+        self.passes: list[int] = []
+
+    def generate(self, request):
+        pass_index = int(request.operation_id.split(":C")[1][:2])
+        self.passes.append(pass_index)
+        words = request.input_text.split("\n", 1)[1].rsplit("\n", 1)[0].split()
+        text = " ".join(words[: len(words) - self.drops.get(pass_index, 1)])
+        return GenerationResult(text=f'{{"text": "{text}"}}', provider="fake", model=request.model)
+
+
+def _run_scheduled(drops: dict[int, int]) -> Scheduled:
+    provider = Scheduled(drops)
+    compress_to_target(
+        " ".join(f"w{index}" for index in range(150)),
+        provider,
+        source_id="a" * 64,
+        model="m",
+        timeout_seconds=30,
+        target_words=10,
+    )
+    return provider
+
+
+def test_passes_stop_after_three_slow_passes_in_a_row() -> None:
+    # Pass 1 drops 30 of 150 words; each later pass drops 1 of ~120, under 1%.
+    provider = _run_scheduled({1: 30})
+
+    assert provider.passes == [1, 2, 3, 4]
+
+
+def test_a_large_drop_resets_the_count_of_slow_passes() -> None:
+    provider = _run_scheduled({1: 30, 4: 10})
+
+    assert provider.passes == [1, 2, 3, 4, 5, 6, 7]
+
+
 def test_retention_ratio_constant() -> None:
     assert RETENTION_RATIO == 0.70
 
