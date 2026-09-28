@@ -1230,3 +1230,27 @@ def test_a_sentence_the_source_sentence_check_rejects_does_not_publish_on_its_fi
         run()
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
     assert [item["pass_index"] for item in audit["verification"]["passes"]] == [1, 2]
+
+
+def test_a_mixed_draft_publishes_only_complete_sentences_at_their_published_offsets(
+    tmp_path,
+) -> None:
+    opening = "New research shows a growing number of U.S."
+    split_rest = "renters struggle with rent."
+    closing = "One in five renters paid late."
+
+    def decide(claim, request):
+        return "insufficiently_supported" if claim["span_text"].strip() == opening else "supported"
+
+    run, _provider, audit_path = _finalize_draft(
+        tmp_path,
+        source=f"{opening} {split_rest} {closing}",
+        draft=f"{opening} {split_rest} {closing}",
+        decide=decide,
+    )
+
+    result = run()
+
+    assert result.text == closing
+    sentences = json.loads(audit_path.read_text(encoding="utf-8"))["publication"]["sentences"]
+    assert [result.text[item["start"] : item["end"]] for item in sentences] == [closing]

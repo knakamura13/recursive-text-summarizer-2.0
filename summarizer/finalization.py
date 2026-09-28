@@ -3,8 +3,8 @@
 With verification enabled, exactly one of two verified texts is published:
 
 1. `editorial`: the editorial draft passes verification, repairs included.
-2. `verified_subset`: otherwise the sentences the verifier supported in the
-   last pass are published and the rest are dropped (warning
+2. `verified_subset`: otherwise the complete sentences the verifier supported
+   in the last pass are published and the rest are dropped (warning
    `verified_sentence_subset`). With `strict_numbers` on, a rejected numbered
    sentence may first be swapped for its source sentence; the swapped draft is
    verified again, and only sentences that pass that check publish.
@@ -288,39 +288,75 @@ def _pass_verdicts(
     return verdicts, claims_by_span
 
 
-def _passing_sentence_text(result: VerificationResult) -> str | None:
-    """Keep sentences whose every claim the verifier supported, and drop the rest.
+def _sentence_groups(spans: Sequence[DraftSpan]) -> list[list[DraftSpan]]:
+    """Draft spans grouped into sentences.
 
-    Kept sentences stay in order, and a paragraph break survives wherever the
-    dropped text crossed one. A contract failure has no sentence verdicts to
-    trust, so nothing is kept.
+    The span splitter can break inside a sentence, for example after "U.S.";
+    a span that starts in lowercase continues the sentence before it.
+    """
+    groups: list[list[DraftSpan]] = []
+    for span in spans:
+        text = span.text.strip()
+        if not text:
+            continue
+        if groups and text[0].islower():
+            groups[-1].append(span)
+        else:
+            groups.append([span])
+    return groups
+
+
+def _published_layout(
+    passed: VerificationPassResult,
+) -> tuple[str, list[tuple[DraftSpan, int]]] | None:
+    """The text of the complete sentences the verifier supported, and where each span sits.
+
+    A sentence publishes only when every claim in every one of its spans was
+    supported. Kept sentences stay in order, and a paragraph break survives
+    wherever the dropped text crossed one.
+    """
+    verdicts, claims_by_span = _pass_verdicts(passed)
+    pieces: list[str] = []
+    placed: list[tuple[DraftSpan, int]] = []
+    cursor = 0
+    paragraph_break = False
+    for group in _sentence_groups(passed.spans):
+        if not all(
+            _span_supported(span.span_id, claims_by_span, verdicts) for span in group
+        ):
+            paragraph_break = paragraph_break or any(
+                _PARAGRAPH_BREAK.search(span.text) for span in group
+            )
+            continue
+        for position, span in enumerate(group):
+            if pieces:
+                separator = "\n\n" if paragraph_break and position == 0 else " "
+                pieces.append(separator)
+                cursor += len(separator)
+            text = span.text.strip()
+            placed.append((span, cursor))
+            pieces.append(text)
+            cursor += len(text)
+        paragraph_break = bool(
+            _PARAGRAPH_BREAK.search(group[-1].text[len(group[-1].text.rstrip()) :])
+        )
+    if not placed:
+        return None
+    return "".join(pieces), placed
+
+
+def _passing_sentence_text(result: VerificationResult) -> str | None:
+    """Keep the complete sentences the verifier supported, and drop the rest.
+
+    A contract failure has no sentence verdicts to trust, so nothing is kept.
     """
     if not result.failed or not result.pass_results:
         return None
     passed = result.pass_results[-1]
     if passed.failed or not passed.spans or not passed.claims or not passed.assessments:
         return None
-    verdicts, claims_by_span = _pass_verdicts(passed)
-    pieces: list[str] = []
-    kept = 0
-    paragraph_break = False
-    for span in passed.spans:
-        text = span.text.strip()
-        if not text:
-            continue
-        if _span_supported(span.span_id, claims_by_span, verdicts):
-            if pieces:
-                pieces.append("\n\n" if paragraph_break else " ")
-            pieces.append(text)
-            kept += 1
-            paragraph_break = bool(
-                _PARAGRAPH_BREAK.search(span.text[len(span.text.rstrip()) :])
-            )
-        else:
-            paragraph_break = paragraph_break or bool(_PARAGRAPH_BREAK.search(span.text))
-    if not kept:
-        return None
-    return "".join(pieces)
+    layout = _published_layout(passed)
+    return layout[0] if layout is not None else None
 
 
 def _renumber_pass_ordinals(
@@ -390,16 +426,16 @@ def _numbered_substitution_draft(
     pieces: list[str] = []
     substitutions: list[_Substitution] = []
     used: set[str] = set()
-    for span in passed.spans:
-        text = span.text.strip()
-        if not text:
-            continue
-        if _span_supported(span.span_id, claims_by_span, verdicts):
+    for group in _sentence_groups(passed.spans):
+        text = " ".join(span.text.strip() for span in group)
+        if all(_span_supported(span.span_id, claims_by_span, verdicts) for span in group):
             pieces.append(text)
             used.add(text)
             continue
         span_verdicts = [
-            verdicts.get(claim_id) for claim_id in claims_by_span.get(span.span_id, ())
+            verdicts.get(claim_id)
+            for span in group
+            for claim_id in claims_by_span.get(span.span_id, ())
         ]
         if not span_verdicts or any(
             verdict is None or verdict is ClaimVerdict.CONTRADICTED
@@ -530,15 +566,22 @@ def _subset_from_first_pass(
     `changed` marks a candidate whose text already differs from the editorial
     draft, so it is a subset even when every sentence passed.
     """
-    reduced = _passing_sentence_text(result)
-    if reduced is None:
+    if not result.failed or not result.pass_results:
         return None
     passed = result.pass_results[-1]
-    verdicts, claims_by_span = _pass_verdicts(passed)
+    if passed.failed or not passed.spans or not passed.claims or not passed.assessments:
+        return None
+    layout = _published_layout(passed)
+    if layout is None:
+        return None
+    reduced, placed = layout
+    # Each kept span keeps the text the verifier checked; its range moves to
+    # where that text sits in the published summary.
     kept_spans = tuple(
-        span
-        for span in passed.spans
-        if span.text.strip() and _span_supported(span.span_id, claims_by_span, verdicts)
+        replace(span, start=start, end=start + len(span.text.strip()))
+        if isinstance(span, DraftSpan)
+        else span
+        for span, start in placed
     )
     kept_span_ids = {span.span_id for span in kept_spans}
     kept_claims = tuple(
