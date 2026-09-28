@@ -16,10 +16,10 @@ The context window is resolved as the worker resolves it: a configured window
 is used as is, otherwise min(model maximum, DEFAULT_OLLAMA_CONTEXT_WINDOW)
 from ``/api/show``; an unknown model window blocks preflight unless configured.
 Estimates come from the pipeline's own functions: ``select_strategy``
-for the strategy and capacity, ``leaf_segmentation`` + ``segment_document``
-for the leaf count, ``merge_input_budget`` + ``measure_merge_overhead`` for
-the merge fanout, and the progress service's merge and verification call
-estimators, which also drive the Run ETA.
+for the strategy and capacity, ``plan_run_requests`` for the editorial and
+first merge request budgets, ``leaf_segmentation`` + ``segment_document`` for
+the leaf count, ``plan_merge_request`` for the merge fanout, and the progress
+service's merge and verification call estimators, which also drive the Run ETA.
 """
 
 from __future__ import annotations
@@ -35,13 +35,16 @@ from summarizer.budget import (
     ASSUMED_CONTEXT_WINDOW,
     BudgetError,
     BudgetReport,
+    RequestBudgetError,
+    RequestLimits,
     resolve_context_window,
     select_strategy,
 )
 from summarizer.config import AppConfig, StrategyConfig
+from summarizer.hierarchy import plan_merge_request
 from summarizer.ingestion import SourceDocument
-from summarizer.merge import child_fence_tokens, measure_merge_overhead
-from summarizer.pipeline import leaf_segmentation, merge_input_budget
+from summarizer.merge import child_fence_tokens
+from summarizer.pipeline import leaf_segmentation, plan_run_requests
 from summarizer.providers.ollama import DEFAULT_OLLAMA_CONTEXT_WINDOW
 from summarizer.segmentation import SegmentationConfig, SegmentationError, segment_document
 from summarizer.summaries import MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
@@ -156,8 +159,16 @@ def run_preflight(payload: dict[str, Any]) -> PreflightResponse:
         context_window_source=source,
         model_installed=model_installed,
     )
+    app = AppConfig(model=model, provider="ollama", ollama_host=host)
     try:
         report = select_strategy(document, counter, provider="ollama", model=model, config=strategy)
+        limits = plan_run_requests(
+            report,
+            counter,
+            strategy=strategy,
+            source_id=document.source_id,
+            target_words=config.target_words,
+        )
     except BudgetError as error:
         (warnings if assumed else errors).append(_budget_notice(error, config, assumed=assumed))
         return _finish(response, errors, warnings)
@@ -172,7 +183,7 @@ def run_preflight(payload: dict[str, Any]) -> PreflightResponse:
     )
     try:
         leaf_count, merge_calls = _tree_estimate(
-            document, counter, report, config, strategy=strategy, model=model, host=host,
+            document, counter, report, config, strategy=strategy, app=app, limits=limits,
             warnings=warnings,
         )
     except (BudgetError, SegmentationError) as error:
@@ -304,8 +315,8 @@ def _tree_estimate(
     config: RunConfig,
     *,
     strategy: StrategyConfig,
-    model: str,
-    host: str,
+    app: AppConfig,
+    limits: RequestLimits,
     warnings: list[Notice],
 ) -> tuple[int, int]:
     """Return (leaf count, merge calls); raises BudgetError/SegmentationError."""
@@ -314,29 +325,23 @@ def _tree_estimate(
     segmentation = leaf_segmentation(
         report,
         counter,
-        app=AppConfig(model=model, provider="ollama", ollama_host=host),
+        app=app,
         strategy=strategy,
         requested=segmentation_config(config),
     )
     leaf_count = _leaf_count(document, counter, segmentation)
     if leaf_count < 2:
         return leaf_count, 0
-    budget = merge_input_budget(report)
-    overhead = measure_merge_overhead(
-        counter, level=1, provider_schema_reserve=MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
+    budget = plan_merge_request(
+        limits, level=1, provider_schema_reserve=MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
     )
-    capacity = budget - overhead
-    if capacity <= 0:
-        raise BudgetError(
-            f"merge requests do not fit: the merge instructions need {overhead} of the "
-            f"{budget} input tokens a context window of {report.context_window_tokens} "
-            "tokens leaves"
-        )
+    # Leaves are not generated yet, so each is sized at its full output
+    # allowance; the run measures the real children with the same budget.
     per_token = 1 if counter.exact else _BYTES_PER_OUTPUT_TOKEN
-    fanout = capacity // (config.max_output_tokens * per_token + child_fence_tokens(counter))
-    if config.max_merge_children is not None:
-        fanout = min(fanout, config.max_merge_children)
-    if fanout < 2:
+    child_tokens = config.max_output_tokens * per_token + child_fence_tokens(counter)
+    try:
+        budget.require_merge_pair(child_tokens)
+    except RequestBudgetError:
         warnings.append(
             _warning(
                 "merge_capacity",
@@ -346,6 +351,10 @@ def _tree_estimate(
             )
         )
         fanout = 2
+    else:
+        fanout = budget.input_capacity // child_tokens
+    if config.max_merge_children is not None:
+        fanout = min(fanout, config.max_merge_children)
     return leaf_count, estimate_merge_calls(leaf_count, fanout)
 
 
@@ -375,7 +384,9 @@ def _leaf_count(
 def _budget_notice(error: Exception, config: RunConfig, *, assumed: bool) -> Notice:
     text = str(error).strip().rstrip(".")
     message = f"{text[:1].upper()}{text[1:]}."
-    if config.strategy == "direct":
+    if isinstance(error, RequestBudgetError) and error.budget.stage == "editorial":
+        hint = "Set a larger context window or choose fewer target words."
+    elif config.strategy == "direct":
         hint = "Choose the Auto or Hierarchical strategy, or set a larger context window."
     elif config.chunk_tokens is not None:
         hint = "Lower chunk tokens or max output tokens, or set a larger context window."

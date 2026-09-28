@@ -8,7 +8,17 @@ from time import sleep
 
 import pytest
 
-from summarizer.budget import BudgetError
+from summarizer.budget import (
+    BudgetError,
+    BudgetFailure,
+    ContextWindow,
+    OverheadMeasurement,
+    RequestBudget,
+    RequestBudgetError,
+    RequestLimits,
+    measure_request_tokens,
+)
+from summarizer.config import StrategyConfig
 from summarizer.cache import CacheStore
 from summarizer.checkpoint import CheckpointStore, RunPlan
 from summarizer.grounding import GroundingPolicy, GroundingSelection
@@ -24,7 +34,6 @@ from summarizer.leaf import LeafSummaryError
 from summarizer.runtime.observers import ItemFailedError, StageName
 from summarizer.merge import (
     child_fence_tokens,
-    measure_merge_request_tokens,
     serialize_child,
 )
 from summarizer.providers.base import (
@@ -46,6 +55,31 @@ class CharacterCounter:
 
     def count(self, text: str) -> int:
         return len(text)
+
+
+def limits_for(usable: int) -> RequestLimits:
+    """Limits whose whole-request capacity is `usable` tokens, with no margin."""
+    return RequestLimits(
+        window=ContextWindow(tokens=usable + 1, assumed=False),
+        config=StrategyConfig(
+            max_output_tokens=1, safety_margin_tokens=0, safety_margin_fraction=0
+        ),
+        counter=CharacterCounter(),
+        correction_headroom=0,
+    )
+
+
+def merge_budget(capacity: int) -> RequestBudget:
+    """A merge budget with an input capacity of exactly `capacity`."""
+    return RequestBudget(
+        stage="merge",
+        context_window_tokens=capacity + 1,
+        overhead=OverheadMeasurement(instructions=0, schema=0, fencing=0),
+        evidence_tokens=0,
+        correction_headroom_tokens=0,
+        output_allowance_tokens=1,
+        safety_margin_tokens=0,
+    )
 
 
 def leaf(index: int, *, summary: str | None = None, **overrides: object) -> SummaryNode:
@@ -122,7 +156,7 @@ def build(count: int, *, ceiling: int | None = None, usable: int = 100_000,
         source_id=SOURCE_ID,
         covered=covered_for(count),
         attributable=attributable_for(count),
-        usable_tokens=usable,
+        limits=limits_for(usable),
         model="m",
         timeout_seconds=30,
         max_merge_children=ceiling,
@@ -166,8 +200,8 @@ def test_fanout_shrinks_as_children_grow() -> None:
     small = leaves(3)
     large = leaves(3, summary="x" * 2_000)
 
-    small_fanout, _ = merge_fanout(small, counter, capacity=10_000)
-    large_fanout, _ = merge_fanout(large, counter, capacity=10_000)
+    small_fanout, _ = merge_fanout(small, counter, budget=merge_budget(10_000))
+    large_fanout, _ = merge_fanout(large, counter, budget=merge_budget(10_000))
 
     assert small_fanout > large_fanout
     assert measure_child_tokens(large[0], counter) > measure_child_tokens(
@@ -186,7 +220,7 @@ def test_fanout_is_sized_from_the_largest_child() -> None:
     mixed = [leaf(1), leaf(2, summary="x" * 4_000), leaf(3)]
     biggest = len(serialize_child(mixed[1])) + child_fence_tokens(counter)
 
-    fanout, reason = merge_fanout(mixed, counter, capacity=10_000)
+    fanout, reason = merge_fanout(mixed, counter, budget=merge_budget(10_000))
 
     assert fanout == 10_000 // biggest
     assert "largest child" in reason
@@ -194,7 +228,7 @@ def test_fanout_is_sized_from_the_largest_child() -> None:
 
 
 def test_a_configured_ceiling_clamps_the_measured_fanout() -> None:
-    fanout, reason = merge_fanout(leaves(3), CharacterCounter(), capacity=100_000, ceiling=3)
+    fanout, reason = merge_fanout(leaves(3), CharacterCounter(), budget=merge_budget(100_000), ceiling=3)
 
     assert fanout == 3
     assert "ceiling" in reason
@@ -211,12 +245,13 @@ def test_a_capacity_that_cannot_hold_a_pair_fails_with_its_arithmetic() -> None:
     children = leaves(2, summary="x" * 400)
     each = measure_child_tokens(children[0], counter)
 
-    with pytest.raises(BudgetError) as error:
-        merge_fanout(children, counter, capacity=each + 1)
+    with pytest.raises(RequestBudgetError) as error:
+        merge_fanout(children, counter, budget=merge_budget(each + 1))
 
-    message = str(error.value)
-    assert "cannot hold two summaries" in message
-    assert f"a pair costs {2 * each}" in message
+    assert error.value.failure is BudgetFailure.MERGE_PAIR_EXCEEDS_CAPACITY
+    assert f"pair of {2 * each} against an input capacity of {each + 1}" in str(
+        error.value
+    )
 
 
 def test_a_fanout_of_two_never_exceeds_its_capacity() -> None:
@@ -227,7 +262,7 @@ def test_a_fanout_of_two_never_exceeds_its_capacity() -> None:
         each = measure_child_tokens(children[0], counter)
         for capacity in (each - 1, each, each + 1, 2 * each - 1, 2 * each):
             try:
-                fanout, _ = merge_fanout(children, counter, capacity=capacity)
+                fanout, _ = merge_fanout(children, counter, budget=merge_budget(capacity))
             except BudgetError:
                 continue
             assert fanout * each <= capacity
@@ -237,7 +272,7 @@ def test_a_ceiling_below_two_is_refused() -> None:
     for ceiling in (0, 1, -3):
         with pytest.raises(ValueError, match="at least 2"):
             merge_fanout(
-                leaves(3), CharacterCounter(), capacity=100_000, ceiling=ceiling
+                leaves(3), CharacterCounter(), budget=merge_budget(100_000), ceiling=ceiling
             )
 
 
@@ -318,7 +353,7 @@ def test_merged_provenance_uses_document_order_not_grounding_priority() -> None:
         source_id=SOURCE_ID,
         covered=covered_for(3),
         attributable=attributable_for(3),
-        usable_tokens=100_000,
+        limits=limits_for(100_000),
         model="m",
         timeout_seconds=30,
         max_merge_children=3,
@@ -366,7 +401,7 @@ def test_merge_retains_child_references_when_grounding_omits_their_passages() ->
             "S000002": "x" * 1_000,
             "S000003": "y" * 1_000,
         },
-        usable_tokens=100_000,
+        limits=limits_for(100_000),
         model="m",
         timeout_seconds=30,
         max_merge_children=3,
@@ -381,7 +416,7 @@ def test_every_grounded_merge_request_fits_the_usable_budget() -> None:
     _, _, _, provider = build(4, ceiling=2, usable=10_000, grounding_tokens=1_000)
 
     for request in provider.requests:
-        assert measure_merge_request_tokens(request, CharacterCounter()) <= 10_000
+        assert measure_request_tokens(request, CharacterCounter()) <= 10_000
 
 
 def test_adaptive_default_shrinks_fanout_to_fit_mandatory_grounding() -> None:
@@ -425,7 +460,7 @@ def test_adaptive_default_shrinks_fanout_to_fit_mandatory_grounding() -> None:
     # Sized so all three children fit together with room to spare, but their
     # combined mandatory evidence (3 x source_length) does not; only a
     # two-member group's mandatory evidence (2 x source_length) fits.
-    usable_tokens = overhead + 2 * child_cost + 2 * source_length + 300
+    usable_tokens = overhead.total + 2 * child_cost + 2 * source_length + 300
 
     root, nodes, report = build_hierarchy(
         three_leaves,
@@ -436,7 +471,7 @@ def test_adaptive_default_shrinks_fanout_to_fit_mandatory_grounding() -> None:
         attributable={
             f"S{index:06d}": "y" * source_length for index in (1, 2, 3)
         },
-        usable_tokens=usable_tokens,
+        limits=limits_for(usable_tokens),
         model="m",
         timeout_seconds=30,
     )
@@ -492,7 +527,7 @@ def test_authoritative_source_can_correct_a_misleading_child_summary() -> None:
             "S000001": "The archive moved.",
             "S000002": "The archive did not move.",
         },
-        usable_tokens=10_000,
+        limits=limits_for(10_000),
         model="m",
         timeout_seconds=30,
         grounding_policy=GroundingPolicy(max_tokens=1_000),
@@ -600,7 +635,7 @@ def test_provider_failures_propagate() -> None:
             source_id=SOURCE_ID,
             covered=covered_for(4),
             attributable=attributable_for(4),
-            usable_tokens=100_000,
+            limits=limits_for(100_000),
             model="m",
             timeout_seconds=30,
         )
@@ -635,7 +670,7 @@ def test_an_invalid_leaf_is_reported_under_its_own_node_id() -> None:
             source_id=SOURCE_ID,
             covered=covered_for(3),
             attributable=attributable_for(3),
-            usable_tokens=100_000,
+            limits=limits_for(100_000),
             model="m",
             timeout_seconds=30,
         )
@@ -652,7 +687,7 @@ def test_rejects_mismatched_covered_identifiers() -> None:
             source_id=SOURCE_ID,
             covered=covered_for(2),
             attributable=attributable_for(3),
-            usable_tokens=100_000,
+            limits=limits_for(100_000),
             model="m",
             timeout_seconds=30,
         )
@@ -694,10 +729,12 @@ def test_merge_overhead_is_subtracted_from_the_usable_budget() -> None:
     counter = CharacterCounter()
     overhead = measure_merge_overhead(counter, level=1)
 
-    assert overhead > 0
+    assert overhead.total > 0
 
-    with pytest.raises(BudgetError, match="no room for generated children"):
-        build(4, ceiling=2, usable=overhead)
+    with pytest.raises(RequestBudgetError) as error:
+        build(4, ceiling=2, usable=overhead.total)
+
+    assert error.value.failure is BudgetFailure.NO_INPUT_CAPACITY
 
 
 def test_the_legal_set_is_narrowed_to_the_group_being_merged() -> None:
@@ -867,7 +904,7 @@ def test_same_level_merges_are_bounded_concurrent_and_preserve_node_order(
             source_id=SOURCE_ID,
             covered=covered_for(4),
             attributable=attributable_for(4),
-            usable_tokens=100_000,
+            limits=limits_for(100_000),
             model="m",
             timeout_seconds=30,
             max_merge_children=2,
@@ -920,7 +957,7 @@ def test_resume_reuses_compatible_sibling_merges_and_calls_only_a_cache_miss(
         build_hierarchy(
             leaves(4), MergingProvider(), CharacterCounter(), source_id=SOURCE_ID,
             covered=covered_for(4), attributable=attributable_for(4),
-            usable_tokens=100_000, model="m", timeout_seconds=30,
+            limits=limits_for(100_000), model="m", timeout_seconds=30,
             max_merge_children=2, grounding_policy=GroundingPolicy(max_tokens=1_000),
             coordinator=coordinator(session),
         )
@@ -937,7 +974,7 @@ def test_resume_reuses_compatible_sibling_merges_and_calls_only_a_cache_miss(
         _, nodes, _ = build_hierarchy(
             leaves(4), resumed, CharacterCounter(), source_id=SOURCE_ID,
             covered=covered_for(4), attributable=attributable_for(4),
-            usable_tokens=100_000, model="m", timeout_seconds=30,
+            limits=limits_for(100_000), model="m", timeout_seconds=30,
             max_merge_children=2, grounding_policy=GroundingPolicy(max_tokens=1_000),
             coordinator=coordinator(session),
         )
@@ -946,3 +983,21 @@ def test_resume_reuses_compatible_sibling_merges_and_calls_only_a_cache_miss(
     assert [node.node_id for node in nodes[-3:]] == [
         "L1N0001", "L1N0002", "L2N0001"
     ]
+
+
+def test_a_two_child_merge_fits_exactly_at_its_pair_boundary() -> None:
+    """Both sides of the boundary, with the fixed grounding reserve charged."""
+    from summarizer.merge import measure_merge_overhead
+
+    counter = CharacterCounter()
+    each = max(measure_child_tokens(child, counter) for child in leaves(2))
+    boundary = measure_merge_overhead(counter, level=1).total + 1_000 + 2 * each
+
+    root, _, _, provider = build(2, usable=boundary)
+    assert root.level == 1
+    assert all(request.max_output_tokens == 1 for request in provider.requests)
+
+    with pytest.raises(RequestBudgetError) as error:
+        build(2, usable=boundary - 1)
+
+    assert error.value.failure is BudgetFailure.MERGE_PAIR_EXCEEDS_CAPACITY

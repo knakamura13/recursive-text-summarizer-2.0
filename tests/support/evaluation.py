@@ -18,7 +18,7 @@ import re
 import socket
 from typing import Iterator, Mapping, Sequence
 
-from summarizer.budget import measure_overhead
+from summarizer.budget import correction_headroom, measure_overhead
 from summarizer.config import AppConfig, StrategyConfig
 from summarizer.ingestion import SourceDocument, ingest_text
 from summarizer.pipeline import PipelineConfig, PipelineResult, run_pipeline
@@ -374,7 +374,13 @@ def _fixture_document(spec: EvaluationCase) -> SourceDocument:
 
 
 def _strategy_for(document: SourceDocument, strategy: str, counter: CharacterCounter) -> StrategyConfig:
-    overhead = measure_overhead(counter, with_overlap=False).total
+    # Room for one correction note and the 220-word editorial allowance
+    # (3 * 220 + 1024), which every request budget now reserves.
+    overhead = (
+        measure_overhead(counter, with_overlap=False).total
+        + correction_headroom(counter)
+        + 1_684
+    )
     if strategy == "direct":
         context_window = overhead + len(document.text) + 1_000
     else:

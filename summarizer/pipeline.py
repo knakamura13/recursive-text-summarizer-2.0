@@ -12,6 +12,7 @@ from threading import Lock
 from summarizer.budget import (
     BudgetError,
     BudgetReport,
+    RequestLimits,
     measure_overhead,
     plan_request,
     resolve_context_window,
@@ -27,7 +28,8 @@ from summarizer.finalization import (
     _finalize_summary,
     publish_final_output,
 )
-from summarizer.hierarchy import TreeNode, build_hierarchy
+from summarizer.editorial import plan_editorial_request
+from summarizer.hierarchy import TreeNode, build_hierarchy, plan_merge_request
 from summarizer.ingestion import SourceDocument
 from summarizer.leaf import summarize_segments
 from summarizer.providers.base import (
@@ -182,11 +184,7 @@ def _hierarchical_capacity(
         overhead=measure_overhead(
             counter,
             with_overlap=True,
-            provider_schema_reserve=(
-                MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
-                if app.provider == "ollama"
-                else 0
-            ),
+            provider_schema_reserve=_provider_schema_reserve(app),
         ),
         output_allowance=report.reserved_output_tokens,
         correction_headroom=report.correction_headroom_tokens,
@@ -222,13 +220,28 @@ def leaf_segmentation(
     return segmentation
 
 
-def merge_input_budget(report: BudgetReport) -> int:
-    """Return the whole input budget of one merge request."""
-    return (
-        report.context_window_tokens
-        - report.reserved_output_tokens
-        - report.safety_margin_tokens
-    )
+def plan_run_requests(
+    report: BudgetReport,
+    counter: TokenCounter,
+    *,
+    strategy: StrategyConfig,
+    source_id: str,
+    target_words: int,
+) -> RequestLimits:
+    """Return the run's request limits, refusing an infeasible editorial.
+
+    The editorial request is budgeted before any model call, so an
+    unreachable target fails with its arithmetic instead of after every leaf
+    has been generated. Preflight calls this too, so both refuse the same
+    configurations.
+    """
+    limits = RequestLimits.from_report(report, counter, strategy)
+    plan_editorial_request(limits, source_id=source_id, target_words=target_words)
+    return limits
+
+
+def _provider_schema_reserve(app: AppConfig) -> int:
+    return MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES if app.provider == "ollama" else 0
 
 
 def _segment_infos(segments: Sequence[SourceSegment]) -> tuple[SegmentInfo, ...]:
@@ -261,6 +274,13 @@ def run_pipeline(
     report = select_strategy(
         document, counter, provider=app.provider, model=app.model, config=strategy
     )
+    limits = plan_run_requests(
+        report,
+        counter,
+        strategy=strategy,
+        source_id=document.source_id,
+        target_words=config.target_words,
+    )
     runtime_observer.emit(
         StageEvent(StageName.PREPARING, "completed", detail=report.strategy)
     )
@@ -274,6 +294,7 @@ def run_pipeline(
             strategy=strategy,
             config=config,
             report=report,
+            limits=limits,
             coordinator=None,
             observer=runtime_observer,
         )
@@ -380,6 +401,7 @@ def run_pipeline(
             strategy=strategy,
             config=config,
             report=report,
+            limits=limits,
             coordinator=coordinator,
             observer=runtime_observer,
         )
@@ -394,6 +416,7 @@ def _run_pipeline(
     strategy: StrategyConfig,
     config: PipelineConfig,
     report: BudgetReport,
+    limits: RequestLimits,
     coordinator: CacheCoordinator | None,
     observer: RuntimeObserver,
 ) -> PipelineResult:
@@ -413,6 +436,7 @@ def _run_pipeline(
             counter,
             model=app.model,
             timeout_seconds=app.timeout_seconds,
+            max_output_tokens=strategy.max_output_tokens,
             coordinator=coordinator,
             observer=observer,
         )
@@ -442,6 +466,11 @@ def _run_pipeline(
                 document, counter, segmentation, coordinator=coordinator
             )
         )
+        if len(segments) > 1:
+            # Refuse a merge budget with no input room before any leaf call.
+            plan_merge_request(
+                limits, level=1, provider_schema_reserve=_provider_schema_reserve(app)
+            )
         observer.emit_segments(_segment_infos(segments))
         observer.emit(
             StageEvent(
@@ -464,6 +493,7 @@ def _run_pipeline(
             recording,
             model=app.model,
             timeout_seconds=app.timeout_seconds,
+            max_output_tokens=strategy.max_output_tokens,
             coordinator=coordinator,
             observer=observer,
         )
@@ -490,16 +520,12 @@ def _run_pipeline(
                 segment.segment_id: document.text[segment.core_start : segment.core_end]
                 for segment in segments
             },
-            usable_tokens=merge_input_budget(report),
+            limits=limits,
             model=app.model,
             timeout_seconds=app.timeout_seconds,
             max_merge_children=config.max_merge_children,
             coordinator=coordinator,
-            provider_schema_reserve=(
-                MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
-                if app.provider == "ollama"
-                else 0
-            ),
+            provider_schema_reserve=_provider_schema_reserve(app),
             observer=observer,
         )
         if len(leaves) > 1:
@@ -599,6 +625,7 @@ def _run_pipeline(
         segments=segments,
         nodes=nodes,
         root_node_id=root.node_id,
+        request_limits=limits,
         include_citations=config.include_citations,
         audit_configuration={
             "app": asdict(app),

@@ -5,6 +5,7 @@ import pytest
 from summarizer.budget import (
     BudgetFailure,
     RequestBudgetError,
+    correction_headroom,
     measure_overhead,
     select_strategy,
 )
@@ -32,7 +33,9 @@ def config_for(document_tokens: int, *, slack: int, **overrides: object) -> Stra
         "safety_margin_fraction": 0,
     }
     base.update(overrides)
-    window = overhead.total + 1 + document_tokens + slack
+    window = (
+        overhead.total + 1 + correction_headroom(counter) + document_tokens + slack
+    )
     base["context_window"] = window
     return StrategyConfig(**base)  # type: ignore[arg-type]
 

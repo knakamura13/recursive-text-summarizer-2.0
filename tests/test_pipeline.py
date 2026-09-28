@@ -8,7 +8,7 @@ import summarizer.pipeline as pipeline
 from summarizer.budget import select_strategy
 from summarizer.config import AppConfig, StrategyConfig
 from summarizer.ingestion import ingest_text
-from summarizer.merge import measure_merge_request_tokens
+from summarizer.budget import measure_request_tokens
 from summarizer.pipeline import PipelineConfig, run_pipeline
 from summarizer.providers.base import GenerationRequest, GenerationResult
 from summarizer.segmentation import SegmentationConfig
@@ -200,7 +200,7 @@ def test_ollama_merge_uses_request_budget_not_leaf_capacity() -> None:
         if (request.operation_id or "").startswith("merge-L")
     ]
     merge_costs = [
-        measure_merge_request_tokens(
+        measure_request_tokens(
             request,
             counter,
             provider_schema_reserve=MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES,
@@ -238,7 +238,10 @@ def test_default_pipeline_merges_full_capacity_segments_with_a_real_tokenizer() 
         counter,
         app=app_config,
         strategy=strategy,
-        config=PipelineConfig(),
+        # A target below the fake root's three words compresses the root, not
+        # the whole source: this source is several context windows long, and
+        # compressing it would leave an editorial request its budget refuses.
+        config=PipelineConfig(target_words=2),
     )
 
     assert counter.count(document.text) > capacity
@@ -407,3 +410,36 @@ def test_hierarchical_pipeline_audit_with_fenced_code_block(tmp_path) -> None:
 
     # The final summary should be accessible and not discarded
     assert result.final.text.strip() != ""
+
+
+def test_a_merge_without_input_room_is_refused_before_any_leaf_call() -> None:
+    from summarizer.budget import BudgetFailure, RequestBudgetError, correction_headroom
+    from summarizer.merge import measure_merge_overhead
+
+    counter = CharacterCounter()
+    # Every merge reserve fits and leaves zero tokens for children, while a
+    # leaf request, whose prompt is shorter, still has room.
+    window = measure_merge_overhead(counter, level=1).total + 1 + correction_headroom(counter)
+    provider = PipelineProvider()
+
+    with pytest.raises(RequestBudgetError) as error:
+        run_pipeline(
+            ingest_text("Alpha beta gamma. " * 40),
+            provider,
+            counter,
+            app=app(),
+            strategy=StrategyConfig(
+                strategy="hierarchical",
+                context_window=window,
+                max_output_tokens=1,
+                safety_margin_tokens=0,
+                safety_margin_fraction=0,
+            ),
+            config=PipelineConfig(
+                target_words=1, segmentation=SegmentationConfig(max_tokens=100)
+            ),
+        )
+
+    assert error.value.failure is BudgetFailure.NO_INPUT_CAPACITY
+    assert error.value.budget.stage == "merge"
+    assert provider.requests == []

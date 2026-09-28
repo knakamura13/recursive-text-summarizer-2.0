@@ -258,3 +258,19 @@ def test_a_request_without_a_document_id_is_invalid(client: TestClient) -> None:
 
     assert response.status_code == 422
     assert response.json()["code"] == "invalid_request"
+
+
+def test_an_editorial_target_the_window_cannot_hold_blocks_the_run(
+    client: TestClient, ollama: FakeOllama
+) -> None:
+    seed_document(text=SHORT_TEXT)
+
+    result = _preflight(client, context_window=8192, target_words=5000)
+
+    assert result["ok"] is False
+    assert _codes(result["errors"]) == ["budget"]
+    message = result["errors"][0]["message"]
+    # The run refuses the same request with the same arithmetic.
+    assert "Editorial request is infeasible (output_exceeds_context)" in message
+    assert "output allowance 16024" in message
+    assert "choose fewer target words" in message

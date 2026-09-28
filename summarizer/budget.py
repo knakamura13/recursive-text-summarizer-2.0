@@ -9,7 +9,7 @@ from summarizer.config import StrategyConfig, StrategyName
 from summarizer.ingestion import SourceDocument
 from summarizer.leaf import build_leaf_request
 from summarizer.providers.base import GenerationRequest
-from summarizer.reask import MAX_REASON_CHARS, reask_request
+from summarizer.reask import MAX_REASON_BYTES, reask_request
 from summarizer.segmentation import BoundaryKind, SourceSegment
 from summarizer.summaries import (
     MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES,
@@ -218,18 +218,13 @@ def safety_margin(window_tokens: int, config: StrategyConfig) -> int:
     return max(config.safety_margin_tokens, proportional)
 
 
-# UTF-8 encodes one character in at most four bytes, and neither the byte
-# estimator nor a byte-level BPE emits more tokens than bytes.
-_MAX_BYTES_PER_CHARACTER = 4
-
-
 def correction_headroom(counter: TokenCounter) -> int:
     """Bound what one re-ask adds to a request's instructions.
 
     A re-ask appends one note to the original instructions and never
     accumulates notes, so the bound is the longer note template plus the
-    longest reason `rejection_reason` can return, charged at the byte bound
-    because a reason may quote non-ASCII model output.
+    longest reason `rejection_reason` can return. That reason is capped in
+    UTF-8 bytes, and no counter here charges more than one token per byte.
     """
     probe = GenerationRequest(
         model="probe", instructions="probe", input_text="probe", timeout_seconds=1
@@ -240,10 +235,10 @@ def correction_headroom(counter: TokenCounter) -> int:
         - counter.count(request.instructions)
         for request in (probe, structured)
     )
-    return max(template, 0) + MAX_REASON_CHARS * _MAX_BYTES_PER_CHARACTER
+    return max(template, 0) + MAX_REASON_BYTES
 
 
-RequestStage = Literal["direct", "leaf", "merge", "editorial"]
+RequestStage = Literal["direct", "leaf", "merge", "editorial", "compression"]
 
 
 class BudgetFailure(str, Enum):
@@ -336,6 +331,25 @@ class RequestBudget:
                 f"{pair} against an input capacity of {self.input_capacity}",
             )
 
+    @property
+    def request_capacity(self) -> int:
+        """What one whole assembled request may measure before a re-ask.
+
+        The input capacity plus the prompt, schema, fencing and evidence it
+        was reduced by, for stages that measure the request they assemble.
+        """
+        return self.input_capacity + self.overhead.total + self.evidence_tokens
+
+    def require_request(self, tokens: int) -> None:
+        """Refuse an assembled request whose measured size exceeds the budget."""
+        if tokens > self.request_capacity:
+            raise RequestBudgetError(
+                BudgetFailure.INPUT_EXCEEDS_CAPACITY,
+                self,
+                f"an assembled request of {tokens} tokens exceeds the request "
+                f"capacity of {self.request_capacity}",
+            )
+
 
 class RequestBudgetError(BudgetError):
     """A request cannot be sent at its budgeted size, with the arithmetic."""
@@ -404,6 +418,97 @@ def plan_request(
     return budget
 
 
+def measure_request_tokens(
+    request: GenerationRequest,
+    counter: TokenCounter,
+    *,
+    provider_schema_reserve: int = 0,
+) -> int:
+    """Measure an assembled request: instructions, input and compact schema."""
+    schema = (
+        counter.count(json.dumps(request.response_schema, separators=(",", ":")))
+        if request.response_schema is not None
+        else 0
+    )
+    return (
+        counter.count(request.instructions)
+        + counter.count(request.input_text)
+        + schema
+        + provider_schema_reserve
+    )
+
+
+# The chapter-comparison study's allowance (experiments/chapter_comparison):
+# three tokens per requested word leaves room for tokenization, JSON escaping
+# and the editorial prompt's permitted overshoot, plus a fixed envelope.
+_EDITORIAL_TOKENS_PER_TARGET_WORD = 3
+_EDITORIAL_ENVELOPE_TOKENS = 1_024
+
+
+def editorial_output_allowance(target_words: int, config: StrategyConfig) -> int:
+    """Return the editorial output allowance for a requested length.
+
+    Derived from the target rather than from the per-summary allowance, so a
+    long target is budgeted in full or refused, never cut short at transport.
+    """
+    return max(
+        config.max_output_tokens,
+        _EDITORIAL_TOKENS_PER_TARGET_WORD * target_words + _EDITORIAL_ENVELOPE_TOKENS,
+    )
+
+
+@dataclass(frozen=True)
+class RequestLimits:
+    """The run-wide terms every stage plans its request budget from."""
+
+    window: ContextWindow
+    config: StrategyConfig
+    counter: TokenCounter
+    correction_headroom: int
+
+    @classmethod
+    def from_report(
+        cls, report: BudgetReport, counter: TokenCounter, config: StrategyConfig
+    ) -> RequestLimits:
+        return cls(
+            window=ContextWindow(
+                tokens=report.context_window_tokens,
+                assumed=report.context_window_assumed,
+            ),
+            config=config,
+            counter=counter,
+            correction_headroom=report.correction_headroom_tokens,
+        )
+
+    def plan(
+        self,
+        stage: RequestStage,
+        *,
+        overhead: OverheadMeasurement,
+        output_allowance: int | None = None,
+        evidence: int = 0,
+        correctable: bool = True,
+    ) -> RequestBudget:
+        """Plan one request; the allowance defaults to the per-summary one.
+
+        `correctable` is false for a stage that is never re-asked, which
+        needs no room for a correction note.
+        """
+        return plan_request(
+            stage,
+            window=self.window,
+            overhead=overhead,
+            output_allowance=(
+                self.config.max_output_tokens
+                if output_allowance is None
+                else output_allowance
+            ),
+            correction_headroom=self.correction_headroom if correctable else 0,
+            config=self.config,
+            evidence=evidence,
+        )
+
+
 @dataclass(frozen=True)
 class BudgetReport:
     """Everything a strategy decision saw, and why it decided.
@@ -461,11 +566,7 @@ def select_strategy(
         window=window,
         overhead=overhead,
         output_allowance=config.max_output_tokens,
-        # Re-asks are not yet reserved anywhere in the pipeline, and charging
-        # them here alone would make preflight and merge sizing disagree with
-        # direct and leaf sizing. #106 charges `correction_headroom(counter)`
-        # at every stage together.
-        correction_headroom=0,
+        correction_headroom=correction_headroom(counter),
         config=config,
     )
     capacity = budget.input_capacity

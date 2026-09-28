@@ -15,6 +15,8 @@ from summarizer.audit import (
     serialize_audit,
     write_audit,
 )
+from summarizer.budget import ContextWindow, RequestLimits
+from summarizer.config import StrategyConfig
 from summarizer.direct import whole_document_segment
 from summarizer.grounding import GroundingPolicy
 from summarizer.hierarchy import TreeNode, build_hierarchy
@@ -232,7 +234,14 @@ def test_audit_records_merge_grounding_omissions_from_a_small_reserve() -> None:
         source_id=document.source_id,
         covered=tuple((segment.segment_id,) for segment in segments),
         attributable={segment.segment_id: segment.text for segment in segments},
-        usable_tokens=100_000,
+        limits=RequestLimits(
+            window=ContextWindow(tokens=100_001, assumed=False),
+            config=StrategyConfig(
+                max_output_tokens=1, safety_margin_tokens=0, safety_margin_fraction=0
+            ),
+            counter=CharacterCounter(),
+            correction_headroom=0,
+        ),
         model="m",
         timeout_seconds=30,
         max_merge_children=3,
@@ -318,7 +327,14 @@ def test_audit_records_merge_grounding_omissions_from_a_small_reserve() -> None:
         source_id=document.source_id,
         covered=tuple((segment.segment_id,) for segment in segments),
         attributable={segment.segment_id: segment.text for segment in segments},
-        usable_tokens=100_000,
+        limits=RequestLimits(
+            window=ContextWindow(tokens=100_001, assumed=False),
+            config=StrategyConfig(
+                max_output_tokens=1, safety_margin_tokens=0, safety_margin_fraction=0
+            ),
+            counter=CharacterCounter(),
+            correction_headroom=0,
+        ),
         model="m",
         timeout_seconds=30,
         max_merge_children=3,

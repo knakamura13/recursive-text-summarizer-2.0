@@ -1098,7 +1098,11 @@ def _request_pass_prefix(identifiers: Sequence[str]) -> str:
 
 
 def build_decomposition_request(
-    spans: Sequence[DraftSpan], *, source_id: str, runtime: VerificationRuntime
+    spans: Sequence[DraftSpan],
+    *,
+    source_id: str,
+    runtime: VerificationRuntime,
+    max_output_tokens: int | None = None,
 ) -> GenerationRequest:
     """Build one strict, source-fenced claim-anchor request."""
     if not source_id.strip() or not spans:
@@ -1133,6 +1137,7 @@ def build_decomposition_request(
         audit_work_id=VERIFICATION_AUDIT_WORK_ID,
         response_schema=_AnchorResponse.model_json_schema(),
         schema_name="verification_claim_anchors",
+        max_output_tokens=max_output_tokens,
     )
 
 
@@ -1144,6 +1149,7 @@ def build_classification_request(
     source_id: str,
     runtime: VerificationRuntime,
     tolerances: Mapping[str, LiteralTolerance] | None = None,
+    max_output_tokens: int | None = None,
 ) -> GenerationRequest:
     """Build one strict, source-fenced claim-evidence assessment request."""
     if not source_id.strip() or not claims:
@@ -1225,11 +1231,16 @@ def build_classification_request(
         audit_work_id=VERIFICATION_AUDIT_WORK_ID,
         response_schema=schema,
         schema_name="verification_claim_findings",
+        max_output_tokens=max_output_tokens,
     )
 
 
 def build_repair_request(
-    items: Sequence[RepairWorkItem], *, source_id: str, runtime: VerificationRuntime
+    items: Sequence[RepairWorkItem],
+    *,
+    source_id: str,
+    runtime: VerificationRuntime,
+    max_output_tokens: int | None = None,
 ) -> GenerationRequest:
     """Build a strict, source-fenced request for locally validated span repairs."""
     if not source_id.strip() or not items:
@@ -1279,6 +1290,7 @@ def build_repair_request(
         audit_work_id=VERIFICATION_AUDIT_WORK_ID,
         response_schema=_RepairResponse.model_json_schema(),
         schema_name="verification_repairs",
+        max_output_tokens=max_output_tokens,
     )
 
 
@@ -1639,12 +1651,12 @@ def verify_draft_once(
     progress.phase("Decomposing claims")
     spans = split_draft_spans(draft, pass_index=pass_index)
     def render_decomposition(items: tuple[DraftSpan, ...]) -> str:
-        request = build_decomposition_request(items, source_id=source_id, runtime=runtime)
+        request = build_decomposition_request(items, source_id=source_id, runtime=runtime, max_output_tokens=config.output_reserve_tokens)
         return f"{request.instructions}\n{request.input_text}"
 
     def measure_decomposition(items: tuple[DraftSpan, ...]) -> int:
         return _measure_request_tokens(
-            build_decomposition_request(items, source_id=source_id, runtime=runtime),
+            build_decomposition_request(items, source_id=source_id, runtime=runtime, max_output_tokens=config.output_reserve_tokens),
             runtime.counter,
         )
 
@@ -1673,7 +1685,7 @@ def verify_draft_once(
     decomposition_diagnostics: list[str] = []
     groups: list[dict[str, object]] = []
     for batch in decomposition_batches:
-        request = build_decomposition_request(batch, source_id=source_id, runtime=runtime)
+        request = build_decomposition_request(batch, source_id=source_id, runtime=runtime, max_output_tokens=config.output_reserve_tokens)
         for attempt in range(2):
             progress.raise_if_stopped("before claim decomposition")
             try:
@@ -1791,14 +1803,14 @@ def verify_draft_once(
             evidence={item[0].claim_id: item[1] for item in items},
             spans=span_texts,
             source_id=source_id,
-            runtime=runtime,
+            runtime=runtime, max_output_tokens=config.output_reserve_tokens,
         )
         return f"{request.instructions}\n{request.input_text}"
 
     def measure_classification(items: tuple[tuple[Claim, EvidenceBundle], ...]) -> int:
         return _measure_request_tokens(
             build_classification_request(
-                tuple(item[0] for item in items), evidence={item[0].claim_id: item[1] for item in items}, spans=span_texts, source_id=source_id, runtime=runtime
+                tuple(item[0] for item in items), evidence={item[0].claim_id: item[1] for item in items}, spans=span_texts, source_id=source_id, runtime=runtime, max_output_tokens=config.output_reserve_tokens
             ), runtime.counter
         )
 
@@ -1887,7 +1899,7 @@ def verify_draft_once(
             evidence={item[0].claim_id: item[1] for item in batch},
             spans=span_texts,
             source_id=source_id,
-            runtime=runtime,
+            runtime=runtime, max_output_tokens=config.output_reserve_tokens,
         )
         selected = {
             item[0].claim_id: {
@@ -2021,7 +2033,7 @@ def verify_draft_once(
                 evidence={claim.claim_id: escalation_bundle(items)},
                 spans=span_texts,
                 source_id=source_id,
-                runtime=runtime,
+                runtime=runtime, max_output_tokens=config.output_reserve_tokens,
             )
 
         try:
@@ -2047,7 +2059,7 @@ def verify_draft_once(
             extra_bundle = escalation_bundle(batch)
             request = build_classification_request(
                 (claim,), evidence={claim.claim_id: extra_bundle}, spans=span_texts,
-                source_id=source_id, runtime=runtime,
+                source_id=source_id, runtime=runtime, max_output_tokens=config.output_reserve_tokens,
             )
             selected = {
                 claim.claim_id: {
@@ -2179,7 +2191,7 @@ def verify_draft_once(
                 evidence={claim.claim_id: bundle},
                 spans=span_texts,
                 source_id=source_id,
-                runtime=runtime,
+                runtime=runtime, max_output_tokens=config.output_reserve_tokens,
                 tolerances={claim.claim_id: tolerance},
             )
 
@@ -2597,10 +2609,10 @@ def _verify_and_repair(
         batches = pack_work_items(
             tuple(items),
             render_request=lambda batch: build_repair_request(
-                batch, source_id=source_id, runtime=runtime
+                batch, source_id=source_id, runtime=runtime, max_output_tokens=config.output_reserve_tokens
             ).input_text,
             measure_request=lambda batch: _measure_request_tokens(
-                build_repair_request(batch, source_id=source_id, runtime=runtime),
+                build_repair_request(batch, source_id=source_id, runtime=runtime, max_output_tokens=config.output_reserve_tokens),
                 runtime.counter,
             ),
             runtime=runtime,
@@ -2669,7 +2681,7 @@ def _verify_and_repair(
             progress.raise_if_stopped("before repair")
             try:
                 generation = runtime.provider.generate(
-                    build_repair_request(batch, source_id=source_id, runtime=runtime)
+                    build_repair_request(batch, source_id=source_id, runtime=runtime, max_output_tokens=config.output_reserve_tokens)
                 )
             except (ProviderError, VerificationResponseError):
                 return repair_failure("repair_provider_failed", attempted=True)

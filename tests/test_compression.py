@@ -196,3 +196,64 @@ def test_a_rounded_number_is_not_treated_as_omitted() -> None:
     shortened = "They built a stunning nearly 1000 foot skyscraper beside the river."
 
     assert retain_sentences_with_omitted_numbers(source, shortened) == shortened
+
+
+def test_an_unpunctuated_run_is_sent_in_bounded_chunks_with_their_allowances() -> None:
+    """One long "sentence" would otherwise be a single request of any size."""
+    from summarizer.budget import ContextWindow, RequestLimits
+    from summarizer.compression import CHUNK_CHAR_LIMIT, compression_work_ids_for_text
+    from summarizer.config import StrategyConfig
+
+    class CharacterCounter:
+        identity = "test:characters"
+        exact = True
+        monotonic = True
+
+        def count(self, text: str) -> int:
+            return len(text)
+
+    class Recording:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def generate(self, request):
+            self.requests.append(request)
+            chunk = request.input_text.split("\n", 1)[1].rsplit("\n", 1)[0]
+            words = chunk.split()
+            text = " ".join(words[: int(len(words) * RETENTION_RATIO)])
+            return GenerationResult(
+                text=f'{{"text": "{text}"}}', provider="fake", model=request.model
+            )
+
+    source = "alpha " * 1_000
+    provider = Recording()
+    compress_to_target(
+        source,
+        provider,
+        source_id="a" * 64,
+        model="m",
+        timeout_seconds=30,
+        target_words=600,
+        limits=RequestLimits(
+            window=ContextWindow(tokens=8_192, assumed=False),
+            config=StrategyConfig(),
+            counter=CharacterCounter(),
+            correction_headroom=0,
+        ),
+    )
+
+    chunks = [
+        request.input_text.split("\n", 1)[1].rsplit("\n", 1)[0]
+        for request in provider.requests
+    ]
+    first_pass = [
+        chunk
+        for request, chunk in zip(provider.requests, chunks)
+        if request.operation_id.startswith("compression:C01")
+    ]
+    assert len(first_pass) == len(compression_work_ids_for_text(source, max_passes=1))
+    assert " ".join(first_pass).split() == source.split()
+    assert all(len(chunk) <= CHUNK_CHAR_LIMIT for chunk in chunks)
+    assert [request.max_output_tokens for request in provider.requests] == [
+        len(chunk) + 64 for chunk in chunks
+    ]
