@@ -2,6 +2,10 @@
 
 Corpus and generated content remain in the artifact root outside the repository.
 Run --phase pilot first; freeze changes before --phase validation.
+
+The d5 phases run this repository's working tree, not a pinned checkout.
+``d5-replay`` feeds saved failing trials' segments and leaves to the current
+merge stage without regenerating leaves; ``d5-e2e`` runs one fresh case.
 """
 from __future__ import annotations
 
@@ -45,16 +49,38 @@ def verify_environment() -> None:
             raise RuntimeError(f"{name} checkout has tracked or untracked changes: {status[:200]}")
 
 
-def cases(phase: str):
-    documents = {
-        "pilot": ["nvc"],
-        "pilot-retry": ["nvc"],
-        "baseline": ["atomic_habits", "nvc", "isl"],
-        "baseline-retry": ["atomic_habits", "nvc", "isl"],
-        "validation": ["gathering", "all_statistics", "transcript", "news"],
-    }[phase]
-    seeds = MANIFEST["seeds"] if phase.startswith("baseline") else MANIFEST["seeds"][:1]
-    sources = []
+# One working-tree case: document, target (a fraction of the source's words, or
+# an absolute word count for a non-manifest source), seed, the saved phase whose
+# merge inputs are replayed (None runs fresh), strategy and context window.
+# Replay requires the hierarchical strategy, the only path that uses saved leaves.
+D5_CASES = {
+    "d5-replay": (
+        ("gathering", 0.25, 101, "validation", "hierarchical", 32_768),
+        ("isl", 0.25, 101, "baseline-retry", "hierarchical", 32_768),
+        ("isl", 0.5, 101, "baseline-retry", "hierarchical", 32_768),
+        ("transcript", 0.25, 101, "validation", "hierarchical", 32_768),
+        # That trial stopped before any leaf, so it runs fresh.
+        ("transcript", 0.5, 101, None, "auto", 32_768),
+    ),
+    # Diagnostics for a hierarchical publication. Only the first two keep the
+    # study's 32,768 context and automatic strategy; Snow Fall routes direct on
+    # its own, so its hierarchical cases are forced.
+    "d5-e2e": (
+        ("gathering", 0.1, 101, None, "auto", 32_768),
+        ("snowfall", 300, 101, None, "auto", 32_768),
+        ("snowfall", 300, 101, None, "hierarchical", 32_768),
+        ("gathering", 0.1, 101, None, "hierarchical", 65_536),
+        ("snowfall", 300, 101, None, "hierarchical", 65_536),
+    ),
+}
+PHASES = ("pilot", "pilot-retry", "baseline", "baseline-retry", "validation", *D5_CASES)
+# Sources outside the manifest; they are repository sample documents.
+EXTRA_SOURCES = {
+    "snowfall": HERE.parents[1] / "sample-documents" / "article_Snow Fall The Avalanche at Tunnel Creek by John Branch.txt",
+}
+
+
+def _sources(documents):
     for document in documents:
         source = ROOT / "corpus" / f"{document}.txt"
         if not source.is_file():
@@ -72,29 +98,70 @@ def cases(phase: str):
             raise RuntimeError(f"canonical source changed for {document}: {words} words, {actual_hash}")
         if words == 0:
             raise ValueError(f"empty source: {source}")
-        sources.append((document, source, words))
+        yield document, source, words
+
+
+def _saved_trial(saved_phase: str, document: str, fraction: float, seed: int) -> Path:
+    label = f"{document}-{int(fraction * 100)}-seed{seed}-current"
+    trials = sorted((ROOT / "runs" / saved_phase / label).glob("current-*"))
+    if len(trials) != 1:
+        raise RuntimeError(f"expected one saved trial under {saved_phase}/{label}, found {len(trials)}")
+    return trials[0]
+
+
+def cases(phase: str):
+    if phase in D5_CASES:
+        documents = sorted({case[0] for case in D5_CASES[phase]})
+        sources = {document: (source, words) for document, source, words in _sources(
+            [document for document in documents if document not in EXTRA_SOURCES])}
+        for document in documents:
+            if document in EXTRA_SOURCES:
+                path = EXTRA_SOURCES[document]
+                sources[document] = (path, len(path.read_text(encoding="utf-8").split()))
+        for document, amount, seed, saved_phase, strategy, num_ctx in D5_CASES[phase]:
+            source, words = sources[document]
+            fraction = amount if isinstance(amount, float) else None
+            target = round(words * amount) if fraction is not None else amount
+            replay = None if saved_phase is None else _saved_trial(saved_phase, document, fraction, seed)
+            yield document, source, words, fraction, target, seed, "worktree", replay, strategy, num_ctx
+        return
+    documents = {
+        "pilot": ["nvc"],
+        "pilot-retry": ["nvc"],
+        "baseline": ["atomic_habits", "nvc", "isl"],
+        "baseline-retry": ["atomic_habits", "nvc", "isl"],
+        "validation": ["gathering", "all_statistics", "transcript", "news"],
+    }[phase]
+    seeds = MANIFEST["seeds"] if phase.startswith("baseline") else MANIFEST["seeds"][:1]
+    sources = list(_sources(documents))
     # Finish every document and length at one seed before beginning the next trial.
     for seed in seeds:
         for document, source, words in sources:
             for fraction in MANIFEST["target_fractions"]:
                 target = round(words * fraction)
                 for version in MANIFEST["versions"]:
-                    yield document, source, words, fraction, target, seed, version
+                    yield document, source, words, fraction, target, seed, version, None, "auto", 32_768
 
 
-def run_one(phase: str, document: str, source: Path, words: int, fraction: float, target: int, seed: int, version: str) -> dict:
-    label = f"{document}-{int(fraction * 100)}-seed{seed}-{version}"
+def run_one(phase: str, document: str, source: Path, words: int, fraction: float | None, target: int, seed: int,
+            version: str, replay_from: Path | None, strategy: str, num_ctx: int) -> dict:
+    amount = f"{int(fraction * 100)}" if fraction is not None else f"{target}"
+    label = f"{document}-{amount}-seed{seed}-{version}"
+    if strategy != "auto":
+        label += f"-{strategy}"
+    if num_ctx != 32_768:
+        label += f"-ctx{num_ctx}"
     run_dir = ROOT / "runs" / phase / label
     if run_dir.exists():
         raise FileExistsError(f"independent trial already exists: {run_dir}")
     run_dir.mkdir(parents=True)
     trace_dir = run_dir / "trace"
-    proxy = subprocess.Popen(
-        [sys.executable, str(HERE / "capture_proxy.py"), "--seed", str(seed),
-         "--max-output-tokens", str(max(2048, 3 * target + 1024)),
-         "--trace-dir", str(trace_dir)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
+    proxy_command = [sys.executable, str(HERE / "capture_proxy.py"), "--seed", str(seed),
+                     "--trace-dir", str(trace_dir), "--num-ctx", str(num_ctx)]
+    if version != "worktree":
+        # Pinned revisions keep the frozen protocol allowance where they send none.
+        proxy_command.extend(["--max-output-tokens", str(max(2048, 3 * target + 1024))])
+    proxy = subprocess.Popen(proxy_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     started = time.time()
     try:
         assert proxy.stdout is not None
@@ -107,13 +174,22 @@ def run_one(phase: str, document: str, source: Path, words: int, fraction: float
                    "--ollama-url" if version == "legacy" else "--proxy-url", proxy_url]
         if version != "legacy":
             command.extend(["--version", version])
+        if replay_from is not None:
+            command.extend(["--replay-from", str(replay_from)])
+        if strategy != "auto":
+            command.extend(["--strategy", strategy])
+        if num_ctx != 32_768:
+            command.extend(["--context-window", str(num_ctx)])
         with (run_dir / "runner.stdout").open("w", encoding="utf-8") as out, (run_dir / "runner.stderr").open("w", encoding="utf-8") as err:
             result = subprocess.run(command, stdout=out, stderr=err, check=False)
+        run = next((json.loads(path.read_text(encoding="utf-8")) for path in run_dir.glob("*/run.json")), {})
         record = {"label": label, "phase": phase, "version": version,
-                  "revision": MANIFEST["versions"][version], "source": document,
+                  "revision": MANIFEST["versions"].get(version, run.get("revision")), "source": document,
                   "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(), "source_words": words,
                   "target_fraction": fraction, "target_words": target, "seed": seed,
-                  "max_output_tokens": max(2048, 3 * target + 1024),
+                  "strategy": strategy, "num_ctx": num_ctx,
+                  "max_output_tokens": run.get("max_output_tokens", max(2048, 3 * target + 1024)),
+                  "replay_from": None if replay_from is None else str(replay_from),
                   "exit_code": result.returncode, "elapsed_seconds": time.time() - started,
                   "trace_count": len(list(trace_dir.glob("request-*.json")))}
         (run_dir / "trial.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
@@ -129,9 +205,9 @@ def run_one(phase: str, document: str, source: Path, words: int, fraction: float
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("pilot", "pilot-retry", "baseline", "baseline-retry", "validation"), required=True)
-    parser.add_argument("--document", choices=MANIFEST["sources"], help="restrict to one document")
-    parser.add_argument("--version", choices=MANIFEST["versions"], help="restrict to one version")
+    parser.add_argument("--phase", choices=PHASES, required=True)
+    parser.add_argument("--document", choices=(*MANIFEST["sources"], *EXTRA_SOURCES), help="restrict to one document")
+    parser.add_argument("--version", choices=(*MANIFEST["versions"], "worktree"), help="restrict to one version")
     parser.add_argument("--seed", type=int, help="restrict to one seed")
     args = parser.parse_args()
     verify_environment()

@@ -2,11 +2,18 @@
 
 The parent process only orchestrates local files. Model traffic goes exclusively
 through the caller-supplied capture proxy.
+
+``--version worktree`` runs this repository's checkout instead of a pinned
+one, with the pipeline's own default request allowances. ``--replay-from``
+points at a saved trial directory: its cached segmentation and leaf summaries
+are fed to the merge stage unchanged, so no leaf is regenerated. Replay requires
+``--strategy hierarchical``, the only path that uses saved leaves.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -18,9 +25,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 _CHECKOUTS = {
     "pre_experiments": (Path("/private/tmp/rts-study-20260926/checkouts/pre_experiments"), "c41febc"),
     "current": (Path("/private/tmp/rts-study-20260926/checkouts/current"), "9d31e4e"),
+    # Revision is read at run time; the working tree may be ahead of any pin.
+    "worktree": (_REPO_ROOT, None),
 }
 _MODEL = "gemma4:latest"
 _MODEL_DIGEST = "c6eb396dbd5992bbe3f5cdb947e8bbc0ee413d7c17e2beaae69f5d569cf982eb"
@@ -31,6 +41,10 @@ def _output_allowance(target_words: int) -> int:
     return max(2_048, math.ceil(3 * target_words) + 1_024)
 
 
+def _git(checkout: Path, *arguments: str) -> str:
+    return subprocess.check_output(["git", *arguments], cwd=checkout, text=True).strip()
+
+
 def run_case(
     version: str,
     source: str | Path,
@@ -38,6 +52,9 @@ def run_case(
     seed: int,
     output_dir: str | Path,
     proxy_url: str,
+    replay_from: str | Path | None = None,
+    strategy: str = "auto",
+    context_window: int = _CONTEXT_WINDOW,
 ) -> dict[str, Any]:
     """Execute one case; all artifacts are written beneath ``output_dir``.
 
@@ -46,7 +63,7 @@ def run_case(
     independent, even if the caller reuses an output root.
     """
     if version not in _CHECKOUTS:
-        raise ValueError("version must be 'pre_experiments' or 'current'")
+        raise ValueError("version must be one of: " + ", ".join(_CHECKOUTS))
     if not isinstance(target, int) or isinstance(target, bool) or target <= 0:
         raise ValueError("target must be a positive integer")
     if not isinstance(seed, int) or isinstance(seed, bool):
@@ -59,6 +76,28 @@ def run_case(
     checkout, revision = _CHECKOUTS[version]
     if not checkout.is_dir():
         raise FileNotFoundError(f"pinned checkout does not exist: {checkout}")
+    worktree_dirty = None
+    harness_sha256 = None
+    if revision is None:
+        revision = _git(checkout, "rev-parse", "HEAD")
+        # The harness builds the run's configuration and replay substitution, so
+        # its edits decide behavior as much as the summarizer package does.
+        worktree_dirty = bool(_git(
+            checkout, "status", "--porcelain=v1", "--", "summarizer", "experiments/chapter_comparison"
+        ))
+        harness_sha256 = {
+            name: hashlib.sha256((Path(__file__).resolve().parent / name).read_bytes()).hexdigest()
+            for name in ("run_modern.py", "capture_proxy.py", "run_study.py")
+        }
+    if replay_from is not None and strategy != "hierarchical":
+        # Saved leaves only feed the merge stage; a direct run would summarize
+        # the whole source afresh while claiming a replay.
+        raise ValueError("--replay-from requires --strategy hierarchical")
+    replay_path = None
+    if replay_from is not None:
+        replay_path = Path(replay_from).expanduser().resolve(strict=True)
+        if not any(replay_path.glob("cache/objects/*/*.json")):
+            raise ValueError(f"replay directory has no saved cache objects: {replay_path}")
 
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -67,6 +106,8 @@ def run_case(
     request = {
         "version": version,
         "revision": revision,
+        "worktree_dirty": worktree_dirty,
+        "harness_sha256": harness_sha256,
         "checkout": str(checkout),
         "source": str(source_path),
         "target_words": target,
@@ -74,8 +115,12 @@ def run_case(
         "proxy_url": proxy_url,
         "model": _MODEL,
         "model_digest": _MODEL_DIGEST,
-        "context_window": _CONTEXT_WINDOW,
-        "max_output_tokens": _output_allowance(target),
+        "context_window": context_window,
+        # Pinned revisions reserve the protocol allowance on every request. The
+        # working tree budgets each stage itself, so it keeps its defaults.
+        "max_output_tokens": None if version == "worktree" else _output_allowance(target),
+        "replay_from": None if replay_path is None else str(replay_path),
+        "strategy": strategy,
         "trial_dir": str(trial),
     }
     config_path = trial / "worker_config.json"
@@ -119,6 +164,77 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _published_sentence_words(audit_path: Path) -> int | None:
+    """Words in the audited published sentences, excluding any notice line."""
+    try:
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    sentences = (audit.get("publication") or {}).get("sentences") or []
+    return sum(len(str(sentence.get("text", "")).split()) for sentence in sentences)
+
+
+def _saved_merge_inputs(
+    replay_dir: Path, document: Any, counter: Any
+) -> tuple[list[Any], tuple[Any, ...]]:
+    """Load a saved trial's segments and leaves, revalidated against ``document``.
+
+    Every envelope used must match its recorded payload digest. The segmentation
+    passes the same strict checks the cached-segmentation decoder applies, under
+    the token counter and segment budget it was made with. Every leaf must pass
+    the current leaf provenance check for its segment.
+    """
+    from summarizer.cache import _canonical_json
+    from summarizer.leaf import core_text, validate_provenance
+    from summarizer.segmentation import BoundaryKind, SourceSegment, _validate_segments
+    from summarizer.summaries import SummaryNode
+
+    envelopes = []
+    for path in sorted(replay_dir.glob("cache/objects/*/*.json")):
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+        if envelope["descriptor"]["stage"] not in ("segmentation", "leaf"):
+            continue
+        digest = hashlib.sha256(_canonical_json(envelope["payload"])).hexdigest()
+        if digest != envelope.get("payload_sha256"):
+            raise ValueError(f"saved cache object {path.name} does not match its payload digest")
+        envelopes.append(envelope)
+    segmentations = [item for item in envelopes if item["descriptor"]["stage"] == "segmentation"]
+    if len(segmentations) != 1:
+        raise ValueError(f"expected one saved segmentation, found {len(segmentations)}")
+    descriptor = segmentations[0]["descriptor"]
+    if descriptor.get("counter_identity") != counter.identity:
+        raise ValueError(
+            f"saved segmentation used counter {descriptor.get('counter_identity')}, not {counter.identity}"
+        )
+    segments = [
+        SourceSegment(**{**item, "boundary_kind": BoundaryKind(item["boundary_kind"])})
+        for item in segmentations[0]["payload"]
+    ]
+    _validate_segments(
+        document,
+        segments,
+        counter,
+        descriptor["behavior"]["segmentation"]["max_tokens"],
+        strict_cached=True,
+    )
+    leaf_envelopes = [item for item in envelopes if item["descriptor"]["stage"] == "leaf"]
+    saved = {item["descriptor"]["work_id"]: item["payload"] for item in leaf_envelopes}
+    if len(saved) != len(leaf_envelopes):
+        raise ValueError("saved leaves repeat a segment")
+    if set(saved) != {segment.segment_id for segment in segments}:
+        raise ValueError(
+            f"saved leaves cover {len(saved)} of {len(segments)} segments; replay needs all of them"
+        )
+    leaves = []
+    for segment in segments:
+        node = SummaryNode.model_validate(saved[segment.segment_id])
+        validate_provenance(
+            node, legal={segment.segment_id: core_text(segment)}, subject=segment.segment_id
+        )
+        leaves.append(node)
+    return segments, tuple(leaves)
+
+
 def _worker(config_path: Path) -> int:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     trial = Path(config["trial_dir"])
@@ -128,11 +244,14 @@ def _worker(config_path: Path) -> int:
     sys.path.insert(0, str(checkout))
     event_path = trial / "stages.jsonl"
     event_stream = event_path.open("w", encoding="utf-8", buffering=1)
+    metadata: dict[str, Any] = {**config, "status": "running", "stages_log": str(event_path)}
 
     def record(kind: str, event: Any) -> None:
-        event_stream.write(json.dumps({"kind": kind, "event": _jsonable(event)}, default=str) + "\n")
+        value = _jsonable(event)
+        if kind == "stage":
+            metadata["terminal_stage"] = {"stage": value.get("stage"), "state": value.get("state")}
+        event_stream.write(json.dumps({"kind": kind, "event": value}, default=str) + "\n")
 
-    metadata: dict[str, Any] = {**config, "status": "running", "stages_log": str(event_path)}
     (trial / "run.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     try:
         from summarizer.budget import select_strategy
@@ -158,12 +277,17 @@ def _worker(config_path: Path) -> int:
             timeout_seconds=600,
         )
         strategy = StrategyConfig(
-            strategy="auto",
+            strategy=config.get("strategy", "auto"),
             context_window=config["context_window"],
-            max_output_tokens=config["max_output_tokens"],
             safety_margin_tokens=256,
             safety_margin_fraction=0.02,
+            **(
+                {}
+                if config["max_output_tokens"] is None
+                else {"max_output_tokens": config["max_output_tokens"]}
+            ),
         )
+        metadata["max_output_tokens"] = strategy.max_output_tokens
         pipeline = PipelineConfig(
             target_words=config["target_words"],
             include_citations=True,
@@ -178,6 +302,20 @@ def _worker(config_path: Path) -> int:
         )
         source_document = read_source(source)
         counter = resolve_token_counter(provider="ollama", model=config["model"])
+        if config.get("replay_from"):
+            import summarizer.pipeline as pipeline_module
+
+            saved_segments, saved_leaves = _saved_merge_inputs(
+                Path(config["replay_from"]), source_document, counter
+            )
+            # Only the leaf inputs are substituted; merge onwards is unchanged.
+            # The count is recorded when the pipeline actually takes the leaves.
+            def replayed_leaves(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+                metadata["replayed_leaves"] = len(saved_leaves)
+                return saved_leaves
+
+            pipeline_module.cached_segment_document = lambda *_args, **_kwargs: saved_segments
+            pipeline_module.summarize_segments = replayed_leaves
         provider = OllamaProvider(host=config["proxy_url"])
         selected_context = provider.configure_context_window(
             config["model"], strategy.context_window, timeout_seconds=app.timeout_seconds
@@ -220,6 +358,7 @@ def _worker(config_path: Path) -> int:
             "selected_strategy": result.strategy.strategy,
             "strategy_report": _jsonable(result.strategy),
             "word_count": len(result.final.text.split()),
+            "published_sentence_words": _published_sentence_words(audit_path),
             "verification_enabled": pipeline.verification.enabled,
             "audit_path": str(audit_path),
             "cache_path": str(cache_path),
@@ -227,9 +366,13 @@ def _worker(config_path: Path) -> int:
         })
         return_code = 0
     except Exception as error:
+        failure = getattr(error, "failure", None)
+        budget = getattr(error, "budget", None)
         metadata.update({
             "status": "failed",
             "failure": f"{type(error).__name__}: {error}",
+            "failure_class": None if failure is None else failure.value,
+            "failure_stage": None if budget is None else getattr(budget.stage, "value", str(budget.stage)),
             "traceback": traceback.format_exc(),
             "audit_path": str(trial / "audit.json"),
             "cache_path": str(trial / "cache"),
@@ -250,6 +393,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--proxy-url")
+    parser.add_argument("--replay-from", type=Path, help="saved trial directory whose segments and leaves feed the merge stage")
+    parser.add_argument("--strategy", choices=("auto", "direct", "hierarchical"), default="auto")
+    parser.add_argument("--context-window", type=int, default=_CONTEXT_WINDOW, help="must match the proxy's --num-ctx; the proxy refuses a mismatch")
     parser.add_argument("--_worker", type=Path, help=argparse.SUPPRESS)
     return parser
 
@@ -262,7 +408,10 @@ def main(argv: list[str] | None = None) -> int:
     if missing:
         _parser().error("required arguments missing: " + ", ".join("--" + name.replace("_", "-") for name in missing))
     try:
-        result = run_case(args.version, args.source, args.target, args.seed, args.output_dir, args.proxy_url)
+        result = run_case(
+            args.version, args.source, args.target, args.seed, args.output_dir, args.proxy_url,
+            replay_from=args.replay_from, strategy=args.strategy, context_window=args.context_window,
+        )
     except Exception as error:
         print(f"Modern experiment failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
