@@ -73,7 +73,7 @@ class VerificationConfig:
     enabled: bool = False
     evidence_tokens: int = 4096
     request_tokens: int = 8192
-    output_reserve_tokens: int = 1024
+    output_reserve_tokens: int = 4096
     safety_margin_tokens: int = 256
     max_repair_passes: int = 1
     strict_numbers: bool = False

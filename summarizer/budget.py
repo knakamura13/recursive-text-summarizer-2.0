@@ -549,6 +549,15 @@ def select_strategy(
     window = resolve_context_window(
         provider=provider, model=model, explicit=config.context_window
     )
+    if config.strategy == "direct" and window.assumed:
+        raise BudgetError(
+            f"direct summarization was requested but the context window for "
+            f"model {model!r} is not known, so a fit cannot be established; "
+            f"pass an explicit context window to proceed. This matters most "
+            f"on a provider that truncates an oversized prompt silently "
+            f"rather than rejecting it."
+        )
+
     # A direct request carries no overlap. A stage that sends overlap-carrying
     # requests must measure its own overhead: the overlap variant is about 120
     # tokens larger, and sizing against this figure would under-reserve.
@@ -577,15 +586,6 @@ def select_strategy(
         config.max_direct_tokens is not None
         and document_tokens > config.max_direct_tokens
     )
-
-    if config.strategy == "direct" and window.assumed:
-        raise BudgetError(
-            f"direct summarization was requested but the context window for "
-            f"model {model!r} is not known, so a fit cannot be established; "
-            f"pass an explicit context window to proceed. This matters most "
-            f"on a provider that truncates an oversized prompt silently "
-            f"rather than rejecting it."
-        )
 
     if config.strategy == "direct":
         budget.require_input(document_tokens)

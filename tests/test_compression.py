@@ -199,7 +199,7 @@ def test_a_rounded_number_is_not_treated_as_omitted() -> None:
 
 
 def test_an_unpunctuated_run_is_sent_in_bounded_chunks_with_their_allowances() -> None:
-    """One long "sentence" would otherwise be a single request of any size."""
+    """One long "sentence" or unspaced run would otherwise be one request of any size."""
     from summarizer.budget import ContextWindow, RequestLimits
     from summarizer.compression import CHUNK_CHAR_LIMIT, compression_work_ids_for_text
     from summarizer.config import StrategyConfig
@@ -220,12 +220,12 @@ def test_an_unpunctuated_run_is_sent_in_bounded_chunks_with_their_allowances() -
             self.requests.append(request)
             chunk = request.input_text.split("\n", 1)[1].rsplit("\n", 1)[0]
             words = chunk.split()
-            text = " ".join(words[: int(len(words) * RETENTION_RATIO)])
+            text = " ".join(words[: max(1, int(len(words) * RETENTION_RATIO))])
             return GenerationResult(
                 text=f'{{"text": "{text}"}}', provider="fake", model=request.model
             )
 
-    source = "alpha " * 1_000
+    source = "alpha " * 1_000 + "\u5b57" * 2_500
     provider = Recording()
     compress_to_target(
         source,
@@ -252,7 +252,7 @@ def test_an_unpunctuated_run_is_sent_in_bounded_chunks_with_their_allowances() -
         if request.operation_id.startswith("compression:C01")
     ]
     assert len(first_pass) == len(compression_work_ids_for_text(source, max_passes=1))
-    assert " ".join(first_pass).split() == source.split()
+    assert "".join("".join(first_pass).split()) == "".join(source.split())
     assert all(len(chunk) <= CHUNK_CHAR_LIMIT for chunk in chunks)
     assert [request.max_output_tokens for request in provider.requests] == [
         len(chunk) + 64 for chunk in chunks

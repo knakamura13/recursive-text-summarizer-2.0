@@ -385,7 +385,10 @@ def _budget_notice(error: Exception, config: RunConfig, *, assumed: bool) -> Not
     text = str(error).strip().rstrip(".")
     message = f"{text[:1].upper()}{text[1:]}."
     if isinstance(error, RequestBudgetError) and error.budget.stage == "editorial":
-        hint = "Set a larger context window or choose fewer target words."
+        hint = (
+            "Set a larger context window, or choose fewer target words or lower max "
+            "output tokens, whichever sets the editorial allowance."
+        )
     elif config.strategy == "direct":
         hint = "Choose the Auto or Hierarchical strategy, or set a larger context window."
     elif config.chunk_tokens is not None:

@@ -416,7 +416,8 @@ def _compression_chunks(text: str) -> list[str]:
     """Sentence chunks, with any chunk over the limit split between words.
 
     A sentence longer than the limit would otherwise be sent as one request
-    of unbounded size, which its request budget would have to refuse.
+    of unbounded size, which its request budget would have to refuse. A word
+    longer than the limit, as in unspaced scripts, is cut into slices.
     """
     chunks: list[str] = []
     for chunk in chunk_text_by_sentences(text, CHUNK_CHAR_LIMIT):
@@ -425,11 +426,13 @@ def _compression_chunks(text: str) -> list[str]:
             continue
         current = ""
         for word in chunk.split():
-            if current and len(current) + 1 + len(word) > CHUNK_CHAR_LIMIT:
-                chunks.append(current)
-                current = word
-            else:
-                current = f"{current} {word}" if current else word
+            for start in range(0, len(word), CHUNK_CHAR_LIMIT):
+                piece = word[start : start + CHUNK_CHAR_LIMIT]
+                if current and len(current) + 1 + len(piece) > CHUNK_CHAR_LIMIT:
+                    chunks.append(current)
+                    current = piece
+                else:
+                    current = f"{current} {piece}" if current else piece
         if current:
             chunks.append(current)
     return chunks

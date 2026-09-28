@@ -127,7 +127,7 @@ class StrategyConfig:
 
     strategy: StrategyName = "auto"
     context_window: int | None = None
-    max_output_tokens: int = 1_024
+    max_output_tokens: int = 4_096
     safety_margin_tokens: int = 256
     safety_margin_fraction: float = 0.02
     # Unset means capacity alone decides. A cap exists because a window-only

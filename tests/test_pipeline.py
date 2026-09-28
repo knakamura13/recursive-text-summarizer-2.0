@@ -177,7 +177,9 @@ def test_ollama_merge_uses_request_budget_not_leaf_capacity() -> None:
         model="qwen3.5:9b",
         ollama_host="http://localhost:11434",
     )
-    strategy = StrategyConfig(strategy="hierarchical", context_window=10_000)
+    strategy = StrategyConfig(
+        strategy="hierarchical", context_window=10_000, max_output_tokens=1_024
+    )
     provider = GroundedPipelineProvider()
 
     result = run_pipeline(
@@ -193,6 +195,7 @@ def test_ollama_merge_uses_request_budget_not_leaf_capacity() -> None:
         result.strategy.context_window_tokens
         - result.strategy.reserved_output_tokens
         - result.strategy.safety_margin_tokens
+        - result.strategy.correction_headroom_tokens
     )
     merge_requests = [
         request

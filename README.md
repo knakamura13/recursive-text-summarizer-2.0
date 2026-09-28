@@ -105,7 +105,7 @@ Run `python main.py --help` for parser-generated help. The complete options are:
 | `--max-retries N`                       | `5`                      | Maximum attempts for retryable provider failures.                                                                                      |
 | `--strategy {auto,direct,hierarchical}` | `auto`                   | Execution strategy.                                                                                                                    |
 | `--context-window TOKENS`               | unset                    | Explicit total context window; otherwise use the model table/assumed value.                                                            |
-| `--max-output-tokens TOKENS`            | `1024`                   | Output allowance for each direct, leaf, and merge summary request.                                                                     |
+| `--max-output-tokens TOKENS`            | `4096`                   | Output allowance for each direct, leaf, and merge summary request.                                                                     |
 | `--safety-margin-tokens TOKENS`         | `256`                    | Fixed budget safety floor.                                                                                                             |
 | `--safety-margin-fraction FRACTION`     | `0.02`                   | Fractional safety margin; the larger margin applies.                                                                                   |
 | `--max-direct-tokens TOKENS`            | unset                    | Optional direct-path cap used by `auto`.                                                                                               |
