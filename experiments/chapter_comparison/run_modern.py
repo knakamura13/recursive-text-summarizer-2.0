@@ -187,6 +187,7 @@ def _saved_merge_inputs(
     from summarizer.cache import _canonical_json
     from summarizer.leaf import core_text, validate_provenance
     from summarizer.segmentation import BoundaryKind, SourceSegment, _validate_segments
+    from summarizer.tokenization import ConservativeUtf8TokenCounter
     from summarizer.summaries import SummaryNode
 
     envelopes = []
@@ -202,10 +203,18 @@ def _saved_merge_inputs(
     if len(segmentations) != 1:
         raise ValueError(f"expected one saved segmentation, found {len(segmentations)}")
     descriptor = segmentations[0]["descriptor"]
-    if descriptor.get("counter_identity") != counter.identity:
-        raise ValueError(
-            f"saved segmentation used counter {descriptor.get('counter_identity')}, not {counter.identity}"
-        )
+    # The segmentation is checked under the counter that made it; the merge
+    # stage onwards uses the current counter.
+    saved_counter = next(
+        (
+            candidate
+            for candidate in (counter, ConservativeUtf8TokenCounter())
+            if candidate.identity == descriptor.get("counter_identity")
+        ),
+        None,
+    )
+    if saved_counter is None:
+        raise ValueError(f"saved segmentation used unavailable counter {descriptor.get('counter_identity')}")
     segments = [
         SourceSegment(**{**item, "boundary_kind": BoundaryKind(item["boundary_kind"])})
         for item in segmentations[0]["payload"]
@@ -213,7 +222,7 @@ def _saved_merge_inputs(
     _validate_segments(
         document,
         segments,
-        counter,
+        saved_counter,
         descriptor["behavior"]["segmentation"]["max_tokens"],
         strict_cached=True,
     )
@@ -301,7 +310,9 @@ def _worker(config_path: Path) -> int:
             ),
         )
         source_document = read_source(source)
-        counter = resolve_token_counter(provider="ollama", model=config["model"])
+        counter = resolve_token_counter(
+            provider="ollama", model=config["model"], ollama_host=config["proxy_url"]
+        )
         if config.get("replay_from"):
             import summarizer.pipeline as pipeline_module
 

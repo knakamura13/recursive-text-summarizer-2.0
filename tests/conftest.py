@@ -44,3 +44,12 @@ def disable_network_access(
     monkeypatch.setattr(socket, "create_connection", deny_network_access)
     monkeypatch.setattr(socket.socket, "connect", deny_network_access)
     yield
+
+
+@pytest.fixture(autouse=True)
+def isolate_ollama_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    # Counter resolution reads the local Ollama model store; keep it empty so
+    # results never depend on the models installed on this machine.
+    monkeypatch.setenv("OLLAMA_MODELS", str(tmp_path_factory.mktemp("ollama-models")))

@@ -150,7 +150,7 @@ def run_preflight(payload: dict[str, Any]) -> PreflightResponse:
     if source == "model":
         strategy = replace(strategy, context_window=window)
     assumed = source == "assumed"
-    counter = resolve_token_counter(provider="ollama", model=model)
+    counter = resolve_token_counter(provider="ollama", model=model, ollama_host=host)
     response = PreflightResponse(
         ok=False,
         context_window_tokens=resolve_context_window(
