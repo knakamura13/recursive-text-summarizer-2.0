@@ -162,7 +162,8 @@ def _trace_summary(trial_dir: Path) -> dict[str, Any]:
 def _audit_summary(path: Path) -> dict[str, Any]:
     audit = read_json(path)
     if audit is None:
-        return {"audit_present": path.exists(), "audit_valid": False, "audit_truncated": None}
+        return {"audit_present": path.exists(), "audit_valid": False, "audit_truncated": None,
+                "published_sentence_words": None}
     truncated: bool | None = None
     def walk(value: Any) -> None:
         nonlocal truncated
@@ -177,7 +178,15 @@ def _audit_summary(path: Path) -> dict[str, Any]:
             for item in value:
                 walk(item)
     walk(audit)
-    return {"audit_present": True, "audit_valid": True, "audit_truncated": truncated}
+    publication = audit.get("publication") if isinstance(audit, dict) else None
+    sentences = publication.get("sentences") if isinstance(publication, dict) else None
+    # Words of the audited published sentences, excluding any notice line.
+    sentence_words = (
+        sum(len(str(item.get("text", "")).split()) for item in sentences if isinstance(item, dict))
+        if isinstance(sentences, list) else None
+    )
+    return {"audit_present": True, "audit_valid": True, "audit_truncated": truncated,
+            "published_sentence_words": sentence_words}
 
 
 def collect_trial(trial_path: Path, mapping: dict[str, dict[str, str]]) -> dict[str, Any]:
@@ -248,6 +257,8 @@ def collect_trial(trial_path: Path, mapping: dict[str, dict[str, str]]) -> dict[
             "request_errors")},
         "failure_class": run.get("failure_class"), "failure_stage": run.get("failure_stage"),
         "terminal_stage": run.get("terminal_stage"), "replayed_leaves": run.get("replayed_leaves"),
+        "requested_strategy": run.get("strategy"), "selected_strategy": run.get("selected_strategy"),
+        "published_sentence_words": audit["published_sentence_words"] if status == "succeeded" else None,
         "audit_truncated": audit["audit_truncated"],
         "audit_present": audit["audit_present"], "audit_valid": audit["audit_valid"],
         "pass_count": _number(run.get("pass_count")) if run.get("pass_count") is not None else (len(passes) or None),
@@ -463,15 +474,21 @@ def make_requests_markdown(rows: list[dict[str, Any]]) -> str:
     """Tabulate working-tree trials' outcomes and effective requests, text-free."""
     lines = ["# Working-tree effective requests", "",
              "Only request metadata and outcomes; no source, prompt or summary text.", "",
-             "| Phase | Document | Target | Seed | Replayed leaves | Status | Terminal stage | Failure class (stage) | Published words | Requests | Repeats | Truncated | num_predict overridden | Effective num_predict (count) | num_ctx | Max prompt tokens | Max output tokens | Elapsed s |",
-             "|:---|:---|---:|---:|---:|:---|:---|:---|---:|---:|---:|---:|---:|:---|:---|---:|---:|---:|"]
+             "Published words count the audited sentences; the full text adds any removal notice.", "",
+             "| Phase | Document | Target | Seed | Strategy (requested → selected) | Replayed leaves | Status | Terminal stage | Failure class (stage) | Published words (sentences / full text) | Requests | Repeats | Truncated | num_predict overridden | Effective num_predict (count) | num_ctx | Max prompt tokens | Max output tokens | Elapsed s |",
+             "|:---|:---|---:|---:|:---|---:|:---|:---|:---|---:|---:|---:|---:|---:|:---|:---|---:|---:|---:|"]
     for r in rows:
         terminal = r.get("terminal_stage") or {}
         failure = f"{r['failure_class']} ({r['failure_stage']})" if r.get("failure_class") else None
         predicts = ", ".join(f"{k}×{v}" for k, v in (r.get("effective_num_predict") or {}).items()) or None
-        vals = [r["phase"], r["document"], r["target_words"], r["seed"], r.get("replayed_leaves"), r["status"],
+        strategy = f"{r.get('requested_strategy')} → {r.get('selected_strategy')}" if r.get("requested_strategy") else None
+        published = (
+            f"{_fmt(r.get('published_sentence_words'))} / {_fmt(r['final_words'])}"
+            if r["status"] == "succeeded" else None
+        )
+        vals = [r["phase"], r["document"], r["target_words"], r["seed"], strategy, r.get("replayed_leaves"), r["status"],
                 f"{terminal.get('stage')} {terminal.get('state')}" if terminal else None, failure,
-                r["final_words"], r["request_attempts"], r.get("repeated_requests"), r.get("truncated_requests"),
+                published, r["request_attempts"], r.get("repeated_requests"), r.get("truncated_requests"),
                 r.get("num_predict_overridden"), predicts, ", ".join(r.get("effective_num_ctx") or []) or None,
                 r.get("max_prompt_tokens"), r.get("max_output_tokens_generated"), r["elapsed_seconds"]]
         lines.append("| " + " | ".join(_fmt(v) for v in vals) + " |")

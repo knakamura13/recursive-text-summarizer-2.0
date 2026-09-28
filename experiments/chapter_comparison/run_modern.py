@@ -6,12 +6,14 @@ through the caller-supplied capture proxy.
 ``--version worktree`` runs this repository's checkout instead of a pinned
 one, with the pipeline's own default request allowances. ``--replay-from``
 points at a saved trial directory: its cached segmentation and leaf summaries
-are fed to the merge stage unchanged, so no leaf is regenerated.
+are fed to the merge stage unchanged, so no leaf is regenerated. Replay requires
+``--strategy hierarchical``, the only path that uses saved leaves.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -75,10 +77,22 @@ def run_case(
     if not checkout.is_dir():
         raise FileNotFoundError(f"pinned checkout does not exist: {checkout}")
     worktree_dirty = None
+    harness_sha256 = None
     if revision is None:
         revision = _git(checkout, "rev-parse", "HEAD")
-        # Only the summarizer package decides behavior; experiment edits do not.
-        worktree_dirty = bool(_git(checkout, "status", "--porcelain=v1", "--", "summarizer"))
+        # The harness builds the run's configuration and replay substitution, so
+        # its edits decide behavior as much as the summarizer package does.
+        worktree_dirty = bool(_git(
+            checkout, "status", "--porcelain=v1", "--", "summarizer", "experiments/chapter_comparison"
+        ))
+        harness_sha256 = {
+            name: hashlib.sha256((Path(__file__).resolve().parent / name).read_bytes()).hexdigest()
+            for name in ("run_modern.py", "capture_proxy.py", "run_study.py")
+        }
+    if replay_from is not None and strategy != "hierarchical":
+        # Saved leaves only feed the merge stage; a direct run would summarize
+        # the whole source afresh while claiming a replay.
+        raise ValueError("--replay-from requires --strategy hierarchical")
     replay_path = None
     if replay_from is not None:
         replay_path = Path(replay_from).expanduser().resolve(strict=True)
@@ -93,6 +107,7 @@ def run_case(
         "version": version,
         "revision": revision,
         "worktree_dirty": worktree_dirty,
+        "harness_sha256": harness_sha256,
         "checkout": str(checkout),
         "source": str(source_path),
         "target_words": target,
@@ -149,6 +164,16 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _published_sentence_words(audit_path: Path) -> int | None:
+    """Words in the audited published sentences, excluding any notice line."""
+    try:
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    sentences = (audit.get("publication") or {}).get("sentences") or []
+    return sum(len(str(sentence.get("text", "")).split()) for sentence in sentences)
+
+
 def _saved_merge_inputs(replay_dir: Path, document: Any) -> tuple[list[Any], tuple[Any, ...]]:
     """Load a saved trial's segments and leaves, revalidated against ``document``.
 
@@ -170,11 +195,20 @@ def _saved_merge_inputs(replay_dir: Path, document: Any) -> tuple[list[Any], tup
         SourceSegment(**{**item, "boundary_kind": BoundaryKind(item["boundary_kind"])})
         for item in segmentations[0]
     ]
+    segments.sort(key=lambda item: item.order)
+    if [segment.order for segment in segments] != list(range(len(segments))):
+        raise ValueError("saved segment orders are not 0..n-1")
+    cursor = 0
     for segment in segments:
         if segment.source_id != document.source_id:
             raise ValueError(f"{segment.segment_id} belongs to another source")
         if document.text[segment.context_start : segment.context_end] != segment.text:
             raise ValueError(f"{segment.segment_id} no longer matches the source text")
+        if segment.core_start != cursor:
+            raise ValueError(f"{segment.segment_id} core starts at {segment.core_start}, expected {cursor}")
+        cursor = segment.core_end
+    if cursor != len(document.text):
+        raise ValueError(f"saved segment cores end at {cursor} of {len(document.text)} characters")
     by_id = {segment.segment_id: segment for segment in segments}
     saved = {
         item["descriptor"]["work_id"]: item["payload"]
@@ -186,7 +220,7 @@ def _saved_merge_inputs(replay_dir: Path, document: Any) -> tuple[list[Any], tup
             f"saved leaves cover {len(saved)} of {len(by_id)} segments; replay needs all of them"
         )
     leaves = []
-    for segment in sorted(segments, key=lambda item: item.order):
+    for segment in segments:
         node = SummaryNode.model_validate(saved[segment.segment_id])
         validate_provenance(
             node, legal={segment.segment_id: core_text(segment)}, subject=segment.segment_id
@@ -268,9 +302,13 @@ def _worker(config_path: Path) -> int:
                 Path(config["replay_from"]), source_document
             )
             # Only the leaf inputs are substituted; merge onwards is unchanged.
+            # The count is recorded when the pipeline actually takes the leaves.
+            def replayed_leaves(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+                metadata["replayed_leaves"] = len(saved_leaves)
+                return saved_leaves
+
             pipeline_module.cached_segment_document = lambda *_args, **_kwargs: saved_segments
-            pipeline_module.summarize_segments = lambda *_args, **_kwargs: saved_leaves
-            metadata["replayed_leaves"] = len(saved_leaves)
+            pipeline_module.summarize_segments = replayed_leaves
         counter = resolve_token_counter(provider="ollama", model=config["model"])
         provider = OllamaProvider(host=config["proxy_url"])
         selected_context = provider.configure_context_window(
@@ -314,6 +352,7 @@ def _worker(config_path: Path) -> int:
             "selected_strategy": result.strategy.strategy,
             "strategy_report": _jsonable(result.strategy),
             "word_count": len(result.final.text.split()),
+            "published_sentence_words": _published_sentence_words(audit_path),
             "verification_enabled": pipeline.verification.enabled,
             "audit_path": str(audit_path),
             "cache_path": str(cache_path),
@@ -350,7 +389,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy-url")
     parser.add_argument("--replay-from", type=Path, help="saved trial directory whose segments and leaves feed the merge stage")
     parser.add_argument("--strategy", choices=("auto", "direct", "hierarchical"), default="auto")
-    parser.add_argument("--context-window", type=int, default=_CONTEXT_WINDOW, help="must match the proxy's --num-ctx")
+    parser.add_argument("--context-window", type=int, default=_CONTEXT_WINDOW, help="must match the proxy's --num-ctx; the proxy refuses a mismatch")
     parser.add_argument("--_worker", type=Path, help=argparse.SUPPRESS)
     return parser
 

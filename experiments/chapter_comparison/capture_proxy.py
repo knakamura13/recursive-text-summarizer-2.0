@@ -4,9 +4,11 @@ Run only on localhost. Captures can contain entire copyrighted source passages;
 keep --trace-dir outside the repository and do not distribute it.
 
 Sampling (seed, temperature, top_k, top_p), the context window and ``think`` are
-pinned on every chat request. A candidate's own ``num_predict`` is forwarded
-unchanged; ``--max-output-tokens`` only fills it in when a candidate omits it,
-as the legacy transport does. Besides the full private trace, each chat
+pinned on every chat request. A request that asks for a different ``num_ctx``
+is refused with HTTP 400 rather than forwarded, because its sender budgeted for
+a context Ollama would not give it. A candidate's own ``num_predict`` is
+forwarded unchanged; ``--max-output-tokens`` only fills it in when a candidate
+omits it, as the legacy transport does. Besides the full private trace, each chat
 request appends one text-free row to ``requests.jsonl``: original and effective
 options, overridden keys, status, stop reason, token counts, Ollama error text,
 repeats of an identical earlier request and elapsed time.
@@ -140,23 +142,29 @@ class CaptureHandler(BaseHTTPRequestHandler):
         status = 0
         response = b""
         transport_error: str | None = None
-        try:
-            request = urllib.request.Request(
-                server.upstream + self.path,
-                data=body if self.command == "POST" else None,
-                headers={"Content-Type": self.headers.get("Content-Type", "application/json")},
-                method=self.command,
-            )
-            with urllib.request.urlopen(request, timeout=server.timeout) as upstream:
-                status = upstream.status
-                response = upstream.read()
-        except urllib.error.HTTPError as error:
-            status = error.code
-            response = error.read()
-        except (TimeoutError, OSError) as error:
-            status = 502
-            transport_error = f"{type(error).__name__}: {error}"
-            response = transport_error.encode("utf-8")
+        asked_ctx = (original.get("options") or {}).get("num_ctx")
+        if chat and asked_ctx is not None and asked_ctx != server.num_ctx:
+            status = 400
+            transport_error = f"num_ctx {asked_ctx} does not match the proxy's pinned {server.num_ctx}"
+            response = json.dumps({"error": transport_error}).encode("utf-8")
+        else:
+            try:
+                request = urllib.request.Request(
+                    server.upstream + self.path,
+                    data=body if self.command == "POST" else None,
+                    headers={"Content-Type": self.headers.get("Content-Type", "application/json")},
+                    method=self.command,
+                )
+                with urllib.request.urlopen(request, timeout=server.timeout) as upstream:
+                    status = upstream.status
+                    response = upstream.read()
+            except urllib.error.HTTPError as error:
+                status = error.code
+                response = error.read()
+            except (TimeoutError, OSError) as error:
+                status = 502
+                transport_error = f"{type(error).__name__}: {error}"
+                response = transport_error.encode("utf-8")
         completed = time.time()
         if chat:
             with server.trace_lock:
