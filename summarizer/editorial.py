@@ -216,11 +216,18 @@ def write_editorial(
     )
     if budget is not None:
         budget.require_request(measure_request_tokens(request, limits.counter))
-        # Only an exact count can show the draft will not fit: the byte
-        # estimate counts several times more tokens than a model emits, and
-        # would refuse a draft already at its target length.
-        draft_tokens = limits.counter.count(root.summary) + _FINAL_DRAFT_WRAPPER_TOKENS
-        if limits.counter.exact and draft_tokens > budget.output_allowance_tokens:
+        # An exact count measures the draft. The byte estimate counts several
+        # times more tokens than a model emits and would refuse a draft at its
+        # target length, so it is replaced by a lower bound: one token per
+        # whitespace-separated word. Tokenizers split on whitespace; in gemma4's
+        # vocabulary one token of 262,144 (">▁</") spans a space, and recorded
+        # gemma4 answers used at least 1.16 tokens per word.
+        draft_tokens = (
+            limits.counter.count(root.summary)
+            if limits.counter.exact
+            else len(root.summary.split())
+        ) + _FINAL_DRAFT_WRAPPER_TOKENS
+        if draft_tokens > budget.output_allowance_tokens:
             raise RequestBudgetError(
                 BudgetFailure.OUTPUT_CANNOT_HOLD_DRAFT,
                 budget,

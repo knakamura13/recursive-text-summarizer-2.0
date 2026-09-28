@@ -251,3 +251,30 @@ def test_an_estimated_count_does_not_refuse_a_draft_as_too_long_to_rewrite() -> 
     )
 
     assert len(provider.requests) == 1
+
+
+def test_an_estimated_count_still_refuses_a_draft_with_more_words_than_output_tokens() -> None:
+    from summarizer.budget import BudgetFailure, ContextWindow, RequestBudgetError, RequestLimits
+    from summarizer.config import StrategyConfig
+    from summarizer.tokenization import ConservativeUtf8TokenCounter
+
+    provider = Provider()
+    # The #121 case: 4,641 words to rewrite within a 4,096-token allowance.
+    with pytest.raises(RequestBudgetError) as caught:
+        write_editorial(
+            _root_with_summary("word " * 4_641),
+            provider,
+            source_id=SOURCE_ID,
+            model="m",
+            timeout_seconds=30,
+            target_words=980,
+            limits=RequestLimits(
+                window=ContextWindow(tokens=65_536, assumed=False),
+                config=StrategyConfig(),
+                counter=ConservativeUtf8TokenCounter(),
+                correction_headroom=0,
+            ),
+        )
+
+    assert caught.value.failure is BudgetFailure.OUTPUT_CANNOT_HOLD_DRAFT
+    assert provider.requests == []
