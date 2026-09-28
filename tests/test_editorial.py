@@ -226,3 +226,28 @@ def test_a_draft_that_fits_the_output_allowance_is_sent() -> None:
     )
 
     assert [request.max_output_tokens for request in provider.requests] == [4_096]
+
+
+def test_an_estimated_count_does_not_refuse_a_draft_as_too_long_to_rewrite() -> None:
+    from summarizer.budget import ContextWindow, RequestLimits
+    from summarizer.config import StrategyConfig
+    from summarizer.tokenization import ConservativeUtf8TokenCounter
+
+    provider = Provider()
+    # A target-length draft is far more bytes than the allowance's tokens.
+    write_editorial(
+        _root_with_summary("word " * 1_000),
+        provider,
+        source_id=SOURCE_ID,
+        model="m",
+        timeout_seconds=30,
+        target_words=1_000,
+        limits=RequestLimits(
+            window=ContextWindow(tokens=65_536, assumed=False),
+            config=StrategyConfig(),
+            counter=ConservativeUtf8TokenCounter(),
+            correction_headroom=0,
+        ),
+    )
+
+    assert len(provider.requests) == 1

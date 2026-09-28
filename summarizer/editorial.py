@@ -216,8 +216,11 @@ def write_editorial(
     )
     if budget is not None:
         budget.require_request(measure_request_tokens(request, limits.counter))
+        # Only an exact count can show the draft will not fit: the byte
+        # estimate counts several times more tokens than a model emits, and
+        # would refuse a draft already at its target length.
         draft_tokens = limits.counter.count(root.summary) + _FINAL_DRAFT_WRAPPER_TOKENS
-        if draft_tokens > budget.output_allowance_tokens:
+        if limits.counter.exact and draft_tokens > budget.output_allowance_tokens:
             raise RequestBudgetError(
                 BudgetFailure.OUTPUT_CANNOT_HOLD_DRAFT,
                 budget,
