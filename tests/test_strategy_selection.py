@@ -2,7 +2,12 @@ from dataclasses import dataclass
 
 import pytest
 
-from summarizer.budget import BudgetError, measure_overhead, select_strategy
+from summarizer.budget import (
+    BudgetFailure,
+    RequestBudgetError,
+    measure_overhead,
+    select_strategy,
+)
 from summarizer.config import StrategyConfig
 from summarizer.ingestion import ingest_text
 
@@ -114,7 +119,7 @@ def test_a_window_with_no_usable_capacity_fails_for_every_strategy(
     capacity, so a window this small is a dead configuration rather than a
     reason to prefer one path over another.
     """
-    with pytest.raises(BudgetError, match="no usable input capacity"):
+    with pytest.raises(RequestBudgetError) as error:
         select(
             "a" * 100,
             StrategyConfig(
@@ -126,19 +131,36 @@ def test_a_window_with_no_usable_capacity_fails_for_every_strategy(
             ),
         )
 
+    assert error.value.failure is BudgetFailure.NO_INPUT_CAPACITY
+
+
+def test_an_output_allowance_beyond_the_window_is_refused_unchanged() -> None:
+    """The reserved output is never lowered to make a request fit."""
+    with pytest.raises(RequestBudgetError) as error:
+        select(
+            "a" * 100,
+            StrategyConfig(
+                context_window=32_768,
+                max_output_tokens=40_882,
+                safety_margin_tokens=256,
+                safety_margin_fraction=0.02,
+            ),
+        )
+
+    assert error.value.failure is BudgetFailure.OUTPUT_EXCEEDS_CONTEXT
+    assert error.value.budget.output_allowance_tokens == 40_882
+
 
 def test_explicit_direct_over_capacity_fails_with_its_arithmetic() -> None:
     """Rejection happens before any provider call and shows the numbers used."""
-    with pytest.raises(BudgetError) as error:
+    with pytest.raises(RequestBudgetError) as error:
         select(
             "a" * 100,
             config_for(100, slack=-1, strategy="direct"),
         )
 
-    message = str(error.value)
-    assert "100" in message
-    for term in ("capacity", "direct"):
-        assert term in message
+    assert error.value.failure is BudgetFailure.INPUT_EXCEEDS_CAPACITY
+    assert "input of 100 tokens exceeds the input capacity of 99" in str(error.value)
 
 
 def test_report_carries_the_counter_and_overhead_it_used() -> None:

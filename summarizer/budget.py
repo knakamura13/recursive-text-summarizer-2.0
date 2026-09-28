@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import Enum
+from typing import Literal
 
 from summarizer.config import StrategyConfig, StrategyName
 from summarizer.ingestion import SourceDocument
 from summarizer.leaf import build_leaf_request
+from summarizer.providers.base import GenerationRequest
+from summarizer.reask import MAX_REASON_CHARS, reask_request
 from summarizer.segmentation import BoundaryKind, SourceSegment
 from summarizer.summaries import (
     MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES,
@@ -214,32 +218,190 @@ def safety_margin(window_tokens: int, config: StrategyConfig) -> int:
     return max(config.safety_margin_tokens, proportional)
 
 
-def usable_input_capacity(
+# UTF-8 encodes one character in at most four bytes, and neither the byte
+# estimator nor a byte-level BPE emits more tokens than bytes.
+_MAX_BYTES_PER_CHARACTER = 4
+
+
+def correction_headroom(counter: TokenCounter) -> int:
+    """Bound what one re-ask adds to a request's instructions.
+
+    A re-ask appends one note to the original instructions and never
+    accumulates notes, so the bound is the longer note template plus the
+    longest reason `rejection_reason` can return, charged at the byte bound
+    because a reason may quote non-ASCII model output.
+    """
+    probe = GenerationRequest(
+        model="probe", instructions="probe", input_text="probe", timeout_seconds=1
+    )
+    structured = replace(probe, response_schema={}, schema_name="probe")
+    template = max(
+        counter.count(reask_request(request, "").instructions)
+        - counter.count(request.instructions)
+        for request in (probe, structured)
+    )
+    return max(template, 0) + MAX_REASON_CHARS * _MAX_BYTES_PER_CHARACTER
+
+
+RequestStage = Literal["direct", "leaf", "merge", "editorial"]
+
+
+class BudgetFailure(str, Enum):
+    """Why one request cannot be sent at its budgeted size.
+
+    Every member describes the request configuration: the context window and
+    the reserves charged against it. None of them is a finding that the
+    requested summary target is impossible; the error carries that target's
+    output allowance unchanged.
+    """
+
+    # The output allowance takes the whole usable context or more.
+    OUTPUT_EXCEEDS_CONTEXT = "output_exceeds_context"
+    # The allowance fits, but prompt, schema, evidence and correction reserves
+    # leave no source input.
+    NO_INPUT_CAPACITY = "no_input_capacity"
+    # The request's measured input is larger than its input capacity.
+    INPUT_EXCEEDS_CAPACITY = "input_exceeds_capacity"
+    # The input capacity cannot hold the two largest-sized children a merge
+    # needs to make progress.
+    MERGE_PAIR_EXCEEDS_CAPACITY = "merge_pair_exceeds_capacity"
+
+
+@dataclass(frozen=True)
+class RequestBudget:
+    """Every term one stage's request is charged against its context window.
+
+    `input_capacity` is what remains for source text or child summaries:
+    the window less the safety margin, the output allowance, the measured
+    instructions, schema and fencing, the evidence reserve, and room for one
+    correction note. It may be non-positive only inside a `RequestBudgetError`.
+    """
+
+    stage: RequestStage
+    context_window_tokens: int
+    overhead: OverheadMeasurement
+    evidence_tokens: int
+    correction_headroom_tokens: int
+    output_allowance_tokens: int
+    safety_margin_tokens: int
+
+    @property
+    def usable_context_tokens(self) -> int:
+        return self.context_window_tokens - self.safety_margin_tokens
+
+    @property
+    def input_capacity(self) -> int:
+        return (
+            self.usable_context_tokens
+            - self.output_allowance_tokens
+            - self.overhead.total
+            - self.evidence_tokens
+            - self.correction_headroom_tokens
+        )
+
+    def arithmetic(self) -> str:
+        """Show the subtraction that produced `input_capacity`."""
+        return (
+            f"context window {self.context_window_tokens} - safety margin "
+            f"{self.safety_margin_tokens} - output allowance "
+            f"{self.output_allowance_tokens} - instructions "
+            f"{self.overhead.instructions} - schema {self.overhead.schema} - "
+            f"fencing {self.overhead.fencing} - evidence {self.evidence_tokens} "
+            f"- correction headroom {self.correction_headroom_tokens} = "
+            f"{self.input_capacity} input tokens"
+        )
+
+    def require_input(self, tokens: int) -> None:
+        """Refuse a request whose measured input exceeds the capacity."""
+        if tokens > self.input_capacity:
+            raise RequestBudgetError(
+                BudgetFailure.INPUT_EXCEEDS_CAPACITY,
+                self,
+                f"an input of {tokens} tokens exceeds the input capacity of "
+                f"{self.input_capacity}",
+            )
+
+    def require_merge_pair(self, largest_child_tokens: int) -> None:
+        """Refuse a merge budget that cannot hold two of its largest child.
+
+        Sized from the largest child, as fanout is, so a pair is never
+        admitted that fits only on average.
+        """
+        pair = 2 * largest_child_tokens
+        if pair > self.input_capacity:
+            raise RequestBudgetError(
+                BudgetFailure.MERGE_PAIR_EXCEEDS_CAPACITY,
+                self,
+                f"a largest child of {largest_child_tokens} tokens makes a pair of "
+                f"{pair} against an input capacity of {self.input_capacity}",
+            )
+
+
+class RequestBudgetError(BudgetError):
+    """A request cannot be sent at its budgeted size, with the arithmetic."""
+
+    def __init__(
+        self, failure: BudgetFailure, budget: RequestBudget, detail: str
+    ) -> None:
+        self.failure = failure
+        self.budget = budget
+        super().__init__(
+            f"{budget.stage} request is infeasible ({failure.value}): {detail}; "
+            f"{budget.arithmetic()}. This is a limit of the request "
+            f"configuration, not of the requested output target"
+        )
+
+
+def plan_request(
+    stage: RequestStage,
     *,
     window: ContextWindow,
     overhead: OverheadMeasurement,
+    output_allowance: int,
+    correction_headroom: int,
     config: StrategyConfig,
-) -> int:
-    """Return how many tokens of source text a request may carry.
+    evidence: int = 0,
+) -> RequestBudget:
+    """Budget one stage's request, or raise `RequestBudgetError`.
 
-    Raises `BudgetError` rather than returning a non-positive number, because
-    that outcome is reachable on default local configuration: the conservative
-    byte estimator charges over four times a real tokenizer on this project's
-    own ASCII.
+    The output allowance is taken as given and never reduced to make room:
+    lowering it would silently shorten the requested target. A budget that
+    cannot be met is refused with its classification and arithmetic.
     """
-    margin = safety_margin(window.tokens, config)
-    capacity = (
-        window.tokens - overhead.total - config.max_output_tokens - margin
+    if output_allowance <= 0:
+        raise ValueError("output allowance must be positive")
+    if correction_headroom < 0 or evidence < 0:
+        raise ValueError("correction headroom and evidence must not be negative")
+    budget = RequestBudget(
+        stage=stage,
+        context_window_tokens=window.tokens,
+        overhead=overhead,
+        evidence_tokens=evidence,
+        correction_headroom_tokens=correction_headroom,
+        output_allowance_tokens=output_allowance,
+        safety_margin_tokens=safety_margin(window.tokens, config),
     )
-    if capacity <= 0:
-        raise BudgetError(
-            f"no usable input capacity: a context window of {window.tokens} tokens "
-            f"leaves {capacity} after overhead of {overhead.total} "
-            f"(instructions {overhead.instructions}, schema {overhead.schema}, "
-            f"fencing {overhead.fencing}), reserved output of "
-            f"{config.max_output_tokens}, and a safety margin of {margin}"
+    if budget.usable_context_tokens <= 0:
+        raise RequestBudgetError(
+            BudgetFailure.NO_INPUT_CAPACITY,
+            budget,
+            f"a safety margin of {budget.safety_margin_tokens} tokens leaves no "
+            f"usable context in a window of {window.tokens}",
         )
-    return capacity
+    if output_allowance >= budget.usable_context_tokens:
+        raise RequestBudgetError(
+            BudgetFailure.OUTPUT_EXCEEDS_CONTEXT,
+            budget,
+            f"an output allowance of {output_allowance} tokens does not fit a "
+            f"usable context of {budget.usable_context_tokens}",
+        )
+    if budget.input_capacity <= 0:
+        raise RequestBudgetError(
+            BudgetFailure.NO_INPUT_CAPACITY,
+            budget,
+            "the reserves leave no room for input",
+        )
+    return budget
 
 
 @dataclass(frozen=True)
@@ -259,6 +421,7 @@ class BudgetReport:
     overhead: OverheadMeasurement
     reserved_output_tokens: int
     safety_margin_tokens: int
+    correction_headroom_tokens: int
     usable_input_capacity: int
     document_tokens: int
     fits: bool
@@ -293,10 +456,19 @@ def select_strategy(
             else 0
         ),
     )
-    margin = safety_margin(window.tokens, config)
-    capacity = usable_input_capacity(
-        window=window, overhead=overhead, config=config
+    budget = plan_request(
+        "direct",
+        window=window,
+        overhead=overhead,
+        output_allowance=config.max_output_tokens,
+        # Re-asks are not yet reserved anywhere in the pipeline, and charging
+        # them here alone would make preflight and merge sizing disagree with
+        # direct and leaf sizing. #106 charges `correction_headroom(counter)`
+        # at every stage together.
+        correction_headroom=0,
+        config=config,
     )
+    capacity = budget.input_capacity
     document_tokens = counter.count(document.text)
     fits = document_tokens <= capacity
 
@@ -314,14 +486,8 @@ def select_strategy(
             f"rather than rejecting it."
         )
 
-    if config.strategy == "direct" and not fits:
-        raise BudgetError(
-            f"direct summarization was requested but the document does not fit: "
-            f"{document_tokens} tokens against a usable input capacity of "
-            f"{capacity} (context window {window.tokens}, overhead "
-            f"{overhead.total}, reserved output {config.max_output_tokens}, "
-            f"safety margin {margin})"
-        )
+    if config.strategy == "direct":
+        budget.require_input(document_tokens)
 
     strategy, reason = _decide(
         config=config,
@@ -340,8 +506,9 @@ def select_strategy(
         counter_identity=counter.identity,
         counter_exact=counter.exact,
         overhead=overhead,
-        reserved_output_tokens=config.max_output_tokens,
-        safety_margin_tokens=margin,
+        reserved_output_tokens=budget.output_allowance_tokens,
+        safety_margin_tokens=budget.safety_margin_tokens,
+        correction_headroom_tokens=budget.correction_headroom_tokens,
         usable_input_capacity=capacity,
         document_tokens=document_tokens,
         fits=fits,

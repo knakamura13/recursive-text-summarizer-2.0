@@ -38,7 +38,8 @@ INVALID_OUTPUT_ERRORS: tuple[type[Exception], ...] = (
     ProviderResponseError,
 )
 
-_MAX_REASON_CHARS = 400
+# Public so a request budget can reserve room for the longest correction note.
+MAX_REASON_CHARS = 400
 _MAX_LOCATION_PART_CHARS = 40
 
 _Parsed = TypeVar("_Parsed")
@@ -83,7 +84,7 @@ def rejection_reason(error: BaseException) -> str:
         text = f"response failed validation ({details})"
     else:
         text = str(error)
-    return _collapse(text, _MAX_REASON_CHARS) or type(error).__name__
+    return _collapse(text, MAX_REASON_CHARS) or type(error).__name__
 
 
 def reask_request(request: GenerationRequest, reason: str) -> GenerationRequest:
