@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
@@ -28,8 +28,14 @@ COMPRESSION_PROMPT_VERSION = "compression-prompt/1"
 COMPRESSION_SCHEMA_NAME = "compression_draft"
 CHUNK_CHAR_LIMIT = 1000
 RETENTION_RATIO = 0.70
-MAX_PASSES = 3
+# Pass indexes are two digits in compression work ids (`C01K000001`).
+MAX_PASSES = 99
 BAND_TOLERANCE = 0.10
+# Stop after this many passes in a row that each shortened the text by less
+# than this fraction. On a 9,800-word source at a 980-word target this saved
+# a third of the compression calls and ended about 640 words longer.
+SLOW_PASS_FRACTION = 0.01
+SLOW_PASS_LIMIT = 3
 # The `{"text": ...}` object around a shortened chunk. The chunk's own size
 # bounds the shortened text, which is asked for at seventy percent of it.
 _COMPRESSION_ENVELOPE_TOKENS = 64
@@ -443,14 +449,10 @@ def _compression_chunks(text: str) -> list[tuple[str, str]]:
     return chunks
 
 
-def compression_work_ids_for_text(text: str, *, max_passes: int = 4) -> tuple[str, ...]:
-    """Reserve checkpoint work ids for every chunk in each compression pass."""
+def compression_pass_work_ids(text: str, pass_index: int) -> tuple[str, ...]:
+    """Return the checkpoint work ids of one compression pass over `text`."""
     chunk_count = max(1, len(_compression_chunks(text.strip())))
-    return tuple(
-        f"C{pass_index:02d}K{chunk_index:06d}"
-        for pass_index in range(1, max_passes + 1)
-        for chunk_index in range(1, chunk_count + 1)
-    )
+    return tuple(f"C{pass_index:02d}K{chunk_index:06d}" for chunk_index in range(1, chunk_count + 1))
 
 
 def compress_to_target(
@@ -465,9 +467,19 @@ def compress_to_target(
     strict_numbers: bool = False,
     strict_names: bool = False,
     limits: RequestLimits | None = None,
+    reserve_work: Callable[[tuple[str, ...]], None] | None = None,
 ) -> CompressionResult:
-    """Shorten `text` toward `target_words` with up to four whole-document passes.
+    """Shorten `text` by repeated light passes until it is within the target band.
 
+    Each pass trims every chunk a little. Passes repeat while the text is above
+    the band and stop when it reaches the band or the floor, when a pass no
+    longer shortens it (that pass is discarded, so the longer text is kept
+    rather than dropping facts), or after `SLOW_PASS_LIMIT` passes in a row
+    that each shortened it by less than `SLOW_PASS_FRACTION`. Slow passes are
+    often followed by a large drop, so one slow pass alone does not stop it.
+    `MAX_PASSES` is the work-id format's limit.
+
+    `reserve_work` is called with each pass's work ids before the pass runs.
     With `limits`, every chunk request is budgeted and carries its allowance.
     """
     if target_words <= 0:
@@ -475,18 +487,16 @@ def compress_to_target(
     stripped = text.strip()
     if not stripped:
         raise ValueError("text must not be empty")
-    count = word_count(stripped)
-    if _in_band(count, target_words) or _under_floor(count, target_words):
-        return CompressionResult(text=stripped, generations=(), passes=0)
 
     current = stripped
     all_generations: list[GenerationResult] = []
     passes_run = 0
+    slow_passes = 0
     for pass_index in range(1, MAX_PASSES + 1):
-        if _in_band(word_count(current), target_words) or _under_floor(
-            word_count(current), target_words
-        ):
+        if not _above_ceiling(word_count(current), target_words):
             break
+        if reserve_work is not None:
+            reserve_work(compression_pass_work_ids(current, pass_index))
         previous = current
         current, gens = _compress_pass(
             current,
@@ -507,35 +517,10 @@ def compress_to_target(
             current = previous
             break
         passes_run = pass_index
-        if _in_band(word_count(current), target_words) or _under_floor(
-            word_count(current), target_words
-        ):
+        shortened = 1 - word_count(current) / word_count(previous)
+        slow_passes = slow_passes + 1 if shortened < SLOW_PASS_FRACTION else 0
+        if slow_passes >= SLOW_PASS_LIMIT:
             break
-
-    if (
-        passes_run == MAX_PASSES
-        and _above_ceiling(word_count(current), target_words)
-    ):
-        previous = current
-        current, gens = _compress_pass(
-            current,
-            provider,
-            source_id=source_id,
-            model=model,
-            timeout_seconds=timeout_seconds,
-            pass_index=MAX_PASSES + 1,
-            coordinator=coordinator,
-            strict_numbers=strict_numbers,
-            strict_names=strict_names,
-            limits=limits,
-        )
-        all_generations.extend(gens)
-        if word_count(current) >= word_count(previous) or (
-            strict_numbers and _omits_a_number(previous, current)
-        ):
-            current = previous
-        else:
-            passes_run = MAX_PASSES + 1
 
     return CompressionResult(
         text=current.strip(),

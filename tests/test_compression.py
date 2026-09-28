@@ -80,6 +80,105 @@ def test_compress_pass_invokes_provider() -> None:
     assert result.text
 
 
+class Trimming:
+    """Keep a fixed fraction of each chunk's words; record pass indexes."""
+
+    def __init__(self, keep: float) -> None:
+        self.keep = keep
+        self.passes: list[int] = []
+
+    def generate(self, request):
+        self.passes.append(int(request.operation_id.split(":C")[1][:2]))
+        words = request.input_text.split("\n", 1)[1].rsplit("\n", 1)[0].split()
+        text = " ".join(words[: max(1, round(len(words) * self.keep))])
+        return GenerationResult(text=f'{{"text": "{text}"}}', provider="fake", model=request.model)
+
+
+def _sentences(count: int) -> str:
+    return " ".join(f"Sentence {index} has several plain words in it." for index in range(count))
+
+
+def test_light_passes_repeat_until_the_text_is_within_the_band() -> None:
+    # Each pass keeps 80% of the words, so reaching 100 +-10% from 800 words
+    # takes ten passes, more than any fixed small cap would allow.
+    provider = Trimming(0.8)
+    reserved: list[tuple[str, ...]] = []
+
+    result = compress_to_target(
+        _sentences(100),
+        provider,
+        source_id="a" * 64,
+        model="m",
+        timeout_seconds=30,
+        target_words=100,
+        reserve_work=reserved.append,
+    )
+
+    assert not _above_ceiling(word_count(result.text), 100)
+    assert result.passes == max(provider.passes) > 4
+    # Each pass's work is planned before its first request.
+    assert [ids[0][:3] for ids in reserved] == [f"C{p:02d}" for p in range(1, result.passes + 1)]
+
+
+def test_passes_stop_and_keep_the_longer_text_when_a_pass_no_longer_shortens() -> None:
+    provider = Provider(['{"text":"Sentence one has several plain words in it."}'])
+    source = _sentences(1)
+
+    result = compress_to_target(
+        f"{source} {source} {source}",
+        provider,
+        source_id="a" * 64,
+        model="m",
+        timeout_seconds=30,
+        target_words=5,
+    )
+
+    # One chunk shortened to one sentence, then a pass that cannot shorten it.
+    assert result.text == "Sentence one has several plain words in it."
+    assert result.passes == 1
+
+
+class Scheduled:
+    """Drop a scheduled number of words in each pass over one chunk."""
+
+    def __init__(self, drops: dict[int, int]) -> None:
+        self.drops = drops
+        self.passes: list[int] = []
+
+    def generate(self, request):
+        pass_index = int(request.operation_id.split(":C")[1][:2])
+        self.passes.append(pass_index)
+        words = request.input_text.split("\n", 1)[1].rsplit("\n", 1)[0].split()
+        text = " ".join(words[: len(words) - self.drops.get(pass_index, 1)])
+        return GenerationResult(text=f'{{"text": "{text}"}}', provider="fake", model=request.model)
+
+
+def _run_scheduled(drops: dict[int, int]) -> Scheduled:
+    provider = Scheduled(drops)
+    compress_to_target(
+        " ".join(f"w{index}" for index in range(150)),
+        provider,
+        source_id="a" * 64,
+        model="m",
+        timeout_seconds=30,
+        target_words=10,
+    )
+    return provider
+
+
+def test_passes_stop_after_three_slow_passes_in_a_row() -> None:
+    # Pass 1 drops 30 of 150 words; each later pass drops 1 of ~120, under 1%.
+    provider = _run_scheduled({1: 30})
+
+    assert provider.passes == [1, 2, 3, 4]
+
+
+def test_a_large_drop_resets_the_count_of_slow_passes() -> None:
+    provider = _run_scheduled({1: 30, 4: 10})
+
+    assert provider.passes == [1, 2, 3, 4, 5, 6, 7]
+
+
 def test_retention_ratio_constant() -> None:
     assert RETENTION_RATIO == 0.70
 
@@ -201,7 +300,7 @@ def test_a_rounded_number_is_not_treated_as_omitted() -> None:
 def test_an_unpunctuated_run_is_sent_in_bounded_chunks_with_their_allowances() -> None:
     """One long "sentence" or unspaced run would otherwise be one request of any size."""
     from summarizer.budget import ContextWindow, RequestLimits
-    from summarizer.compression import CHUNK_CHAR_LIMIT, compression_work_ids_for_text
+    from summarizer.compression import CHUNK_CHAR_LIMIT, compression_pass_work_ids
     from summarizer.config import StrategyConfig
 
     class CharacterCounter:
@@ -251,7 +350,7 @@ def test_an_unpunctuated_run_is_sent_in_bounded_chunks_with_their_allowances() -
         for request, chunk in zip(provider.requests, chunks)
         if request.operation_id.startswith("compression:C01")
     ]
-    assert len(first_pass) == len(compression_work_ids_for_text(source, max_passes=1))
+    assert len(first_pass) == len(compression_pass_work_ids(source, 1))
     assert "".join("".join(first_pass).split()) == "".join(source.split())
     assert all(len(chunk) <= CHUNK_CHAR_LIMIT for chunk in chunks)
     assert [request.max_output_tokens for request in provider.requests] == [
