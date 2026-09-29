@@ -341,6 +341,9 @@ def write_editorial(
             decode=decode,
             encode=lambda value: {"text": value},
             compute=compute,
+            # A kept unfinished draft is a fallback, not an answer: caching it
+            # would replay the cut on every later run instead of asking again.
+            cache_if=lambda value: split_unfinished_ending(value)[1] is None,
         )
     if generation is None:
         report("reused")

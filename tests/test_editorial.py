@@ -2,9 +2,11 @@ import json
 
 import pytest
 
+from summarizer.cache import CacheStore
 from summarizer.editorial import EditorialError, build_editorial_request, write_editorial
 from summarizer.providers.base import GenerationRequest, GenerationResult
 from summarizer.runtime.observers import ItemFailedError, RuntimeObserver, StageName
+from summarizer.segmentation import CacheCoordinator
 from summarizer.summaries import SummaryNode
 
 
@@ -344,3 +346,32 @@ def test_a_complete_draft_is_not_asked_for_again(text: str) -> None:
 
     assert result.text == text
     assert len(provider.requests) == 1
+
+
+def _cached_write(tmp_path, *responses: str) -> ScriptedProvider:
+    provider = ScriptedProvider(*responses)
+    provider.cache_coordinator = CacheCoordinator(
+        store=CacheStore(tmp_path / "cache"), source_id=SOURCE_ID,
+        provider="openai", model="m", ollama_host="",
+        counter_identity="test:characters",
+        counter_exact=True, context_window_tokens=100_000,
+        behavior={},
+    )
+    _write(provider)
+    return provider
+
+
+def test_a_kept_unfinished_draft_is_not_cached(tmp_path) -> None:
+    _cached_write(tmp_path, _CUT, _CUT, _CUT)
+
+    later = _cached_write(tmp_path, _COMPLETE)
+
+    assert len(later.requests) == 1
+
+
+def test_a_complete_draft_is_cached(tmp_path) -> None:
+    _cached_write(tmp_path, _CUT, _COMPLETE)
+
+    later = _cached_write(tmp_path)
+
+    assert later.requests == []
