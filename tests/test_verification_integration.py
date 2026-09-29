@@ -17,6 +17,7 @@ from summarizer.ingestion import ingest_text
 from summarizer.pipeline import PipelineConfig, run_pipeline
 from summarizer.providers.base import GenerationRequest, GenerationResult
 from summarizer.segmentation import CacheCoordinator, SegmentationConfig
+from summarizer.text import default_sentence_tokenizer
 from summarizer.runtime.observers import RuntimeObserver, StageName
 from summarizer.verification import (
     SourceLexicalEntry,
@@ -126,9 +127,15 @@ class VerificationPipelineProvider:
     def _compression(request: GenerationRequest) -> dict[str, object]:
         lines = request.input_text.splitlines()
         chunk = lines[1] if len(lines) > 2 else request.input_text
-        words = chunk.split()
-        keep = max(1, int(len(words) * 0.7))
-        return {"text": " ".join(words[:keep])}
+        # Keep about seventy percent of the words, in whole sentences, as a
+        # model following the compression prompt does.
+        wanted = max(1, int(len(chunk.split()) * 0.7))
+        kept: list[str] = []
+        for sentence in default_sentence_tokenizer(chunk):
+            if kept and len(" ".join(kept).split()) >= wanted:
+                break
+            kept.append(sentence.strip())
+        return {"text": " ".join(kept)}
 
     @staticmethod
     def _node(level: int, identifier: str) -> dict[str, object]:
