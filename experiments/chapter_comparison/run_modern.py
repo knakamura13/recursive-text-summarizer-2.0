@@ -10,10 +10,11 @@ are fed to the merge stage unchanged, so no leaf is regenerated. Replay requires
 ``--strategy hierarchical``, the only path that uses saved leaves.
 
 Every working-tree trial saves the record the editorial step receives, after
-any compression, as ``editorial_root.json``. ``--editorial-root-from`` hands
-that saved record from another trial of the same case to the editorial step,
-so compression is not rerun and only ``--editorial-units`` changes: ``root``
-keeps the saved content units and ``none`` removes them.
+any compression, as ``editorial_root.json``, with the direct summary it was
+prepared from. ``--editorial-root-from`` replays both in a new trial of the
+same case, so neither the direct summary nor compression is regenerated and
+only ``--editorial-units`` changes: ``root`` keeps the saved content units and
+``none`` removes them. Replay supports direct runs only.
 """
 
 from __future__ import annotations
@@ -202,22 +203,33 @@ def _published_sentence_words(audit_path: Path) -> int | None:
 def _hook_editorial_root(config: dict[str, Any], metadata: dict[str, Any], trial: Path, source_id: str) -> None:
     """Save the record the editorial step receives, or substitute a saved one.
 
-    The saved record is checked against this trial's source and target, so an
-    arm can only reuse the editorial input of the same case.
+    The saved file also keeps the direct summary the record was prepared from.
+    A replay returns that summary in place of the direct request, so neither
+    the direct summary nor compression is regenerated and the audit describes
+    the root the editorial record came from. The saved record is checked
+    against this trial's source and target, so an arm can only reuse the
+    editorial input of the same case.
     """
     import summarizer.finalization as finalization
+    import summarizer.pipeline as pipeline_module
     from summarizer.summaries import SummaryNode
 
     prepare = finalization._prepare_root_for_editorial
     saved_path = config.get("editorial_root_from")
+    saved = None
+    if saved_path is not None:
+        saved = json.loads(Path(saved_path).read_text(encoding="utf-8"))
+        if saved["source_id"] != source_id or saved["target_words"] != config["target_words"]:
+            raise ValueError(f"saved editorial root belongs to another case: {saved_path}")
+        if "original_root" not in saved:
+            raise ValueError(f"saved editorial root has no direct summary to replay: {saved_path}")
+        original = SummaryNode.model_validate(saved["original_root"])
+        pipeline_module.summarize_direct = lambda *_args, **_kwargs: original
 
     def hooked(root: Any, provider: Any, **kwargs: Any) -> tuple[Any, tuple[Any, ...]]:
-        if saved_path is None:
+        if saved is None:
             prepared, generations = prepare(root, provider, **kwargs)
         else:
-            saved = json.loads(Path(saved_path).read_text(encoding="utf-8"))
-            if saved["source_id"] != source_id or saved["target_words"] != config["target_words"]:
-                raise ValueError(f"saved editorial root belongs to another case: {saved_path}")
             record = saved["root"]
             if config["editorial_units"] == "none":
                 record = {**record, "content_units": []}
@@ -227,6 +239,7 @@ def _hook_editorial_root(config: dict[str, Any], metadata: dict[str, Any], trial
             "source_id": source_id,
             "target_words": config["target_words"],
             "editorial_units": config["editorial_units"],
+            "original_root": root.model_dump(mode="json"),
             "root": prepared.model_dump(mode="json"),
         }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return prepared, generations
@@ -399,6 +412,10 @@ def _worker(config_path: Path) -> int:
         selected = select_strategy(
             source_document, counter, provider=app.provider, model=app.model, config=strategy
         )
+        if config.get("editorial_root_from") and selected.strategy != "direct":
+            # Only the direct summary is replayed; a hierarchical run would
+            # regenerate its merges before reaching the saved record.
+            raise ValueError("--editorial-root-from supports direct runs only")
         metadata.update({
             "selected_strategy": selected.strategy,
             "strategy_report": _jsonable(selected),
