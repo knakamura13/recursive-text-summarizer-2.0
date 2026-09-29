@@ -52,7 +52,9 @@ def build_provider(
 
 def build_counter(config: AppConfig) -> TokenCounter:
     """Resolve the provider's local token accounting boundary."""
-    return resolve_token_counter(provider=config.provider, model=config.model)
+    return resolve_token_counter(
+        provider=config.provider, model=config.model, ollama_host=config.ollama_host
+    )
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -53,7 +53,7 @@ def verify_environment() -> None:
 # an absolute word count for a non-manifest source), seed, the saved phase whose
 # merge inputs are replayed (None runs fresh), strategy and context window.
 # Replay requires the hierarchical strategy, the only path that uses saved leaves.
-D5_CASES = {
+WORKTREE_CASES = {
     "d5-replay": (
         ("gathering", 0.25, 101, "validation", "hierarchical", 32_768),
         ("isl", 0.25, 101, "baseline-retry", "hierarchical", 32_768),
@@ -72,8 +72,18 @@ D5_CASES = {
         ("gathering", 0.1, 101, None, "hierarchical", 65_536),
         ("snowfall", 300, 101, None, "hierarchical", 65_536),
     ),
+    # #120: the same saved merge inputs under the exact local tokenizer count.
+    "d11-replay": (
+        ("gathering", 0.25, 101, "validation", "hierarchical", 32_768),
+        ("isl", 0.25, 101, "baseline-retry", "hierarchical", 32_768),
+        ("isl", 0.5, 101, "baseline-retry", "hierarchical", 32_768),
+        ("transcript", 0.25, 101, "validation", "hierarchical", 32_768),
+    ),
+    # With the exact count only the transcript routes hierarchical on its own
+    # at the study's context; every other study case fits one direct request.
+    "d11-e2e": (("transcript", 0.25, 101, None, "auto", 32_768),),
 }
-PHASES = ("pilot", "pilot-retry", "baseline", "baseline-retry", "validation", *D5_CASES)
+PHASES = ("pilot", "pilot-retry", "baseline", "baseline-retry", "validation", *WORKTREE_CASES)
 # Sources outside the manifest; they are repository sample documents.
 EXTRA_SOURCES = {
     "snowfall": HERE.parents[1] / "sample-documents" / "article_Snow Fall The Avalanche at Tunnel Creek by John Branch.txt",
@@ -110,15 +120,15 @@ def _saved_trial(saved_phase: str, document: str, fraction: float, seed: int) ->
 
 
 def cases(phase: str):
-    if phase in D5_CASES:
-        documents = sorted({case[0] for case in D5_CASES[phase]})
+    if phase in WORKTREE_CASES:
+        documents = sorted({case[0] for case in WORKTREE_CASES[phase]})
         sources = {document: (source, words) for document, source, words in _sources(
             [document for document in documents if document not in EXTRA_SOURCES])}
         for document in documents:
             if document in EXTRA_SOURCES:
                 path = EXTRA_SOURCES[document]
                 sources[document] = (path, len(path.read_text(encoding="utf-8").split()))
-        for document, amount, seed, saved_phase, strategy, num_ctx in D5_CASES[phase]:
+        for document, amount, seed, saved_phase, strategy, num_ctx in WORKTREE_CASES[phase]:
             source, words = sources[document]
             fraction = amount if isinstance(amount, float) else None
             target = round(words * amount) if fraction is not None else amount

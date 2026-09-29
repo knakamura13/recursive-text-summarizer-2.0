@@ -45,3 +45,13 @@ The output-allowance rule is intentionally not capped by the context window. For
 ```
 
 `d5-e2e` holds the diagnostics for a hierarchical publication. Only Gathering 10% (980 words) and Snow Fall at 300 words on the automatic strategy keep the study configuration. The Snow Fall sample document is not a manifest source, and it routes direct on its own. Its hierarchical cases are forced, and the two 65,536-context cases double the study's 32,768 pin. Each case passes its context to both the proxy (`--num-ctx`) and `run_modern.py` (`--context-window`). The proxy refuses, with HTTP 400, any request whose `num_ctx` differs from its pin.
+
+## Exact local token counts (#120)
+
+For an Ollama host on this machine, the working tree counts tokens with the model's own tokenizer, read from its local GGUF file (`run.json` records `counter_identity: gguf:<digest prefix>`). For gemma4 this matched Ollama's `prompt_eval_count` on all 1,742 recorded #107 requests at system + user tokens + 14 template tokens. The pinned revisions and the byte counter are unchanged. A replayed segmentation is checked under the counter that made it, and the merge stage onwards uses the current counter. `d11-replay` replays the same four saved merge inputs as `d5-replay`. With the exact count, only the transcript routes hierarchical on its own at 32,768, so `d11-e2e` runs transcript 25% fresh on the automatic strategy:
+
+```sh
+/private/tmp/rts-study-20260926/venv/bin/python experiments/chapter_comparison/run_study.py --phase d11-replay
+/private/tmp/rts-study-20260926/venv/bin/python experiments/chapter_comparison/run_study.py --phase d11-e2e
+/private/tmp/rts-study-20260926/venv/bin/python experiments/chapter_comparison/collect_results.py --phase d11-replay --phase d11-e2e
+```

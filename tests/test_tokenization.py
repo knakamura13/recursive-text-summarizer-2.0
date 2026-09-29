@@ -1,10 +1,14 @@
+import json
+import struct
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from summarizer.tokenization import (
     ConservativeUtf8TokenCounter,
+    GgufTokenCounter,
     TiktokenCounter,
     TokenAccountingError,
     TokenCounter,
@@ -146,6 +150,102 @@ def test_non_openai_provider_uses_offline_conservative_counter(
     assert isinstance(counter, ConservativeUtf8TokenCounter)
     assert counter.identity == "estimate:utf8-bytes"
     assert counter.count("é") == 2
+
+
+def _write_gguf(path: Path, *, model: str, pre: str) -> None:
+    """Write a minimal GGUF v3 header holding a small SentencePiece BPE vocabulary."""
+    tokens = ["<pad>", "<eos>", "<bos>", "<unk>", "<|turn>", *(f"<0x{b:02X}>" for b in range(256)),
+              "a", "b", "ab", "\u2581", "\u2581ab"]
+    merges = ["a b", "\u2581 ab"]
+
+    def string(value: str) -> bytes:
+        data = value.encode("utf-8")
+        return struct.pack("<Q", len(data)) + data
+
+    def strings(values: list[str]) -> bytes:
+        return struct.pack("<IQ", 8, len(values)) + b"".join(string(v) for v in values)
+
+    entries = [
+        (string("general.architecture"), struct.pack("<I", 8) + string("test")),
+        (string("tokenizer.ggml.model"), struct.pack("<I", 8) + string(model)),
+        (string("tokenizer.ggml.pre"), struct.pack("<I", 8) + string(pre)),
+        (string("tokenizer.ggml.tokens"), struct.pack("<I", 9) + strings(tokens)),
+        (string("tokenizer.ggml.merges"), struct.pack("<I", 9) + strings(merges)),
+        (string("tokenizer.ggml.scores"),
+         struct.pack("<I", 9) + struct.pack("<IQ", 6, len(tokens)) + struct.pack(f"<{len(tokens)}f", *([0.0] * len(tokens)))),
+        (string("tokenizer.ggml.add_bos_token"), struct.pack("<I", 7) + struct.pack("<?", False)),
+    ]
+    path.write_bytes(
+        b"GGUF" + struct.pack("<IQQ", 3, 0, len(entries)) + b"".join(k + v for k, v in entries)
+    )
+
+
+def _install_ollama_model(root: Path, name: str, tag: str, *, model: str = "llama", pre: str = "gemma4") -> str:
+    digest = "sha256:" + "ab" * 32
+    blob = root / "blobs" / digest.replace(":", "-")
+    blob.parent.mkdir(parents=True, exist_ok=True)
+    _write_gguf(blob, model=model, pre=pre)
+    manifest = root / "manifests" / "registry.ollama.ai" / "library" / name / tag
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"layers": [
+        {"mediaType": "application/vnd.ollama.image.license", "digest": "sha256:" + "00" * 32},
+        {"mediaType": "application/vnd.ollama.image.model", "digest": digest},
+    ]}))
+    return digest
+
+
+def test_local_ollama_model_counts_with_its_own_tokenizer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_ollama_model(tmp_path, "tiny", "latest")
+    monkeypatch.setenv("OLLAMA_MODELS", str(tmp_path))
+
+    counter = resolve_token_counter(provider="ollama", model="tiny", ollama_host="http://127.0.0.1:11434")
+
+    assert isinstance(counter, GgufTokenCounter)
+    assert counter.exact is True
+    assert counter.identity == "gguf:" + "ab" * 8
+    # Merges apply: "ab ab" is "ab" + "\u2581ab", two tokens, where bytes count five.
+    assert counter.count("ab ab") == 2
+    # Unknown characters fall back to one token per byte, as the model does.
+    assert counter.count("\U0001f642") == 4
+    # A special-token marker inside text is counted as its pieces, never as one.
+    assert counter.count("<|turn>") == len("<|turn>")
+
+
+@pytest.mark.parametrize(
+    ("host", "model", "pre"),
+    [
+        ("http://10.0.0.5:11434", "tiny", "gemma4"),  # not this machine's store
+        (None, "tiny", "gemma4"),  # no host given
+        ("http://localhost:11434", "tiny", "llama-bpe"),  # tokenizer not checked against Ollama
+        ("http://localhost:11434", "missing", "gemma4"),  # model not installed
+    ],
+)
+def test_ollama_counter_falls_back_to_bytes_unless_verified_and_local(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, host: str | None, model: str, pre: str
+) -> None:
+    _install_ollama_model(tmp_path, "tiny", "latest", pre=pre)
+    monkeypatch.setenv("OLLAMA_MODELS", str(tmp_path))
+
+    counter = resolve_token_counter(provider="ollama", model=model, ollama_host=host)
+
+    assert isinstance(counter, ConservativeUtf8TokenCounter)
+
+
+def test_gguf_prefix_search_returns_a_verified_fitting_slice(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_ollama_model(tmp_path, "tiny", "latest")
+    monkeypatch.setenv("OLLAMA_MODELS", str(tmp_path))
+    counter = resolve_token_counter(provider="ollama", model="tiny", ollama_host="localhost")
+    text = "ab " * 40
+
+    end = counter.fitting_prefix(text, 0, len(text), 10)
+    start = counter.fitting_suffix(text, 0, len(text), 10)
+
+    assert 0 < end < len(text) and counter.count(text[:end]) <= 10
+    assert 0 < start < len(text) and counter.count(text[start:]) <= 10
 
 
 def test_default_model_counter_constructs_against_a_real_encoding() -> None:
