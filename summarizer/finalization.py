@@ -1403,19 +1403,16 @@ def _verify_publication(
     progress: VerificationProgress,
     source_cores: Mapping[str, str] | None = None,
     segments: Sequence[SourceSegment] = (),
+    unfinished: str | None = None,
 ) -> _VerifiedPublication:
     """Verify the editorial draft once, else publish its passing sentences.
 
     With `strict_numbers` on, a rejected numbered sentence may be swapped for
     its source sentence, but only a verification pass over the new draft can
-    publish the swap.
+    publish the swap. `unfinished` is the editorial's cut-off last sentence,
+    already removed from `draft`; it is recorded as removed.
     """
     ledger = _SentenceLedger()
-    draft, unfinished = _split_unfinished_ending(draft)
-    if not draft:
-        raise FinalizationVerificationError(
-            "the editorial draft is one unfinished sentence, so nothing is left to verify"
-        )
     progress.phase("Checking the editorial draft")
     result = verify_and_repair(
         draft,
@@ -1591,9 +1588,41 @@ def _finalize_summary(
         observer=runtime_observer,
     )
     runtime_observer.emit(StageEvent(StageName.WRITING, "completed"))
+    # The cut-off ending is taken from the model's own draft, before literal
+    # restoration appends source sentences that could hide where it stopped.
+    editorial_text, unfinished = (
+        _split_unfinished_ending(editorial.text)
+        if verification.enabled
+        else (editorial.text, None)
+    )
+    if not editorial_text:
+        _build_audit(
+            audit_path=audit_path,
+            source_id=source_id,
+            strategy=strategy,
+            model=model,
+            audit_configuration=audit_configuration,
+            segments=segments,
+            segment_parents={},
+            nodes=nodes,
+            root_node_id=root_node_id,
+            citations=(),
+            generations=(*generations, *compression_generations, editorial.generation),
+            warnings=tuple(warnings),
+            failures=(*failures, "editorial_draft_unfinished"),
+            verification=None,
+            verification_enabled=True,
+            publication=None,
+            reliability_resume=reliability_resume,
+            reliability_tracker=reliability_tracker,
+            materialize=True,
+        )
+        raise FinalizationVerificationError(
+            "the editorial draft is one unfinished sentence, so nothing is left to verify"
+        )
     final_text = retain_sentences_with_missing_literals(
         root.summary,
-        editorial.text,
+        editorial_text,
         strict_numbers=verification.strict_numbers,
         strict_names=verification.strict_names,
     )
@@ -1637,6 +1666,7 @@ def _finalize_summary(
             progress=VerificationProgress(runtime_observer),
             source_cores=source_cores,
             segments=segments,
+            unfinished=unfinished,
         )
         if outcome.result.failed:
             _build_audit(

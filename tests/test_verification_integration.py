@@ -1149,9 +1149,10 @@ def test_an_infeasible_editorial_target_is_refused_before_any_call() -> None:
 class _EndingProvider(VerificationPipelineProvider):
     """Returns a fixed editorial draft; the verifier supports every claim it is asked about."""
 
-    def __init__(self, draft: str) -> None:
+    def __init__(self, draft: str, summary: str = "Grounded level 0.") -> None:
         super().__init__(verification="supported")
         self.draft = draft
+        self.summary = summary
 
     def generate(self, request):
         self.requests.append(request)
@@ -1159,7 +1160,7 @@ class _EndingProvider(VerificationPipelineProvider):
         if operation == "editorial-final":
             payload = {"text": self.draft}
         elif operation == "D000001":
-            payload = self._node(0, operation)
+            payload = {**self._node(0, operation), "summary": self.summary}
         elif operation.startswith("verification-decompose:"):
             inputs = json.loads(request.input_text.splitlines()[1])
             payload = {
@@ -1192,8 +1193,8 @@ class _EndingProvider(VerificationPipelineProvider):
         return GenerationResult(json.dumps(payload), "fake", request.model)
 
 
-def _run_with_draft(tmp_path, draft: str):
-    provider = _EndingProvider(draft)
+def _run_with_draft(tmp_path, draft: str, *, summary: str = "Grounded level 0.", strict_numbers=False):
+    provider = _EndingProvider(draft, summary)
     stages = []
     result = run_pipeline(
         ingest_text("The lake froze in 1910."),
@@ -1204,7 +1205,9 @@ def _run_with_draft(tmp_path, draft: str):
         config=PipelineConfig(
             target_words=40,
             audit_path=tmp_path / "audit.json",
-            verification=VerificationConfig(enabled=True, max_repair_passes=0),
+            verification=VerificationConfig(
+                enabled=True, max_repair_passes=0, strict_numbers=strict_numbers
+            ),
         ),
         observer=RuntimeObserver(on_stage=stages.append),
     )
@@ -1260,3 +1263,28 @@ def test_a_last_sentence_closed_by_a_quote_or_emphasis_is_complete(tmp_path, dra
 def test_a_draft_that_is_one_unfinished_sentence_is_not_published(tmp_path) -> None:
     with pytest.raises(FinalizationVerificationError, match="unfinished"):
         _run_with_draft(tmp_path, "The lake froze so that")
+    audit = json.loads((tmp_path / "audit.json").read_text(encoding="utf-8"))
+    assert "publication" not in audit
+    assert "editorial_draft_unfinished" in audit["failures"]
+
+
+def test_a_restored_source_sentence_does_not_hide_an_unfinished_ending(tmp_path) -> None:
+    # With strict numbers, the dropped "1910" sentence is appended after the
+    # draft, so the draft as restored ends in punctuation.
+    provider, _, result = _run_with_draft(
+        tmp_path,
+        "The lake was cold. The lake froze so that",
+        summary="The lake froze in 1910.",
+        strict_numbers=True,
+    )
+
+    assert "so that" not in result.final.text
+    audit = json.loads(serialize_audit(result.final.audit))
+    removed = audit["publication"]["removed_sentences"]
+    assert {"text": "The lake froze so that", "verdict": "unfinished",
+            "reason": "The draft ended before this sentence did."} in removed
+    assert not any(
+        "so that" in request.input_text
+        for request in provider.requests
+        if (request.operation_id or "").startswith("verification-")
+    )
