@@ -1,3 +1,5 @@
+import json
+
 from summarizer.compression import (
     BAND_TOLERANCE,
     RETENTION_RATIO,
@@ -11,6 +13,7 @@ from summarizer.compression import (
     _under_floor,
 )
 from summarizer.providers.base import GenerationResult
+from summarizer.text import default_sentence_tokenizer
 
 
 class Provider:
@@ -81,7 +84,8 @@ def test_compress_pass_invokes_provider() -> None:
 
 
 class Trimming:
-    """Keep a fixed fraction of each chunk's words; record pass indexes."""
+    """Keep about a fixed fraction of each chunk's words in whole sentences;
+    record pass indexes."""
 
     def __init__(self, keep: float) -> None:
         self.keep = keep
@@ -89,8 +93,14 @@ class Trimming:
 
     def generate(self, request):
         self.passes.append(int(request.operation_id.split(":C")[1][:2]))
-        words = request.input_text.split("\n", 1)[1].rsplit("\n", 1)[0].split()
-        text = " ".join(words[: max(1, round(len(words) * self.keep))])
+        chunk = request.input_text.split("\n", 1)[1].rsplit("\n", 1)[0]
+        wanted = max(1, round(len(chunk.split()) * self.keep))
+        kept: list[str] = []
+        for sentence in default_sentence_tokenizer(chunk):
+            if kept and len(" ".join(kept).split()) >= wanted:
+                break
+            kept.append(sentence.strip())
+        text = " ".join(kept)
         return GenerationResult(text=f'{{"text": "{text}"}}', provider="fake", model=request.model)
 
 
@@ -360,3 +370,41 @@ def test_an_unpunctuated_run_is_sent_in_bounded_chunks_with_their_allowances() -
     # one long sentence rejoin with a space rather than a paragraph break.
     assert "\u5b57" * 2_500 in result.text
     assert "\n\n" not in result.text
+
+
+# One chunk: a quotation-heavy passage well above a small target.
+_QUOTED = (
+    "The coach met the team before the final. She told them the plan in detail. "
+    "The captain repeated the plan to every player on the bench. "
+    "Everyone agreed to follow it for the whole of the second half."
+)
+
+
+def _compress_once(answer: str, chunk: str = _QUOTED):
+    provider = Provider([json.dumps({"text": answer})])
+    result = compress_to_target(
+        chunk, provider, source_id="a" * 64, model="m", timeout_seconds=30, target_words=5
+    )
+    return provider, result
+
+
+def test_a_shortened_chunk_that_stops_mid_sentence_is_discarded_and_the_chunk_kept() -> None:
+    # A double quotation mark closed the JSON text field mid-sentence.
+    provider, result = _compress_once("The coach met the team. She told them ")
+
+    assert result.text == _QUOTED
+    assert result.passes == 0
+    assert provider.calls == 1
+
+
+def test_a_complete_shortened_chunk_is_used() -> None:
+    _, result = _compress_once("The coach told the team the plan. They followed it.")
+
+    assert result.text == "The coach told the team the plan. They followed it."
+
+
+def test_a_chunk_that_itself_ends_mid_sentence_keeps_its_shortened_answer() -> None:
+    chunk = _QUOTED + " The last line of the page ran on to the next and"
+    _, result = _compress_once("The coach told the team the plan and", chunk)
+
+    assert result.text == "The coach told the team the plan and"
