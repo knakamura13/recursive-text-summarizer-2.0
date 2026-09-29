@@ -313,6 +313,7 @@ def _compress_chunk(
     strict_numbers: bool,
     strict_names: bool,
     limits: RequestLimits | None,
+    split: bool,
 ) -> tuple[str, GenerationResult | None]:
     input_words = word_count(chunk)
     target_word_count = max(1, int(input_words * RETENTION_RATIO))
@@ -383,11 +384,10 @@ def _compress_chunk(
     # A shortened chunk that stops mid-sentence lost the rest of the chunk,
     # usually at a double quotation mark that closed the JSON text field. It
     # is discarded and the chunk kept as it was, so no fact is dropped; the
-    # next pass tries the chunk again.
-    if (
-        split_unfinished_ending(text)[1] is not None
-        and split_unfinished_ending(chunk.strip())[1] is None
-    ):
+    # next pass tries the chunk again. Only a piece split out of an over-long
+    # sentence may end unfinished, because its input ends where the cut fell;
+    # a chunk of whole sentences whose own last line runs on is still checked.
+    if not split and split_unfinished_ending(text)[1] is not None:
         text = chunk.strip()
     return retain_sentences_with_missing_literals(
         chunk,
@@ -413,7 +413,7 @@ def _compress_pass(
     chunks = _compression_chunks(text)
     generations: list[GenerationResult] = []
     output = ""
-    for index, (separator, chunk) in enumerate(chunks, start=1):
+    for index, (separator, chunk, split) in enumerate(chunks, start=1):
         compressed, generation = _compress_chunk(
             chunk,
             provider,
@@ -426,6 +426,7 @@ def _compress_pass(
             strict_numbers=strict_numbers,
             strict_names=strict_names,
             limits=limits,
+            split=split,
         )
         output = f"{output}{separator}{compressed}" if output else compressed
         if generation is not None:
@@ -433,20 +434,22 @@ def _compress_pass(
     return output, tuple(generations)
 
 
-def _compression_chunks(text: str) -> list[tuple[str, str]]:
-    """Return `(separator, chunk)` pairs that rejoin into the pass's output.
+def _compression_chunks(text: str) -> list[tuple[str, str, bool]]:
+    """Return `(separator, chunk, split)` triples that rejoin into the pass's output.
 
     Sentence chunks are separated by a blank line. A sentence longer than the
     limit would otherwise be sent as one request of unbounded size, which its
     request budget would have to refuse, so it is split between words and its
     pieces rejoin with a space. A word longer than the limit, as in unspaced
     scripts or a long identifier, is cut into slices that rejoin with no
-    separator, so a slice kept verbatim restores the original word.
+    separator, so a slice kept verbatim restores the original word. `split`
+    marks those pieces, which end wherever the cut fell rather than at the
+    end of a sentence.
     """
-    chunks: list[tuple[str, str]] = []
+    chunks: list[tuple[str, str, bool]] = []
     for chunk in chunk_text_by_sentences(text, CHUNK_CHAR_LIMIT):
         if len(chunk) <= CHUNK_CHAR_LIMIT:
-            chunks.append(("\n\n", chunk))
+            chunks.append(("\n\n", chunk, False))
             continue
         current = ""
         current_separator = "\n\n"
@@ -455,12 +458,12 @@ def _compression_chunks(text: str) -> list[tuple[str, str]]:
                 piece = word[start : start + CHUNK_CHAR_LIMIT]
                 joiner = " " if start == 0 else ""
                 if current and len(current) + len(joiner) + len(piece) > CHUNK_CHAR_LIMIT:
-                    chunks.append((current_separator, current))
+                    chunks.append((current_separator, current, True))
                     current, current_separator = piece, joiner
                 else:
                     current = f"{current}{joiner}{piece}" if current else piece
         if current:
-            chunks.append((current_separator, current))
+            chunks.append((current_separator, current, True))
     return chunks
 
 

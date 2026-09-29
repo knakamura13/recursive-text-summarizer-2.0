@@ -5,6 +5,7 @@ from summarizer.compression import (
     RETENTION_RATIO,
     build_compression_request,
     compress_to_target,
+    compression_pass_work_ids,
     retain_sentences_with_missing_literals,
     retain_sentences_with_omitted_numbers,
     word_count,
@@ -149,7 +150,7 @@ def test_passes_stop_and_keep_the_longer_text_when_a_pass_no_longer_shortens() -
 
 
 class Scheduled:
-    """Drop a scheduled number of words in each pass over one chunk."""
+    """Drop a scheduled number of words in each pass over one sentence."""
 
     def __init__(self, drops: dict[int, int]) -> None:
         self.drops = drops
@@ -159,14 +160,14 @@ class Scheduled:
         pass_index = int(request.operation_id.split(":C")[1][:2])
         self.passes.append(pass_index)
         words = request.input_text.split("\n", 1)[1].rsplit("\n", 1)[0].split()
-        text = " ".join(words[: len(words) - self.drops.get(pass_index, 1)])
+        text = " ".join(words[: len(words) - self.drops.get(pass_index, 1)]).rstrip(".") + "."
         return GenerationResult(text=f'{{"text": "{text}"}}', provider="fake", model=request.model)
 
 
 def _run_scheduled(drops: dict[int, int]) -> Scheduled:
     provider = Scheduled(drops)
     compress_to_target(
-        " ".join(f"w{index}" for index in range(150)),
+        " ".join(f"w{index}" for index in range(150)) + ".",
         provider,
         source_id="a" * 64,
         model="m",
@@ -403,8 +404,19 @@ def test_a_complete_shortened_chunk_is_used() -> None:
     assert result.text == "The coach told the team the plan. They followed it."
 
 
-def test_a_chunk_that_itself_ends_mid_sentence_keeps_its_shortened_answer() -> None:
+def test_a_chunk_that_itself_ends_mid_sentence_still_rejects_a_cut_answer() -> None:
     chunk = _QUOTED + " The last line of the page ran on to the next and"
     _, result = _compress_once("The coach told the team the plan and", chunk)
 
-    assert result.text == "The coach told the team the plan and"
+    assert result.text == chunk
+
+
+def test_pieces_of_an_over_long_sentence_keep_their_shortened_answers() -> None:
+    # One unpunctuated run of about 2,400 characters is split into pieces
+    # that end wherever the cut fell.
+    source = " ".join(f"item{index}" for index in range(300))
+    _, result = _compress_once("The run went on and", source)
+
+    pieces = len(compression_pass_work_ids(source, 1))
+    assert pieces > 1
+    assert result.text == " ".join(["The run went on and"] * pieces)
