@@ -132,6 +132,10 @@ _REMOVAL_REASONS = {
     ),
 }
 _UNVERIFIED_REASON = "Verification could not check this sentence."
+_UNFINISHED_REASON = "The draft ended before this sentence did."
+# A complete sentence ends in terminal punctuation, optionally followed by
+# closing quotes, brackets or emphasis markers.
+_SENTENCE_END = re.compile(r"[.!?…。！？][\"'”’»)\]}*_]*\Z")
 _COMPLETED_DETAIL = {
     "editorial": "Editorial draft verified",
     "content_unit_fallback": "Published verified content units",
@@ -178,6 +182,25 @@ def _original_sentence_spans(text: str) -> list[tuple[int, int, str]]:
         spans.append((index, index + len(sentence), sentence.strip()))
         cursor = index + len(sentence)
     return spans
+
+
+def _split_unfinished_ending(draft: str) -> tuple[str, str | None]:
+    """Split off the draft's last sentence when it stops without ending.
+
+    A model that stops mid-sentence leaves a fragment that makes no complete
+    claim, so it is never verified or published. Only the last sentence is
+    checked: earlier ones without terminal punctuation may be list items or
+    headings, and the tokenizer joins a mid-text fragment to what follows.
+    The draft's own ending is tested, because the tokenizer splits a closing
+    marker such as ``**`` into a piece of its own.
+    """
+    spans = _original_sentence_spans(draft)
+    if not spans or _SENTENCE_END.search(draft.rstrip()):
+        return draft, None
+    start, _, text = spans[-1]
+    if not any(character.isalnum() for character in text):
+        return draft, None
+    return draft[:start].rstrip(), text
 
 
 def _supported_fragment_text(result: VerificationPassResult, unit_text: str) -> str | None:
@@ -1359,8 +1382,12 @@ class _VerifiedPublication:
         """The VERIFYING stage's closing description."""
         if self.kind != "verified_subset":
             return _COMPLETED_DETAIL[self.kind]
-        count = len(self.removed)
-        return f"Removed {count} unsupported sentence{'' if count == 1 else 's'}"
+        unfinished = sum(1 for item in self.removed if item.verdict == "unfinished")
+        count = len(self.removed) - unfinished
+        parts = [f"{count} unsupported sentence{'' if count == 1 else 's'}"] if count else []
+        if unfinished:
+            parts.append("1 unfinished sentence")
+        return f"Removed {' and '.join(parts)}"
 
 
 def _verify_publication(
@@ -1376,12 +1403,14 @@ def _verify_publication(
     progress: VerificationProgress,
     source_cores: Mapping[str, str] | None = None,
     segments: Sequence[SourceSegment] = (),
+    unfinished: str | None = None,
 ) -> _VerifiedPublication:
     """Verify the editorial draft once, else publish its passing sentences.
 
     With `strict_numbers` on, a rejected numbered sentence may be swapped for
     its source sentence, but only a verification pass over the new draft can
-    publish the swap.
+    publish the swap. `unfinished` is the editorial's cut-off last sentence,
+    already removed from `draft`; it is recorded as removed.
     """
     ledger = _SentenceLedger()
     progress.phase("Checking the editorial draft")
@@ -1434,10 +1463,26 @@ def _verify_publication(
         if not result.failed and result.pass_results
         else frozenset()
     )
+    removed = ledger.removed(published)
+    if unfinished is not None and not result.failed:
+        removed = (
+            *removed,
+            AuditRemovedSentence(
+                text=unfinished, verdict="unfinished", reason=_UNFINISHED_REASON
+            ),
+        )
+        if kind == "editorial":
+            kind = "verified_subset"
+            code = ("verified_sentence_subset",)
+            result = replace(
+                result,
+                diagnostic_codes=(*result.diagnostic_codes, *code),
+                warning_codes=(*result.warning_codes, *code),
+            )
     return _VerifiedPublication(
         kind=kind,
         result=result,
-        removed=ledger.removed(published),
+        removed=removed,
         generations=generations,
         substitutions=substitutions,
     )
@@ -1543,9 +1588,41 @@ def _finalize_summary(
         observer=runtime_observer,
     )
     runtime_observer.emit(StageEvent(StageName.WRITING, "completed"))
+    # The cut-off ending is taken from the model's own draft, before literal
+    # restoration appends source sentences that could hide where it stopped.
+    editorial_text, unfinished = (
+        _split_unfinished_ending(editorial.text)
+        if verification.enabled
+        else (editorial.text, None)
+    )
+    if not editorial_text:
+        _build_audit(
+            audit_path=audit_path,
+            source_id=source_id,
+            strategy=strategy,
+            model=model,
+            audit_configuration=audit_configuration,
+            segments=segments,
+            segment_parents={},
+            nodes=nodes,
+            root_node_id=root_node_id,
+            citations=(),
+            generations=(*generations, *compression_generations, editorial.generation),
+            warnings=tuple(warnings),
+            failures=(*failures, "editorial_draft_unfinished"),
+            verification=None,
+            verification_enabled=True,
+            publication=None,
+            reliability_resume=reliability_resume,
+            reliability_tracker=reliability_tracker,
+            materialize=True,
+        )
+        raise FinalizationVerificationError(
+            "the editorial draft is one unfinished sentence, so nothing is left to verify"
+        )
     final_text = retain_sentences_with_missing_literals(
         root.summary,
-        editorial.text,
+        editorial_text,
         strict_numbers=verification.strict_numbers,
         strict_names=verification.strict_names,
     )
@@ -1589,6 +1666,7 @@ def _finalize_summary(
             progress=VerificationProgress(runtime_observer),
             source_cores=source_cores,
             segments=segments,
+            unfinished=unfinished,
         )
         if outcome.result.failed:
             _build_audit(

@@ -159,6 +159,8 @@ Retryable timeout, rate-limit, connection, and server failures use bounded expon
 
 When a decomposition or claim-check answer omits, repeats, or misanswers some spans or claims, only those items are asked again, under their original ids: first in groups half the size of the largest first batch (skipped when that batch held one item), then one at a time, so no item is asked more than three times. An item still unfinished after that is recorded in the audit pass's `unresolved[]` (`omitted`, `invalid_response`, or `capacity`), its sentence is never published, and the run reports `verification_incomplete`. Sentences whose claims were all checked and supported can still publish as a verified subset; its last audit pass is then not `complete` and keeps the `unresolved[]` entries for the sentences it withheld.
 
+A draft whose last sentence stops before its end, as when the model stops writing mid-sentence, loses that sentence before verification. The audit lists it in `removed_sentences[]` with verdict `unfinished`, and the rest of the draft is verified and published as a verified subset. A draft that is only an unfinished sentence is not published. Earlier sentences without terminal punctuation are not treated as unfinished, because they may be headings or list items.
+
 The offline evaluator uses a deterministic, source-sensitive fake provider. It tests orchestration, provenance, source mutation behavior, and rubric evidence; it does not measure live-model coherence or quality. Live OpenAI/Ollama quality must be inspected separately and is not guaranteed by this project.
 
 ## Migration from the original workflow
