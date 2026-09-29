@@ -53,6 +53,43 @@ def default_sentence_tokenizer(text: str) -> list[str]:
     return _SENTENCE_TOKENIZER.tokenize(text)
 
 
+# A complete sentence ends in terminal punctuation, optionally followed by
+# closing quotes, brackets or emphasis markers.
+_SENTENCE_END = re.compile(r"[.!?…。！？][\"'”’»)\]}*_]*\Z")
+
+
+def original_sentence_spans(text: str) -> list[tuple[int, int, str]]:
+    """`(start, end, stripped text)` of each tokenizer sentence in `text`."""
+    spans: list[tuple[int, int, str]] = []
+    cursor = 0
+    for sentence in default_sentence_tokenizer(text):
+        index = text.find(sentence, cursor)
+        if index < 0:
+            return []
+        spans.append((index, index + len(sentence), sentence.strip()))
+        cursor = index + len(sentence)
+    return spans
+
+
+def split_unfinished_ending(draft: str) -> tuple[str, str | None]:
+    """Split off the draft's last sentence when it stops without ending.
+
+    A model that stops mid-sentence leaves a fragment that makes no complete
+    claim. Only the last sentence is checked: earlier ones without terminal
+    punctuation may be list items or headings, and the tokenizer joins a
+    mid-text fragment to what follows. The draft's own ending is tested,
+    because the tokenizer splits a closing marker such as ``**`` into a piece
+    of its own.
+    """
+    spans = original_sentence_spans(draft)
+    if not spans or _SENTENCE_END.search(draft.rstrip()):
+        return draft, None
+    start, _, text = spans[-1]
+    if not any(character.isalnum() for character in text):
+        return draft, None
+    return draft[:start].rstrip(), text
+
+
 def normalize_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip()).strip()
 

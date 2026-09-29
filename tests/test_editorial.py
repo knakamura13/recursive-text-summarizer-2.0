@@ -2,9 +2,11 @@ import json
 
 import pytest
 
+from summarizer.cache import CacheStore
 from summarizer.editorial import EditorialError, build_editorial_request, write_editorial
 from summarizer.providers.base import GenerationRequest, GenerationResult
 from summarizer.runtime.observers import ItemFailedError, RuntimeObserver, StageName
+from summarizer.segmentation import CacheCoordinator
 from summarizer.summaries import SummaryNode
 
 
@@ -278,3 +280,98 @@ def test_an_estimated_count_still_refuses_a_draft_with_more_words_than_output_to
 
     assert caught.value.failure is BudgetFailure.OUTPUT_CANNOT_HOLD_DRAFT
     assert provider.requests == []
+
+
+# A local model writing JSON under a grammar ends the text field at an
+# unescaped double quotation mark, so its draft stops where a quotation began.
+_CUT = json.dumps({"text": "The team met weekly. The lead said the goal was to "})
+_COMPLETE = json.dumps({"text": "The team met weekly. The lead named one goal."})
+
+
+def _write(provider):
+    observer, events = _recording_observer()
+    result = write_editorial(
+        root(),
+        provider,
+        source_id=SOURCE_ID,
+        model="m",
+        timeout_seconds=30,
+        target_words=50,
+        observer=observer,
+    )
+    return result, events
+
+
+def test_a_draft_that_stops_mid_sentence_is_asked_for_again_with_the_reason() -> None:
+    provider = ScriptedProvider(_CUT, _COMPLETE)
+
+    result, events = _write(provider)
+
+    assert result.text == "The team met weekly. The lead named one goal."
+    first, second = provider.requests
+    assert second.input_text == first.input_text
+    assert "stops mid-sentence" in second.instructions
+    assert [state for state, _, _ in events] == ["active", "retrying", "completed"]
+    assert "stops mid-sentence" in events[1][2]
+
+
+def test_the_last_unfinished_draft_is_kept_when_no_reask_finishes() -> None:
+    provider = ScriptedProvider(_CUT, _CUT, _CUT)
+
+    result, events = _write(provider)
+
+    assert len(provider.requests) == 3
+    assert result.text == "The team met weekly. The lead said the goal was to"
+    assert [state for state, _, _ in events] == ["active", "retrying", "retrying", "completed"]
+    assert "stops mid-sentence" in events[-1][2]
+
+
+def test_an_invalid_reask_answer_does_not_cost_the_unfinished_draft() -> None:
+    provider = ScriptedProvider(_CUT, "not json", "not json")
+
+    result, events = _write(provider)
+
+    assert result.text == "The team met weekly. The lead said the goal was to"
+    assert events[-1][0] == "completed"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["The lead named one goal.", "The lead said 'one goal.'", "**The lead named one goal.**"],
+)
+def test_a_complete_draft_is_not_asked_for_again(text: str) -> None:
+    provider = ScriptedProvider(json.dumps({"text": text}))
+
+    result, _ = _write(provider)
+
+    assert result.text == text
+    assert len(provider.requests) == 1
+
+
+def _cached_write(tmp_path, *responses: str) -> ScriptedProvider:
+    provider = ScriptedProvider(*responses)
+    provider.cache_coordinator = CacheCoordinator(
+        store=CacheStore(tmp_path / "cache"), source_id=SOURCE_ID,
+        provider="openai", model="m", ollama_host="",
+        counter_identity="test:characters",
+        counter_exact=True, context_window_tokens=100_000,
+        behavior={},
+    )
+    _write(provider)
+    return provider
+
+
+def test_a_kept_unfinished_draft_is_not_cached(tmp_path) -> None:
+    _cached_write(tmp_path, _CUT, _CUT, _CUT)
+
+    later = _cached_write(tmp_path, _COMPLETE)
+
+    assert len(later.requests) == 1
+
+
+def test_a_complete_draft_is_cached(tmp_path) -> None:
+    _cached_write(tmp_path, _CUT, _COMPLETE)
+
+    later = _cached_write(tmp_path)
+
+    assert later.requests == []
