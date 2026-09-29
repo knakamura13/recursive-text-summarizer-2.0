@@ -33,7 +33,7 @@ from summarizer.segmentation import CacheCoordinator
 from summarizer.summaries import SummaryNode
 from summarizer.text import split_unfinished_ending
 
-EDITORIAL_PROMPT_VERSION = "editorial-prompt/4"
+EDITORIAL_PROMPT_VERSION = "editorial-prompt/5"
 EDITORIAL_SCHEMA_NAME = "final_editorial_draft"
 EDITORIAL_WORK_ID = "editorial-final"
 # The `{"text": ...}` answer object around the rewritten draft, as for a
@@ -42,11 +42,17 @@ _FINAL_DRAFT_WRAPPER_TOKENS = 64
 
 _INSTRUCTIONS = """\
 Write one standalone final summary from the grounded summary record supplied as
-data. The record's summary field is already near the intended length of about
-{target_words} words. Polish it for clear organization, consistent terminology,
-and minimal repetition. You may tighten wording. Do not drop a number, date,
-or count. If keeping those facts makes the summary longer than {target_words}
-words, keep the facts.
+data. The record's summary field is the text to keep: it is already near the
+intended length of about {target_words} words. Polish it for clear
+organization, consistent terminology, and minimal repetition. You may tighten
+wording, but keep every point it makes, so the result stays near its length.
+Do not drop a number, date, or count. If keeping those facts makes the summary
+longer than {target_words} words, keep the facts.
+
+The record's content_units, when present, are grounded facts that support the
+summary. They are not a replacement for it and not a shorter version to write
+instead. Keep each of their facts that the summary field does not already
+state.
 
 Return one JSON object conforming to the supplied schema, and nothing else.
 
