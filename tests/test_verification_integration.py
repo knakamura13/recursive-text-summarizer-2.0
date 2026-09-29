@@ -1144,3 +1144,119 @@ def test_an_infeasible_editorial_target_is_refused_before_any_call() -> None:
     assert error.value.budget.stage == "editorial"
     assert error.value.budget.output_allowance_tokens == 121_024
     assert provider.requests == []
+
+
+class _EndingProvider(VerificationPipelineProvider):
+    """Returns a fixed editorial draft; the verifier supports every claim it is asked about."""
+
+    def __init__(self, draft: str) -> None:
+        super().__init__(verification="supported")
+        self.draft = draft
+
+    def generate(self, request):
+        self.requests.append(request)
+        operation = request.operation_id or ""
+        if operation == "editorial-final":
+            payload = {"text": self.draft}
+        elif operation == "D000001":
+            payload = self._node(0, operation)
+        elif operation.startswith("verification-decompose:"):
+            inputs = json.loads(request.input_text.splitlines()[1])
+            payload = {
+                "spans": [
+                    {"span_id": item["span_id"], "anchors": [item["text"].strip()]}
+                    for item in inputs
+                ]
+            }
+        elif operation.startswith("verification-classify:"):
+            claims = json.loads(request.input_text.splitlines()[1])["claims"]
+            payload = {
+                "findings": [
+                    {
+                        "claim_id": claim["claim_id"],
+                        "verdict": "supported",
+                        "evidence": [
+                            {
+                                "segment_id": claim["evidence"][0]["segment_id"],
+                                "exact_quote": "lake froze in 1910",
+                            }
+                        ],
+                    }
+                    for claim in claims
+                ]
+            }
+        elif operation.startswith("compression:"):
+            payload = self._compression(request)
+        else:  # pragma: no cover - unexpected calls indicate a pipeline regression
+            raise AssertionError(f"unexpected operation {operation}")
+        return GenerationResult(json.dumps(payload), "fake", request.model)
+
+
+def _run_with_draft(tmp_path, draft: str):
+    provider = _EndingProvider(draft)
+    stages = []
+    result = run_pipeline(
+        ingest_text("The lake froze in 1910."),
+        provider,
+        CharacterCounter(),
+        app=app(),
+        strategy=strategy(),
+        config=PipelineConfig(
+            target_words=40,
+            audit_path=tmp_path / "audit.json",
+            verification=VerificationConfig(enabled=True, max_repair_passes=0),
+        ),
+        observer=RuntimeObserver(on_stage=stages.append),
+    )
+    return provider, stages, result
+
+
+def test_an_unfinished_last_sentence_is_removed_even_when_the_verifier_supports_it(
+    tmp_path,
+) -> None:
+    provider, stages, result = _run_with_draft(
+        tmp_path, "The lake froze in 1910. The lake froze so that"
+    )
+
+    assert result.final.text == "The lake froze in 1910."
+    audit = json.loads(serialize_audit(result.final.audit))
+    publication = audit["publication"]
+    assert publication["kind"] == "verified_subset"
+    assert "verified_sentence_subset" in audit["warnings"]
+    assert [sentence["text"] for sentence in publication["sentences"]] == [
+        "The lake froze in 1910."
+    ]
+    assert publication["removed_sentences"] == [
+        {
+            "text": "The lake froze so that",
+            "verdict": "unfinished",
+            "reason": "The draft ended before this sentence did.",
+        }
+    ]
+    # The fragment is never sent to the verifier.
+    verifier_inputs = [
+        request.input_text
+        for request in provider.requests
+        if (request.operation_id or "").startswith("verification-")
+    ]
+    assert verifier_inputs and not any("so that" in text for text in verifier_inputs)
+    verifying = [event for event in stages if event.stage is StageName.VERIFYING]
+    assert verifying[-1].detail == "Removed 1 unfinished sentence"
+
+
+@pytest.mark.parametrize(
+    "draft",
+    ['The report said "The lake froze in 1910."', "The lake froze. **It froze in 1910.**"],
+)
+def test_a_last_sentence_closed_by_a_quote_or_emphasis_is_complete(tmp_path, draft) -> None:
+    _, _, result = _run_with_draft(tmp_path, draft)
+
+    assert result.final.text == draft
+    audit = json.loads(serialize_audit(result.final.audit))
+    assert audit["publication"]["kind"] == "editorial"
+    assert audit["publication"]["removed_sentences"] == []
+
+
+def test_a_draft_that_is_one_unfinished_sentence_is_not_published(tmp_path) -> None:
+    with pytest.raises(FinalizationVerificationError, match="unfinished"):
+        _run_with_draft(tmp_path, "The lake froze so that")

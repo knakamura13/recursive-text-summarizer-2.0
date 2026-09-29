@@ -37,7 +37,8 @@ JSON paths read by the web application (offsets are code points, i.e. Python
   - `removed_sentences[]`: sentences dropped from the published candidate, in
     the order verification first saw them, with `text`, `verdict`
     (`contradicted`, `insufficiently_supported`, `not_meaningfully_verifiable`,
-    or `unverified`), and a readable `reason`.
+    `unverified`, or `unfinished` for a last draft sentence that stops before
+    its end and is never verified), and a readable `reason`.
   - `substitutions[]`, absent when none was proposed: with `strict_numbers`
     on, each rejected draft sentence swapped for a source sentence, with
     `original_text`, `original_verdict`, `replacement_text`, the verifier's
@@ -672,6 +673,7 @@ class AuditRemovedSentence(_AuditRecord):
         "insufficiently_supported",
         "not_meaningfully_verifiable",
         "unverified",
+        "unfinished",
     ]
     reason: str
 
