@@ -374,3 +374,13 @@ def test_a_complete_draft_is_cached(tmp_path) -> None:
     later = _cached_write(tmp_path)
 
     assert later.requests == []
+
+
+def test_the_summary_to_keep_comes_before_the_supporting_units() -> None:
+    record = root().model_copy(update={"content_units": ()})
+    request = build_editorial_request(
+        record, source_id=SOURCE_ID, model="m", timeout_seconds=30, target_words=120
+    )
+
+    payload = request.input_text
+    assert payload.index('"summary"') < payload.index('"content_units"')
