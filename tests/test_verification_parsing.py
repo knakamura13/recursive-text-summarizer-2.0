@@ -258,3 +258,65 @@ def test_finding_parser_rejects_blank_quotes_and_duplicate_evidence(evidence) ->
             claims=claims,
             selected={claims[0].claim_id: {"S000001": "irrelevant source passage Fact"}},
         )
+
+
+def _one_claim_findings(quotes: list[str], passage: str):
+    spans = split_draft_spans("Claim.", pass_index=1)
+    claims = parse_claim_anchors(
+        '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
+        spans=spans,
+        pass_index=1,
+    )
+    response = json.dumps({"findings": [{
+        "claim_id": claims[0].claim_id,
+        "verdict": "supported",
+        "evidence": [{"segment_id": "S000001", "exact_quote": quote} for quote in quotes],
+    }]})
+    return parse_claim_findings(
+        response, claims=claims, selected={claims[0].claim_id: {"S000001": passage}}
+    )
+
+
+# A source extracted from a PDF keeps its line breaks and typographic marks,
+# which a model copying a quote returns as spaces and plain characters.
+_PASSAGE = "Before.  The group\nhad \u201cone rule\u201d \u2014 it didn\u2019t\n\nbend. After."
+
+
+@pytest.mark.parametrize(
+    "quote",
+    (
+        'The group had "one rule" - it didn\'t bend.',
+        "The group had \u201cone rule\u201d \u2014 it didn\u2019t bend.",
+        '  The group\thad "one rule" - it didn\'t  bend.  ',
+    ),
+)
+def test_a_quote_differing_only_in_spacing_or_quote_marks_is_recorded_as_the_source_text(
+    quote,
+) -> None:
+    findings = _one_claim_findings([quote], _PASSAGE)
+
+    assert findings[0].verdict is ClaimVerdict.SUPPORTED
+    assert findings[0].exact_quotes == (
+        "The group\nhad \u201cone rule\u201d \u2014 it didn\u2019t\n\nbend.",
+    )
+
+
+@pytest.mark.parametrize(
+    "quote",
+    (
+        'The group had "one law" - it didn\'t bend.',
+        'The group had "one rule" - it did not bend.',
+        "group had one rule it didn't bend",
+    ),
+)
+def test_a_quote_differing_by_any_other_character_is_still_rejected(quote) -> None:
+    with pytest.raises(VerificationResponseError, match="quote not in evidence"):
+        _one_claim_findings([quote], _PASSAGE)
+
+
+def test_two_quotes_of_the_same_source_text_count_once() -> None:
+    findings = _one_claim_findings(
+        ['it didn\'t bend.', "it didn\u2019t\n\nbend."], _PASSAGE
+    )
+
+    assert findings[0].exact_quotes == ("it didn\u2019t\n\nbend.",)
