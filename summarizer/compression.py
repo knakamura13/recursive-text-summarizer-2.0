@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from summarizer.budget import OverheadMeasurement, RequestLimits, measure_request_tokens
 from summarizer.leaf import _describe, _extract_json_object, _sanitize
 from summarizer.providers.base import GenerationRequest, GenerationResult, ModelProvider
+from summarizer.reask import INVALID_OUTPUT_ERRORS
 from summarizer.safety import redact_text
 from summarizer.segmentation import CacheCoordinator
 from summarizer.text import (
@@ -349,11 +350,21 @@ def _compress_chunk(
         return redact_text(CompressedDraft.model_validate(payload).text).strip()
 
     generation: GenerationResult | None = None
+    kept = False
 
     def compute() -> str:
-        nonlocal generation
-        generation = provider.generate(request)
-        return redact_text(parse_compressed_draft(generation.text, subject=work_id).text).strip()
+        # An answer cut off at its allowance or not parseable as the draft
+        # would otherwise end the whole run for one chunk. Compression may
+        # always keep a chunk unshortened, so that one chunk is kept and the
+        # next pass tries it again. The kept chunk is not cached, so a later
+        # run asks the model again.
+        nonlocal generation, kept
+        try:
+            generation = provider.generate(request)
+            return redact_text(parse_compressed_draft(generation.text, subject=work_id).text).strip()
+        except INVALID_OUTPUT_ERRORS:
+            generation, kept = None, True
+            return chunk.strip()
 
     if coordinator is None:
         text = compute()
@@ -380,6 +391,7 @@ def _compress_chunk(
             decode=decode,
             encode=lambda value: {"text": value},
             compute=compute,
+            cache_if=lambda _value: not kept,
         )
     # A shortened chunk that stops mid-sentence lost the rest of the chunk,
     # usually at a double quotation mark that closed the JSON text field. It
