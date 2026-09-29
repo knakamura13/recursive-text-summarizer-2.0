@@ -8,6 +8,12 @@ one, with the pipeline's own default request allowances. ``--replay-from``
 points at a saved trial directory: its cached segmentation and leaf summaries
 are fed to the merge stage unchanged, so no leaf is regenerated. Replay requires
 ``--strategy hierarchical``, the only path that uses saved leaves.
+
+Every working-tree trial saves the record the editorial step receives, after
+any compression, as ``editorial_root.json``. ``--editorial-root-from`` hands
+that saved record from another trial of the same case to the editorial step,
+so compression is not rerun and only ``--editorial-units`` changes: ``root``
+keeps the saved content units and ``none`` removes them.
 """
 
 from __future__ import annotations
@@ -35,6 +41,8 @@ _CHECKOUTS = {
 _MODEL = "gemma4:latest"
 _MODEL_DIGEST = "c6eb396dbd5992bbe3f5cdb947e8bbc0ee413d7c17e2beaae69f5d569cf982eb"
 _CONTEXT_WINDOW = 32_768
+_EDITORIAL_ROOT = "editorial_root.json"
+_EDITORIAL_UNITS = ("root", "none")
 
 
 def _output_allowance(target_words: int) -> int:
@@ -55,6 +63,8 @@ def run_case(
     replay_from: str | Path | None = None,
     strategy: str = "auto",
     context_window: int = _CONTEXT_WINDOW,
+    editorial_root_from: str | Path | None = None,
+    editorial_units: str = "root",
 ) -> dict[str, Any]:
     """Execute one case; all artifacts are written beneath ``output_dir``.
 
@@ -98,6 +108,19 @@ def run_case(
         replay_path = Path(replay_from).expanduser().resolve(strict=True)
         if not any(replay_path.glob("cache/objects/*/*.json")):
             raise ValueError(f"replay directory has no saved cache objects: {replay_path}")
+    if editorial_units not in _EDITORIAL_UNITS:
+        raise ValueError("editorial_units must be one of: " + ", ".join(_EDITORIAL_UNITS))
+    editorial_root_path = None
+    if editorial_root_from is not None:
+        if version != "worktree":
+            raise ValueError("--editorial-root-from requires --version worktree")
+        editorial_root_path = Path(editorial_root_from).expanduser().resolve(strict=True) / _EDITORIAL_ROOT
+        if not editorial_root_path.is_file():
+            raise ValueError(f"trial has no saved editorial root: {editorial_root_path}")
+    elif editorial_units != "root":
+        # Changing the units of a freshly compressed summary would change two
+        # factors at once; the arm must reuse a saved editorial input.
+        raise ValueError("--editorial-units other than root requires --editorial-root-from")
 
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -121,6 +144,8 @@ def run_case(
         "max_output_tokens": None if version == "worktree" else _output_allowance(target),
         "replay_from": None if replay_path is None else str(replay_path),
         "strategy": strategy,
+        "editorial_root_from": None if editorial_root_path is None else str(editorial_root_path),
+        "editorial_units": editorial_units,
         "trial_dir": str(trial),
     }
     config_path = trial / "worker_config.json"
@@ -172,6 +197,41 @@ def _published_sentence_words(audit_path: Path) -> int | None:
         return None
     sentences = (audit.get("publication") or {}).get("sentences") or []
     return sum(len(str(sentence.get("text", "")).split()) for sentence in sentences)
+
+
+def _hook_editorial_root(config: dict[str, Any], metadata: dict[str, Any], trial: Path, source_id: str) -> None:
+    """Save the record the editorial step receives, or substitute a saved one.
+
+    The saved record is checked against this trial's source and target, so an
+    arm can only reuse the editorial input of the same case.
+    """
+    import summarizer.finalization as finalization
+    from summarizer.summaries import SummaryNode
+
+    prepare = finalization._prepare_root_for_editorial
+    saved_path = config.get("editorial_root_from")
+
+    def hooked(root: Any, provider: Any, **kwargs: Any) -> tuple[Any, tuple[Any, ...]]:
+        if saved_path is None:
+            prepared, generations = prepare(root, provider, **kwargs)
+        else:
+            saved = json.loads(Path(saved_path).read_text(encoding="utf-8"))
+            if saved["source_id"] != source_id or saved["target_words"] != config["target_words"]:
+                raise ValueError(f"saved editorial root belongs to another case: {saved_path}")
+            record = saved["root"]
+            if config["editorial_units"] == "none":
+                record = {**record, "content_units": []}
+            prepared, generations = SummaryNode.model_validate(record), ()
+            metadata["replayed_editorial_root"] = saved_path
+        (trial / _EDITORIAL_ROOT).write_text(json.dumps({
+            "source_id": source_id,
+            "target_words": config["target_words"],
+            "editorial_units": config["editorial_units"],
+            "root": prepared.model_dump(mode="json"),
+        }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return prepared, generations
+
+    finalization._prepare_root_for_editorial = hooked
 
 
 def _saved_merge_inputs(
@@ -327,6 +387,8 @@ def _worker(config_path: Path) -> int:
 
             pipeline_module.cached_segment_document = lambda *_args, **_kwargs: saved_segments
             pipeline_module.summarize_segments = replayed_leaves
+        if config["version"] == "worktree":
+            _hook_editorial_root(config, metadata, trial, source_document.source_id)
         provider = OllamaProvider(host=config["proxy_url"])
         selected_context = provider.configure_context_window(
             config["model"], strategy.context_window, timeout_seconds=app.timeout_seconds
@@ -405,6 +467,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--proxy-url")
     parser.add_argument("--replay-from", type=Path, help="saved trial directory whose segments and leaves feed the merge stage")
+    parser.add_argument("--editorial-root-from", type=Path, help="saved trial directory whose editorial record feeds the editorial step")
+    parser.add_argument("--editorial-units", choices=_EDITORIAL_UNITS, default="root", help="content units handed to the editorial step with a saved record")
     parser.add_argument("--strategy", choices=("auto", "direct", "hierarchical"), default="auto")
     parser.add_argument("--context-window", type=int, default=_CONTEXT_WINDOW, help="must match the proxy's --num-ctx; the proxy refuses a mismatch")
     parser.add_argument("--_worker", type=Path, help=argparse.SUPPRESS)
@@ -422,6 +486,7 @@ def main(argv: list[str] | None = None) -> int:
         result = run_case(
             args.version, args.source, args.target, args.seed, args.output_dir, args.proxy_url,
             replay_from=args.replay_from, strategy=args.strategy, context_window=args.context_window,
+            editorial_root_from=args.editorial_root_from, editorial_units=args.editorial_units,
         )
     except Exception as error:
         print(f"Modern experiment failed: {type(error).__name__}: {error}", file=sys.stderr)
