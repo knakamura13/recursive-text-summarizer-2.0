@@ -135,16 +135,22 @@ def _saved_trial(saved_phase: str, document: str, fraction: float, seed: int, ve
     return trials[0]
 
 
-def cases(phase: str):
+def cases(phase: str, document_filter: str | None = None):
+    """Yield the phase's cases, only for `document_filter` when given.
+
+    The filter applies before saved trials are looked up, so one document's
+    cases can run while another's saved trials don't exist yet.
+    """
     if phase in WORKTREE_CASES:
-        documents = sorted({case[0] for case in WORKTREE_CASES[phase]})
+        chosen = [case for case in WORKTREE_CASES[phase] if document_filter in (None, case[0])]
+        documents = sorted({case[0] for case in chosen})
         sources = {document: (source, words) for document, source, words in _sources(
             [document for document in documents if document not in EXTRA_SOURCES])}
         for document in documents:
             if document in EXTRA_SOURCES:
                 path = EXTRA_SOURCES[document]
                 sources[document] = (path, len(path.read_text(encoding="utf-8").split()))
-        for document, amount, seed, saved_phase, strategy, num_ctx, *editorial in WORKTREE_CASES[phase]:
+        for document, amount, seed, saved_phase, strategy, num_ctx, *editorial in chosen:
             source, words = sources[document]
             fraction = amount if isinstance(amount, float) else None
             target = round(words * amount) if fraction is not None else amount
@@ -163,6 +169,8 @@ def cases(phase: str):
         "baseline-retry": ["atomic_habits", "nvc", "isl"],
         "validation": ["gathering", "all_statistics", "transcript", "news"],
     }[phase]
+    if document_filter is not None:
+        documents = [document for document in documents if document == document_filter]
     seeds = MANIFEST["seeds"] if phase.startswith("baseline") else MANIFEST["seeds"][:1]
     sources = list(_sources(documents))
     # Finish every document and length at one seed before beginning the next trial.
@@ -247,9 +255,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, help="restrict to one seed")
     args = parser.parse_args()
     verify_environment()
-    selected = [case for case in cases(args.phase)
-                if (args.document is None or case[0] == args.document)
-                and (args.seed is None or case[5] == args.seed)
+    selected = [case for case in cases(args.phase, args.document)
+                if (args.seed is None or case[5] == args.seed)
                 and (args.version is None or case[6] == args.version)]
     if not selected:
         parser.error("no cases match the requested filters")
