@@ -1511,6 +1511,57 @@ def parse_claim_anchors(
     return tuple(claims)
 
 
+# Characters a model commonly swaps when copying a quote: curly quotes and
+# apostrophes for straight ones, and dash variants for a hyphen.
+_QUOTE_EQUIVALENTS = str.maketrans(
+    {
+        "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'", "\u2032": "'",
+        "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"', "\u2033": '"',
+        "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-",
+        "\u2015": "-", "\u2212": "-",
+    }
+)
+
+
+def _normalized_with_offsets(text: str) -> tuple[str, list[int]]:
+    """`text` with whitespace runs collapsed to one space and quote marks and
+    dashes made plain, with the original offset of every normalized character."""
+    characters: list[str] = []
+    offsets: list[int] = []
+    for index, character in enumerate(text):
+        if character.isspace():
+            if characters and characters[-1] != " ":
+                characters.append(" ")
+                offsets.append(index)
+            continue
+        characters.append(character.translate(_QUOTE_EQUIVALENTS))
+        offsets.append(index)
+    return "".join(characters), offsets
+
+
+def locate_quote(quote: str, passage: str) -> str | None:
+    """The passage text a verifier quote copies, or None when it copies none.
+
+    An exact substring is its own match. Otherwise the quote matches when it is
+    a contiguous substring of the passage after both collapse whitespace and
+    make quote marks and dashes plain, and the passage's original text for
+    that range is returned. Nothing looser counts: every other character must
+    be the same.
+    """
+    if not quote.strip():
+        return None
+    if quote in passage:
+        return quote
+    wanted = _normalized_with_offsets(quote.strip())[0].strip()
+    if not wanted:
+        return None
+    normalized, offsets = _normalized_with_offsets(passage)
+    position = normalized.find(wanted)
+    if position < 0:
+        return None
+    return passage[offsets[position] : offsets[position + len(wanted) - 1] + 1]
+
+
 def _validated_finding(
     finding: _Finding,
     claim: Claim,
@@ -1518,22 +1569,35 @@ def _validated_finding(
     *,
     downgrade_invalid_quotes: bool = False,
 ) -> BatchFinding:
-    """Check one finding against the evidence selected for its own claim."""
+    """Check one finding against the evidence selected for its own claim.
+
+    A quote that matches its passage only after normalization is recorded as
+    the passage's own text, so audits and offsets use the source as written.
+    """
     evidence_ids: list[str] = []
     quotes: list[str] = []
+    sent: set[tuple[str, str]] = set()
     invalid_quote = False
     for evidence in finding.evidence:
-        if (evidence.segment_id, evidence.exact_quote) in zip(evidence_ids, quotes):
+        pair = (evidence.segment_id, evidence.exact_quote)
+        if pair in sent:
             raise VerificationResponseError("claim-verification: duplicate evidence")
+        sent.add(pair)
         passage = legal_evidence.get(evidence.segment_id)
         if passage is None:
             raise VerificationResponseError("claim-verification: unselected evidence")
-        if not evidence.exact_quote.strip() or evidence.exact_quote not in passage:
+        located = locate_quote(evidence.exact_quote, passage)
+        if located is None:
             if not downgrade_invalid_quotes:
                 raise VerificationResponseError("claim-verification: quote not in evidence")
             invalid_quote = True
+        quote = located if located is not None else evidence.exact_quote
+        if (evidence.segment_id, quote) in zip(evidence_ids, quotes):
+            # Two quotes that differ only in spacing or quote marks cite the
+            # same source text, so the second adds nothing.
+            continue
         evidence_ids.append(evidence.segment_id)
-        quotes.append(evidence.exact_quote)
+        quotes.append(quote)
     try:
         return BatchFinding(
             claim_id=claim.claim_id,
