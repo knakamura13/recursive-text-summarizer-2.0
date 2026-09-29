@@ -168,14 +168,14 @@ def test_parse_args_rejects_path_conflicts() -> None:
 def test_main_runs_default_pipeline_without_network(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / "input.txt").write_text("Source.", encoding="utf-8")
-    provider = RecordingProvider("concise summary")
+    provider = RecordingProvider("Concise summary.")
 
     exit_code = main(
         [], provider_factory=lambda _config: provider, counter_factory=counter_factory
     )
 
     assert exit_code == 0
-    assert (tmp_path / "output.txt").read_text(encoding="utf-8") == "concise summary"
+    assert (tmp_path / "output.txt").read_text(encoding="utf-8") == "Concise summary."
     assert [call.operation_id for call in provider.calls] == ["D000001", "editorial-final"]
 
 
@@ -184,7 +184,7 @@ def test_main_uses_discovered_ollama_context_for_budget_and_requests(
 ) -> None:
     class ContextProvider(RecordingProvider):
         def __init__(self) -> None:
-            super().__init__("concise summary")
+            super().__init__("Concise summary.")
             self.context_calls: list[tuple[str, int | None, float]] = []
 
         def configure_context_window(

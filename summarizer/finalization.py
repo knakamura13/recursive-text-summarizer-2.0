@@ -83,7 +83,11 @@ from summarizer.segmentation import (
     segment_document,
 )
 from summarizer.summaries import SummaryNode
-from summarizer.text import default_sentence_tokenizer
+from summarizer.text import (
+    default_sentence_tokenizer,
+    original_sentence_spans,
+    split_unfinished_ending,
+)
 from summarizer.tokenization import TokenCounter
 from summarizer.verification import (
     Claim,
@@ -133,9 +137,6 @@ _REMOVAL_REASONS = {
 }
 _UNVERIFIED_REASON = "Verification could not check this sentence."
 _UNFINISHED_REASON = "The draft ended before this sentence did."
-# A complete sentence ends in terminal punctuation, optionally followed by
-# closing quotes, brackets or emphasis markers.
-_SENTENCE_END = re.compile(r"[.!?…。！？][\"'”’»)\]}*_]*\Z")
 _COMPLETED_DETAIL = {
     "editorial": "Editorial draft verified",
     "content_unit_fallback": "Published verified content units",
@@ -172,37 +173,6 @@ def _all_claims_supported(result: VerificationPassResult) -> bool:
     )
 
 
-def _original_sentence_spans(text: str) -> list[tuple[int, int, str]]:
-    spans: list[tuple[int, int, str]] = []
-    cursor = 0
-    for sentence in default_sentence_tokenizer(text):
-        index = text.find(sentence, cursor)
-        if index < 0:
-            return []
-        spans.append((index, index + len(sentence), sentence.strip()))
-        cursor = index + len(sentence)
-    return spans
-
-
-def _split_unfinished_ending(draft: str) -> tuple[str, str | None]:
-    """Split off the draft's last sentence when it stops without ending.
-
-    A model that stops mid-sentence leaves a fragment that makes no complete
-    claim, so it is never verified or published. Only the last sentence is
-    checked: earlier ones without terminal punctuation may be list items or
-    headings, and the tokenizer joins a mid-text fragment to what follows.
-    The draft's own ending is tested, because the tokenizer splits a closing
-    marker such as ``**`` into a piece of its own.
-    """
-    spans = _original_sentence_spans(draft)
-    if not spans or _SENTENCE_END.search(draft.rstrip()):
-        return draft, None
-    start, _, text = spans[-1]
-    if not any(character.isalnum() for character in text):
-        return draft, None
-    return draft[:start].rstrip(), text
-
-
 def _supported_fragment_text(result: VerificationPassResult, unit_text: str) -> str | None:
     """Return original sentences whose claims are all supported.
 
@@ -223,7 +193,7 @@ def _supported_fragment_text(result: VerificationPassResult, unit_text: str) -> 
     verdicts = {
         assessment.claim_id: assessment.verdict for assessment in result.assessments
     }
-    sentences = _original_sentence_spans(unit_text)
+    sentences = original_sentence_spans(unit_text)
     if not sentences:
         return None
     located: list[tuple[int, ClaimVerdict]] = []
@@ -1591,7 +1561,7 @@ def _finalize_summary(
     # The cut-off ending is taken from the model's own draft, before literal
     # restoration appends source sentences that could hide where it stopped.
     editorial_text, unfinished = (
-        _split_unfinished_ending(editorial.text)
+        split_unfinished_ending(editorial.text)
         if verification.enabled
         else (editorial.text, None)
     )

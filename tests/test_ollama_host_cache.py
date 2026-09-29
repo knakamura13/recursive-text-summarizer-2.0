@@ -37,7 +37,7 @@ class HostSensitiveProvider(ModelProvider):
         if request.operation_id == "editorial-final":
             # Return proper FinalDraft format
             return GenerationResult(
-                text=json.dumps({"text": f"ANSWER-FROM-{self._host}"}),
+                text=json.dumps({"text": f"ANSWER-FROM-{self._host}."}),
                 provider="fake",
                 model=request.model,
                 input_tokens=10,
