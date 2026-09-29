@@ -33,7 +33,7 @@ from summarizer.segmentation import CacheCoordinator
 from summarizer.summaries import SummaryNode
 from summarizer.text import split_unfinished_ending
 
-EDITORIAL_PROMPT_VERSION = "editorial-prompt/5"
+EDITORIAL_PROMPT_VERSION = "editorial-prompt/6"
 EDITORIAL_SCHEMA_NAME = "final_editorial_draft"
 EDITORIAL_WORK_ID = "editorial-final"
 # The `{"text": ...}` answer object around the rewritten draft, as for a
@@ -149,7 +149,9 @@ def build_editorial_request(
         raise ValueError("target_words must be positive")
     begin = _fence(source_id, "GROUNDED-ROOT-BEGIN")
     end = _fence(source_id, "GROUNDED-ROOT-END")
-    payload = json.dumps(root.model_dump(mode="json"), separators=(",", ":"), sort_keys=True)
+    # The record keeps SummaryNode's field order, so the summary to keep comes
+    # first and the supporting units after it. Sorted keys put the units first.
+    payload = json.dumps(root.model_dump(mode="json"), separators=(",", ":"))
     return GenerationRequest(
         model=model,
         instructions=_INSTRUCTIONS.format(
