@@ -53,6 +53,9 @@ def verify_environment() -> None:
 # an absolute word count for a non-manifest source), seed, the saved phase whose
 # merge inputs are replayed (None runs fresh), strategy and context window.
 # Replay requires the hierarchical strategy, the only path that uses saved leaves.
+# An optional seventh item, (saved phase, units), hands the editorial step the
+# record saved by that phase's trial of the same case, with its content units
+# kept (`root`) or removed (`none`).
 WORKTREE_CASES = {
     "d5-replay": (
         ("gathering", 0.25, 101, "validation", "hierarchical", 32_768),
@@ -82,6 +85,19 @@ WORKTREE_CASES = {
     # With the exact count only the transcript routes hierarchical on its own
     # at the study's context; every other study case fits one direct request.
     "d11-e2e": (("transcript", 0.25, 101, None, "auto", 32_768),),
+    # #109 stage 1: development cases, which all route direct at 32,768. `d7-a`
+    # runs each case in full and saves its editorial record; `d7-c` reuses that
+    # record without its content units, so only the units differ.
+    "d7-a": (
+        ("atomic_habits", 0.25, 101, None, "auto", 32_768),
+        ("nvc", 0.25, 101, None, "auto", 32_768),
+        ("isl", 0.25, 101, None, "auto", 32_768),
+    ),
+    "d7-c": (
+        ("atomic_habits", 0.25, 101, None, "auto", 32_768, ("d7-a", "none")),
+        ("nvc", 0.25, 101, None, "auto", 32_768, ("d7-a", "none")),
+        ("isl", 0.25, 101, None, "auto", 32_768, ("d7-a", "none")),
+    ),
 }
 PHASES = ("pilot", "pilot-retry", "baseline", "baseline-retry", "validation", *WORKTREE_CASES)
 # Sources outside the manifest; they are repository sample documents.
@@ -111,9 +127,9 @@ def _sources(documents):
         yield document, source, words
 
 
-def _saved_trial(saved_phase: str, document: str, fraction: float, seed: int) -> Path:
-    label = f"{document}-{int(fraction * 100)}-seed{seed}-current"
-    trials = sorted((ROOT / "runs" / saved_phase / label).glob("current-*"))
+def _saved_trial(saved_phase: str, document: str, fraction: float, seed: int, version: str = "current") -> Path:
+    label = f"{document}-{int(fraction * 100)}-seed{seed}-{version}"
+    trials = sorted((ROOT / "runs" / saved_phase / label).glob(f"{version}-*"))
     if len(trials) != 1:
         raise RuntimeError(f"expected one saved trial under {saved_phase}/{label}, found {len(trials)}")
     return trials[0]
@@ -128,12 +144,17 @@ def cases(phase: str):
             if document in EXTRA_SOURCES:
                 path = EXTRA_SOURCES[document]
                 sources[document] = (path, len(path.read_text(encoding="utf-8").split()))
-        for document, amount, seed, saved_phase, strategy, num_ctx in WORKTREE_CASES[phase]:
+        for document, amount, seed, saved_phase, strategy, num_ctx, *editorial in WORKTREE_CASES[phase]:
             source, words = sources[document]
             fraction = amount if isinstance(amount, float) else None
             target = round(words * amount) if fraction is not None else amount
             replay = None if saved_phase is None else _saved_trial(saved_phase, document, fraction, seed)
-            yield document, source, words, fraction, target, seed, "worktree", replay, strategy, num_ctx
+            editorial_from, units = (None, "root")
+            if editorial:
+                editorial_phase, units = editorial[0]
+                editorial_from = _saved_trial(editorial_phase, document, fraction, seed, "worktree")
+            yield (document, source, words, fraction, target, seed, "worktree", replay, strategy, num_ctx,
+                   editorial_from, units)
         return
     documents = {
         "pilot": ["nvc"],
@@ -154,7 +175,8 @@ def cases(phase: str):
 
 
 def run_one(phase: str, document: str, source: Path, words: int, fraction: float | None, target: int, seed: int,
-            version: str, replay_from: Path | None, strategy: str, num_ctx: int) -> dict:
+            version: str, replay_from: Path | None, strategy: str, num_ctx: int,
+            editorial_from: Path | None = None, editorial_units: str = "root") -> dict:
     amount = f"{int(fraction * 100)}" if fraction is not None else f"{target}"
     label = f"{document}-{amount}-seed{seed}-{version}"
     if strategy != "auto":
@@ -190,6 +212,8 @@ def run_one(phase: str, document: str, source: Path, words: int, fraction: float
             command.extend(["--strategy", strategy])
         if num_ctx != 32_768:
             command.extend(["--context-window", str(num_ctx)])
+        if editorial_from is not None:
+            command.extend(["--editorial-root-from", str(editorial_from), "--editorial-units", editorial_units])
         with (run_dir / "runner.stdout").open("w", encoding="utf-8") as out, (run_dir / "runner.stderr").open("w", encoding="utf-8") as err:
             result = subprocess.run(command, stdout=out, stderr=err, check=False)
         run = next((json.loads(path.read_text(encoding="utf-8")) for path in run_dir.glob("*/run.json")), {})
@@ -200,6 +224,8 @@ def run_one(phase: str, document: str, source: Path, words: int, fraction: float
                   "strategy": strategy, "num_ctx": num_ctx,
                   "max_output_tokens": run.get("max_output_tokens", max(2048, 3 * target + 1024)),
                   "replay_from": None if replay_from is None else str(replay_from),
+                  "editorial_root_from": None if editorial_from is None else str(editorial_from),
+                  "editorial_units": editorial_units,
                   "exit_code": result.returncode, "elapsed_seconds": time.time() - started,
                   "trace_count": len(list(trace_dir.glob("request-*.json")))}
         (run_dir / "trial.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")

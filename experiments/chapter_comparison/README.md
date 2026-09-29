@@ -55,3 +55,12 @@ For an Ollama host on this machine, the working tree counts tokens with the mode
 /private/tmp/rts-study-20260926/venv/bin/python experiments/chapter_comparison/run_study.py --phase d11-e2e
 /private/tmp/rts-study-20260926/venv/bin/python experiments/chapter_comparison/collect_results.py --phase d11-replay --phase d11-e2e
 ```
+
+## Editorial content units (#109)
+
+Each working-tree trial saves the record the editorial step receives, after any compression, as `editorial_root.json` in its trial directory, together with the direct summary it was prepared from. `--editorial-root-from <trial>` replays both in a new trial of the same case (same source and target). The saved direct summary replaces the direct request, and the saved record replaces compression, so the audit describes the same root. `--editorial-units none` removes the record's content units, and `root` keeps them. Only the editorial and verification requests are new. Replay supports direct runs only, and a saved file without the direct summary is refused. `run.json` records the saved record it used as `replayed_editorial_root`. Stage 1 of #109 compares the two on the development cases, which all route direct at 32,768. Run `d7-a` first, because `d7-c` reuses its records:
+
+```sh
+/private/tmp/rts-study-20260926/venv/bin/python experiments/chapter_comparison/run_study.py --phase d7-a
+/private/tmp/rts-study-20260926/venv/bin/python experiments/chapter_comparison/run_study.py --phase d7-c
+```
