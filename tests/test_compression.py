@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from summarizer.compression import (
     BAND_TOLERANCE,
     RETENTION_RATIO,
@@ -13,7 +15,9 @@ from summarizer.compression import (
     _in_band,
     _under_floor,
 )
-from summarizer.providers.base import GenerationResult
+from summarizer.cache import CacheStore
+from summarizer.providers.base import GenerationResult, ProviderResponseError
+from summarizer.segmentation import CacheCoordinator
 from summarizer.text import default_sentence_tokenizer
 
 
@@ -420,3 +424,67 @@ def test_pieces_of_an_over_long_sentence_keep_their_shortened_answers() -> None:
     pieces = len(compression_pass_work_ids(source, 1))
     assert pieces > 1
     assert result.text == " ".join(["The run went on and"] * pieces)
+
+
+class _Cut:
+    """Raise as a provider does for an answer stopped at its output allowance."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, request):
+        self.calls += 1
+        raise ProviderResponseError("Ollama stopped at the configured output token limit")
+
+
+def _compress_with(provider, coordinator=None):
+    return compress_to_target(
+        _QUOTED, provider, source_id="a" * 64, model="m", timeout_seconds=30,
+        target_words=5, coordinator=coordinator,
+    )
+
+
+def test_a_chunk_whose_answer_is_cut_off_is_kept_and_the_run_continues() -> None:
+    provider = _Cut()
+
+    result = _compress_with(provider)
+
+    assert result.text == _QUOTED
+    assert provider.calls == 1
+
+
+def test_a_chunk_whose_answer_is_not_a_draft_is_kept() -> None:
+    result = _compress_with(Provider(["not json"]))
+
+    assert result.text == _QUOTED
+
+
+def _coordinator(tmp_path) -> CacheCoordinator:
+    return CacheCoordinator(
+        store=CacheStore(tmp_path / "cache"), source_id="a" * 64,
+        provider="openai", model="m", ollama_host="",
+        counter_identity="test:characters", counter_exact=True,
+        context_window_tokens=100_000, behavior={},
+    )
+
+
+def test_a_kept_chunk_is_not_cached(tmp_path) -> None:
+    _compress_with(_Cut(), _coordinator(tmp_path))
+    later = Provider(['{"text": "The coach told the team the plan."}'])
+
+    result = _compress_with(later, _coordinator(tmp_path))
+
+    assert later.calls >= 1
+    assert result.text == "The coach told the team the plan."
+
+
+class _Broken:
+    """A provider defect, not a model answer."""
+
+    def generate(self, request):
+        raise ValueError("provider misconfigured")
+
+
+def test_a_provider_defect_is_not_treated_as_a_model_answer() -> None:
+    with pytest.raises(ValueError, match="misconfigured"):
+        _compress_with(_Broken())
