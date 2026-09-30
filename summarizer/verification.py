@@ -27,6 +27,7 @@ from summarizer.providers.base import (
     GenerationResult,
     ModelProvider,
     ProviderError,
+    ProviderResponseError,
 )
 from summarizer.runtime.observers import (
     ItemEvent,
@@ -959,28 +960,38 @@ def pack_work_items(
     runtime: VerificationRuntime,
     config: VerificationConfig,
     measure_request: Callable[[tuple[_WorkItem, ...]], int] | None = None,
+    measure_answer: Callable[[tuple[_WorkItem, ...]], int] | None = None,
 ) -> tuple[tuple[_WorkItem, ...], ...]:
-    """Pack indivisible work items under both configured and runtime limits."""
+    """Pack indivisible work items under both configured and runtime limits.
+
+    With `measure_answer`, a batch's expected answer must also fit the output
+    reserve, so a batch whose answer copies its items' text is not cut off. An
+    item whose own answer is larger than the reserve still goes alone, since it
+    can't be split; its cut-off answer leaves it unresolved.
+    """
     capacity = _request_capacity(runtime, config)
     if capacity <= 0:
         raise VerificationCapacityError("verification runtime has no usable input capacity")
-    batches: list[tuple[_WorkItem, ...]] = []
-    current: tuple[_WorkItem, ...] = ()
-    for item in items:
-        candidate = (*current, item)
+
+    def fits(candidate: tuple[_WorkItem, ...]) -> bool:
         cost = (
             measure_request(candidate)
             if measure_request is not None
             else runtime.counter.count(render_request(candidate))
         )
-        if cost <= capacity:
+        if cost > capacity:
+            return False
+        return measure_answer is None or measure_answer(candidate) <= config.output_reserve_tokens
+
+    batches: list[tuple[_WorkItem, ...]] = []
+    current: tuple[_WorkItem, ...] = ()
+    for item in items:
+        candidate = (*current, item)
+        if fits(candidate):
             current = candidate
             continue
-        if not current:
-            raise VerificationCapacityError(
-                "single work item exceeds verification request capacity"
-            )
-        batches.append(current)
+        if current:
+            batches.append(current)
         current = (item,)
         cost = (
             measure_request(current)
@@ -1644,6 +1655,9 @@ _MISSING_CLAIM = "claim-verification: claim results do not match"
 _OMISSION_REASONS = frozenset(
     {_MISSING_SPAN, "claim-decomposition: duplicate span result", _MISSING_CLAIM}
 )
+# The provider couldn't return the answer whole, most often because it reached
+# the output reserve; its items are asked again in smaller groups.
+_INCOMPLETE_ANSWER = "verification: the answer was incomplete"
 
 # Each parsed batch yields the items it resolved, a lenient fallback for items
 # rejected only for a repairable detail, and the rejection reason of every
@@ -1754,15 +1768,20 @@ def _resolve_work(
     config: VerificationConfig,
     before_call: Callable[[tuple[_WorkItem, ...], bool], None],
     generations: list[GenerationResult],
+    measure_answer: Callable[[tuple[_WorkItem, ...]], int] | None = None,
 ) -> _Resolution:
     """Ask for every item once, then re-ask only the items still missing.
 
     Missing items keep their ids and are asked again in groups half the size of
     the largest first batch, then one at a time, so no item is asked more than
-    three times. Each re-ask names the rules the earlier answers broke. After
-    its last ask, an item rejected only for a repairable detail takes its
-    lenient fallback; any other item is unresolved. Every generation is
-    appended to `generations` as it arrives; provider errors propagate.
+    three times. Each re-ask names the rules the earlier answers broke. An
+    answer the provider couldn't return whole, as when it is cut off at the
+    output reserve, leaves every item of its batch missing, so they are asked
+    again in smaller groups. After its last ask, an item rejected only for a
+    repairable detail takes its lenient fallback; any other item is
+    unresolved. Every generation is appended to `generations` as it arrives;
+    other provider errors propagate. `measure_answer` packs the re-ask groups
+    by their expected answer as well, as for the first batches.
     """
     order = [item for batch in batches for item in batch]
     values: dict[str, object] = {}
@@ -1773,7 +1792,12 @@ def _resolve_work(
 
     def ask(batch: tuple[_WorkItem, ...], correction: str) -> None:
         before_call(batch, bool(correction))
-        generation = runtime.provider.generate(build_request(batch, correction))
+        try:
+            generation = runtime.provider.generate(build_request(batch, correction))
+        except ProviderResponseError:
+            for item in batch:
+                errors[item_id(item)] = _INCOMPLETE_ANSWER
+            return
         generations.append(generation)
         accepted, fallback, rejected = parse(generation.text, batch)
         for key, value in accepted.items():
@@ -1819,6 +1843,7 @@ def _resolve_work(
                 tuple(fitting),
                 render_request=lambda items: "",
                 measure_request=measure,
+                measure_answer=measure_answer,
                 runtime=runtime,
                 config=config,
             ):
@@ -1969,11 +1994,20 @@ def verify_draft_once(
             runtime.counter,
         )
 
+    def measure_decomposition_answer(items: tuple[DraftSpan, ...]) -> int:
+        # The answer's anchors are substrings of the span text, so the spans'
+        # text in the answer's shape is its expected size.
+        return runtime.counter.count(json.dumps(
+            {"spans": [{"span_id": span.span_id, "anchors": [span.text]} for span in items]},
+            ensure_ascii=False,
+        ))
+
     try:
         decomposition_batches = pack_work_items(
             spans,
             render_request=render_decomposition,
             measure_request=measure_decomposition,
+            measure_answer=measure_decomposition_answer,
             runtime=runtime,
             config=config,
         )
@@ -2015,6 +2049,7 @@ def verify_draft_once(
                 "before re-asking claim decomposition" if retry else "before claim decomposition"
             ),
             generations=decomposition_generations,
+            measure_answer=measure_decomposition_answer,
         )
     except (ProviderError, VerificationResponseError):
         if not terminalize_errors:
