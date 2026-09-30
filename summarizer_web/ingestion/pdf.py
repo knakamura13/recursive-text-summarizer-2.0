@@ -202,9 +202,18 @@ _SAME_LINE_EM = 0.3  # Fragments whose baselines differ by less than this many s
 _SPACE_GAP_EM = -0.25  # Between fragments of a line, a gap above this (in sizes, vs an estimated 0.5em per char) is a space.
 _REPEAT_MIN_PAGES = 3  # A line on fewer pages than this is not a running header or footer.
 _REPEAT_PAGE_FRACTION = 0.25  # ...and it must be on at least this share of the pages.
+_SIZE_CLUSTER_RATIO = 0.05  # Heading sizes within 5% of each other (OCR or rounding noise) are one level.
+_MIN_CAPS_LETTERS = 2  # A single capital letter is not "all caps".
+_SET_OFF_RATIO = 1.3  # A heading sits above more space than this times the page's body line spacing...
+_BODY_GAP_MAX_EM = 3.0  # ...where body spacing ignores gaps over this many body sizes (paragraph/figure breaks).
+_MIN_PAGE_GAPS = 3  # A page with fewer body line gaps than this borrows the document's typical spacing.
+_POSITION_TOLERANCE = 6.0  # Points: text this close in y on another page is "the same place".
 _BOLD_WEIGHT = 600  # FontDescriptor /FontWeight at or above this is bold (600 = semibold).
 _FORCE_BOLD_FLAG = 1 << 18  # FontDescriptor /Flags bit for ForceBold.
-_BOLD_NAME = re.compile(r"bold|black|heavy|semibold|demi(?!-?light)|extrabold", re.IGNORECASE)
+_BOLD_NAME = re.compile(
+    r"bold|black|heavy|semibold|demi(?!-?light)|extrabold|[-,+]medi(?:um)?(?![a-z])",
+    re.IGNORECASE,
+)  # "-Medi" is the bold face of TeX's Nimbus/Times family.
 _SENTENCE_END = re.compile(r"[.!?]$")
 
 
@@ -336,38 +345,86 @@ def _looks_like_heading_text(text: str, words_limit: int) -> bool:
     return not (_SENTENCE_END.search(text) and len(words) > _MAX_SENTENCE_WORDS)
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def _is_caps(text: str) -> bool:
+    return sum(1 for ch in text if ch.isalpha()) >= _MIN_CAPS_LETTERS and text.isupper()
+
+
+def _cluster_sizes(sizes: set[float]) -> dict[float, float]:
+    """Map each size to the largest size of its cluster; sizes within _SIZE_CLUSTER_RATIO chain together."""
+    mapping: dict[float, float] = {}
+    top = previous = None
+    for size in sorted(sizes, reverse=True):
+        if previous is None or size < previous * (1 - _SIZE_CLUSTER_RATIO):
+            top = size
+        mapping[size] = top  # type: ignore[assignment]
+        previous = size
+    return mapping
+
+
 def _headings_from_lines(pages: dict[int, list[_Line]]) -> list[OutlineHint]:
     """Headings from laid-out lines: larger than body text, or bold on a line of their own."""
     chars: dict[float, int] = {}
     seen_on: dict[str, set[int]] = {}
+    placed: dict[str, list[tuple[int, float]]] = {}
+    per_page: dict[int, dict[str, int]] = {}
     for number, lines in pages.items():
+        counts = per_page[number] = {}
         for line in lines:
             chars[line.size] = chars.get(line.size, 0) + len(line.text)
-            seen_on.setdefault(_repeat_key(line.text), set()).add(number)
+            key = _repeat_key(line.text)
+            seen_on.setdefault(key, set()).add(number)
+            placed.setdefault(key, []).append((number, line.y))
+            counts[key] = counts.get(key, 0) + 1
     if not chars:
         return []
     body = max(chars.items(), key=lambda item: item[1])[0]
     repeat_at = max(_REPEAT_MIN_PAGES, math.ceil(_REPEAT_PAGE_FRACTION * len(pages)))
     repeated = {key for key, on in seen_on.items() if len(on) >= repeat_at}
 
-    found: list[tuple[int, float, bool, str]] = []  # page, size, bold body-size, title
+    def is_running(line: _Line, key: str) -> bool:
+        """Repeated across many pages, or at the same place on a few: a header or footer."""
+        if key in repeated:
+            return True
+        near = {n for n, y in placed[key] if abs(y - line.y) <= _POSITION_TOLERANCE}
+        return len(near) >= _REPEAT_MIN_PAGES
+
+    gaps_all = [
+        gap
+        for lines in pages.values()
+        for gap in _body_gaps(lines, body)
+    ]
+    document_gap = _median(gaps_all) if gaps_all else 0.0
+
+    found: list[tuple[int, _Line, str]] = []  # page, first line, title
     for number in sorted(pages):
+        lines = pages[number]
+        page_gaps = _body_gaps(lines, body)
+        typical = _median(page_gaps) if len(page_gaps) >= _MIN_PAGE_GAPS else document_gap
         run: list[_Line] = []
+        run_set_off = False
 
         def flush() -> None:
-            if not run:
+            if not run or not run_set_off:
                 return
             title = " ".join(line.text for line in run)
             first = run[0]
             larger = first.size >= body * _MIN_SIZE_RATIO
             limit = _MAX_HEADING_WORDS_LARGE if larger else _MAX_HEADING_WORDS_BOLD
-            if _looks_like_heading_text(title, limit) and _repeat_key(title) not in repeated:
-                found.append((number, first.size, not larger, title))
+            if _looks_like_heading_text(title, limit) and per_page[number].get(_repeat_key(title), 0) < 2:
+                found.append((number, first, title))
 
-        for line in pages[number]:
+        for index, line in enumerate(lines):
             larger = line.size >= body * _MIN_SIZE_RATIO
-            candidate = (larger or (line.bold and line.size >= body)) and _repeat_key(line.text) not in repeated
-            candidate = candidate and any(ch.isalpha() for ch in line.text)
+            key = _repeat_key(line.text)
+            candidate = (larger or (line.bold and line.size >= body)) and any(
+                ch.isalpha() for ch in line.text
+            )
+            candidate = candidate and not is_running(line, key) and per_page[number][key] < 2
             if candidate and run:
                 last = run[-1]
                 if (
@@ -379,14 +436,39 @@ def _headings_from_lines(pages: dict[int, list[_Line]]) -> list[OutlineHint]:
                     continue
             flush()
             run = [line] if candidate else []
+            if candidate:
+                above = lines[index - 1].y - line.y if index else None
+                run_set_off = above is None or above <= 0 or above > _SET_OFF_RATIO * typical
+
         flush()
 
-    sizes = sorted({size for _, size, bold_body, _ in found if not bold_body}, reverse=True)
-    rank = {size: level for level, size in enumerate(sizes, start=1)}
-    bold_level = len(sizes) + 1
+    styles = {
+        (line.size, line.bold, _is_caps(title)): None for _, line, title in found
+    }
+    clusters = _cluster_sizes({size for size, _, _ in styles})
+    order = sorted(
+        {(clusters[size], bold, caps) for size, bold, caps in styles},
+        key=lambda style: (-style[0], not style[1], not style[2]),
+    )
+    rank = {style: level for level, style in enumerate(order, start=1)}
     return [
-        OutlineHint(title, bold_level if bold_body else rank[size], number)
-        for number, size, bold_body, title in found
+        OutlineHint(
+            title,
+            rank[(clusters[line.size], line.bold, _is_caps(title))],
+            number,
+        )
+        for number, line, title in found
+    ]
+
+
+def _body_gaps(lines: list[_Line], body: float) -> list[float]:
+    """Baseline distances between consecutive body-size lines: the page's normal line spacing."""
+    return [
+        gap
+        for above, below in zip(lines, lines[1:])
+        if above.size == body
+        and below.size == body
+        and 0 < (gap := above.y - below.y) <= _BODY_GAP_MAX_EM * body
     ]
 
 

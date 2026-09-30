@@ -110,10 +110,10 @@ def test_unresolvable_bookmark_destination_keeps_title_and_level(tmp_path: Path)
 
 
 def _layout_pdf(tmp_path: Path, pages: list[list[tuple[str, int, float]]]) -> tuple[Path, PdfWriter]:
-    """Pages of (text, font size, y) lines; the font is Helvetica-Bold when the text starts with '*'."""
+    """Pages of (text, size, y) lines; Helvetica-Bold when the text starts with '*', a Medi face with '~'."""
     writer = PdfWriter()
     fonts = {}
-    for name, base in (("F1", "Helvetica"), ("F2", "Helvetica-Bold")):
+    for name, base in (("F1", "Helvetica"), ("F2", "Helvetica-Bold"), ("F3", "NimbusRomNo9L-Medi")):
         fonts[NameObject(f"/{name}")] = writer._add_object(
             DictionaryObject(
                 {
@@ -127,8 +127,8 @@ def _layout_pdf(tmp_path: Path, pages: list[list[tuple[str, int, float]]]) -> tu
         page = writer.add_blank_page(width=612, height=792)
         ops = []
         for text, size, y in lines:
-            font = "F2" if text.startswith("*") else "F1"
-            ops.append(f"BT /{font} {size} Tf 72 {y} Td ({text.lstrip('*')}) Tj ET")
+            font = {"*": "F2", "~": "F3"}.get(text[:1], "F1")
+            ops.append(f"BT /{font} {size} Tf 72 {y} Td ({text.lstrip('*~')}) Tj ET")
         stream = DecodedStreamObject()
         stream.set_data("\n".join(ops).encode())
         page[NameObject("/Contents")] = writer._add_object(stream)
@@ -203,4 +203,55 @@ def test_layout_heading_detection_can_be_forced_and_does_not_change_text(tmp_pat
     reader = PdfReader(path)
     assert [page.text for page in extraction.pages] == [
         clean_text(p.extract_text() or "") for p in reader.pages
+    ]
+
+
+def test_medi_font_counts_as_bold(tmp_path: Path):
+    path, writer = _layout_pdf(tmp_path, [[("~2.1 Sampling", 11, 740), *_body(710)]])
+    assert _hints(_save(path, writer)) == [("2.1 Sampling", 1, 1)]
+
+
+def test_larger_line_inside_a_paragraph_is_not_a_heading(tmp_path: Path):
+    lines = _body(700)
+    lines[3] = (lines[3][0], 14, lines[3][2])  # OCR-style size noise, normal line spacing
+    path, writer = _layout_pdf(tmp_path, [lines])
+    assert _hints(_save(path, writer)) == []
+
+
+def test_heading_needs_more_space_above_than_body_lines(tmp_path: Path):
+    body = _body(700)
+    lines = [*body[:3], ("Spaced Heading", 14, 642), *[(t, s, y - 36) for t, s, y in body[3:]]]
+    path, writer = _layout_pdf(tmp_path, [lines])
+    assert _hints(_save(path, writer)) == [("Spaced Heading", 1, 1)]
+
+
+def test_text_repeated_on_one_page_is_not_a_heading(tmp_path: Path):
+    lines = [("Panel A", 14, 740), ("Panel A", 14, 500), *_body(700)]
+    path, writer = _layout_pdf(tmp_path, [lines])
+    assert _hints(_save(path, writer)) == []
+
+
+def test_text_at_the_same_place_on_a_few_pages_is_a_running_header(tmp_path: Path):
+    pages = [[*_body(700)] for _ in range(20)]
+    for number in (2, 9, 15):
+        pages[number].insert(0, ("Figure Panel Title", 14, 740))
+    pages[5].insert(0, ("Real Section", 14, 740))
+    path, writer = _layout_pdf(tmp_path, pages)
+    assert _hints(_save(path, writer)) == [("Real Section", 1, 6)]
+
+
+def test_levels_rank_style_keys_and_are_consecutive(tmp_path: Path):
+    pages = [
+        [("PART ONE", 20, 740), *_body(700)],
+        [("Section Title", 20.4, 740), *_body(700)],  # within 5% of 20: same size bucket
+        [("*Bold Sub", 11, 740), *_body(700)],
+        [("Another Part", 15, 740), ("LOUD PART", 15, 640), *_body(600)],
+    ]
+    path, writer = _layout_pdf(tmp_path, pages)
+    assert _hints(_save(path, writer)) == [
+        ("PART ONE", 1, 1),
+        ("Section Title", 2, 2),
+        ("Bold Sub", 5, 3),
+        ("Another Part", 4, 4),
+        ("LOUD PART", 3, 4),
     ]
