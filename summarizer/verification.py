@@ -679,13 +679,26 @@ _FUNCTION_WORDS = frozenset(
 )
 
 
+# Scripts written without spaces between words (Thai, Lao, Myanmar, Khmer,
+# kana and CJK ideographs), where `_TERM` cannot find word boundaries.
+_UNSEGMENTED_SCRIPT = re.compile(
+    "[\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff\u3040-\u30ff\u3400-\u4dbf"
+    "\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002ffff]"
+)
+
+
 def evidence_term_share(text: str, quotes: Sequence[str]) -> float:
-    """Share of `text`'s content words that occur in `quotes`; 1.0 when it has none."""
+    """Share of `text`'s content words that occur in `quotes`.
+
+    It is 1.0, so the floor never applies, when `text` has no content words or
+    is written in a script without spaces between words.
+    """
+    if _UNSEGMENTED_SCRIPT.search(text):
+        return 1.0
     words = _terms(text) - _FUNCTION_WORDS
     if not words:
         return 1.0
     return len(words & _terms(" ".join(quotes))) / len(words)
-
 
 
 _PROPER_NAME = re.compile(

@@ -178,6 +178,28 @@ def test_a_supported_sentence_whose_quotes_share_too_few_of_its_words_is_not_sup
     assert "evidence_overlap_below_floor" in result.diagnostic_codes
 
 
+def test_the_floor_keeps_a_supported_sentence_in_a_script_without_word_spaces() -> None:
+    source = "港は五月に開港した。"
+    provider = Provider(
+        [
+            '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
+            '{"findings":[{"claim_id":"V01C000001","verdict":"supported","evidence":'
+            '[{"segment_id":"S000001","exact_quote":"五月に開港"}]}]}',
+        ]
+    )
+
+    result = verify_draft_once(
+        "港は五月に開港した。",
+        source_id="a" * 64,
+        source_index=build_source_lexical_index(provenance_ids=("S000001",), source={"S000001": source}),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+    )
+
+    assert [assessment.verdict for assessment in result.assessments] == [ClaimVerdict.SUPPORTED]
+
+
 def test_the_floor_also_rejects_a_poorly_quoted_claim_beside_an_uncheckable_one() -> None:
     provider = Provider(
         [
