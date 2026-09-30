@@ -121,15 +121,15 @@ def insert_revision(
     original: Path,
     created_at: str,
 ) -> None:
-    """Record the source revision (canonical text, page map, Import report)."""
+    """Record the source revision (canonical text, page map, outline, Import report)."""
     pages = imported.pages
     connection.execute(
         """
         INSERT INTO source_revisions (
             revision_id, document_id, source_sha256, extraction_version, canonical_path,
-            original_path, page_map_json, blank_pages_json, ocr_pages_json, report_json,
-            created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            original_path, page_map_json, blank_pages_json, ocr_pages_json, outline_json,
+            report_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(uuid.uuid4()),
@@ -141,6 +141,7 @@ def insert_revision(
             json.dumps([span.as_json() for span in pages]) if pages is not None else None,
             json.dumps(report.blank_pages) if pages is not None else None,
             json.dumps(report.ocr_pages) if pages is not None else None,
+            json.dumps([entry.as_json() for entry in imported.outline]),
             report.model_dump_json(),
             created_at,
         ),

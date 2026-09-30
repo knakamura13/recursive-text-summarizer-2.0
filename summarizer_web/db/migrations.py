@@ -73,6 +73,15 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        3,
+        (
+            # Revisions: the document outline. NULL means it was never
+            # extracted (an earlier extraction version), and "[]" means the
+            # extraction found no headings.
+            "ALTER TABLE source_revisions ADD COLUMN outline_json TEXT",
+        ),
+    ),
 )
 
 LATEST_VERSION = MIGRATIONS[-1][0]

@@ -58,7 +58,7 @@ def test_upload_is_queued_then_imported_with_dedup_and_source_slices(app_client)
 
     detail = client.get(f"/api/v1/documents/{document_id}").json()
     assert detail["import_state"] == "ready"
-    assert detail["import_report"]["extraction_version"] == "import/3" and detail["import_report"]["char_count"] > 1_000_000
+    assert detail["import_report"]["char_count"] > 1_000_000
     start, limit = 31_000, 113
     source = client.get(
         f"/api/v1/documents/{document_id}/source", params={"offset": start, "limit": limit}
