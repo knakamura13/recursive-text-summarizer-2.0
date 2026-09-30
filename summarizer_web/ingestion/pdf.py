@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -322,9 +322,34 @@ class _PageCollector:
 
 
 def _collect_lines(reader: PdfReader, number: int) -> list[_Line]:
+    return _collect_page(reader, number)[0]
+
+
+def _collect_page(reader: PdfReader, number: int) -> tuple[list[_Line], str]:
     collector = _PageCollector()
-    reader.pages[number - 1].extract_text(visitor_text=collector)
-    return collector.lines(number)
+    text = reader.pages[number - 1].extract_text(visitor_text=collector) or ""
+    return collector.lines(number), text
+
+
+def _reconcile_titles(hints: list[OutlineHint], texts: dict[int, str]) -> list[OutlineHint]:
+    """Respell each title as its page's text layer has it, so it can be found in the canonical text.
+
+    The visitor's fragment spacing can differ from the layer's ("A - B" vs "A-B"). The title's
+    non-space characters are searched in the page text with optional whitespace between them.
+    """
+    result = []
+    for hint in hints:
+        text = texts.get(hint.page) if hint.page is not None else None
+        if text:
+            try:
+                pattern = r"\s*".join(re.escape(ch) for ch in hint.title if not ch.isspace())
+                match = re.search(pattern, text, re.IGNORECASE)
+            except re.error:
+                match = None
+            if match is not None:
+                hint = replace(hint, title=" ".join(match.group().split()))
+        result.append(hint)
+    return result
 
 
 def _repeat_key(text: str) -> str:
@@ -507,12 +532,13 @@ def detect_layout_headings(reader: PdfReader) -> list[OutlineHint]:
     """Headings found from text layout alone, for PDFs without bookmarks; never raises."""
     try:
         pages: dict[int, list[_Line]] = {}
+        texts: dict[int, str] = {}
         for number in range(1, _page_count(reader) + 1):
             try:
-                pages[number] = _collect_lines(reader, number)
+                pages[number], texts[number] = _collect_page(reader, number)
             except Exception:
                 continue
-        return _headings_from_lines(pages)
+        return _reconcile_titles(_headings_from_lines(pages), texts)
     except Exception:
         return []
 
@@ -615,8 +641,11 @@ def extract_pdf(path: Path, progress: ProgressCallback, tesseract: Tesseract | N
     if not hints:
         ocr_numbers = {page.number for page in pages if page.ocr}
         try:
-            hints = _headings_from_lines(
-                {number: lines for number, lines in layout.items() if number not in ocr_numbers}
+            hints = _reconcile_titles(
+                _headings_from_lines(
+                    {number: lines for number, lines in layout.items() if number not in ocr_numbers}
+                ),
+                {number: text for number, text in enumerate(layer, start=1)},
             )
         except Exception:
             hints = []

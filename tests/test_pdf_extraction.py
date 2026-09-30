@@ -297,3 +297,36 @@ def test_slightly_larger_formula_or_long_line_is_not_a_heading(tmp_path: Path):
     prose = ("one two three four five six seven eight nine ten eleven twelve thirteen", 13, 700)
     path, writer = _layout_pdf(tmp_path, [[formula, prose, ("Short Title", 13, 660), *_body(620)]])
     assert _hints(_save(path, writer)) == [("Short Title", 1, 1)]
+
+
+def test_layout_title_is_respelled_from_the_page_text_and_placed(tmp_path: Path):
+    writer = PdfWriter()
+    font = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Font"),
+                NameObject("/Subtype"): NameObject("/Type1"),
+                NameObject("/BaseFont"): NameObject("/Helvetica"),
+            }
+        )
+    )
+    page = writer.add_blank_page(width=612, height=792)
+    # Separate text objects reach the visitor as separate fragments, so its line reads "Alpha -Beta"
+    # while the page text layer reads "Alpha-Beta".
+    heading = "BT /F1 18 Tf 72 740 Td (Alpha) Tj ET\nBT /F1 18 Tf 118.03 740 Td (-Beta) Tj ET"
+    body = "\n".join(
+        f"BT /F1 11 Tf 72 {700 - 14 * i} Td (Ordinary body sentence number {i} goes here.) Tj ET"
+        for i in range(6)
+    )
+    stream = DecodedStreamObject()
+    stream.set_data(f"{heading}\n{body}".encode())
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    page[NameObject("/Resources")] = DictionaryObject(
+        {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})}
+    )
+    path = _save(tmp_path / "spaced.pdf", writer)
+
+    extraction = extract_pdf(path, ignore_progress, None)
+    assert [h.title for h in extraction.outline_hints] == ["Alpha-Beta"]
+    assert [(e.title, e.level) for e in assemble(extraction).outline] == [("Alpha-Beta", 1)]
+    assert [h.title for h in detect_layout_headings(PdfReader(path))] == ["Alpha-Beta"]
