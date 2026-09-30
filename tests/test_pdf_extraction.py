@@ -255,3 +255,45 @@ def test_levels_rank_style_keys_and_are_consecutive(tmp_path: Path):
         ("Another Part", 4, 4),
         ("LOUD PART", 3, 4),
     ]
+
+
+def test_heading_is_kept_beside_a_running_header_with_the_page_number(tmp_path: Path):
+    pages = []
+    for number in range(1, 9):
+        lines = [(f"Chapter Notes {number}", 10, 770), *_body(700)]
+        pages.append(lines)
+    pages[3] += [("Chapter Notes", 14, 600)]
+    pages[3] = [pages[3][0], ("Chapter Notes", 14, 740), *pages[3][1:-1]]
+    path, writer = _layout_pdf(tmp_path, pages)
+    assert _hints(_save(path, writer)) == [("Chapter Notes", 1, 4)]
+
+
+def test_heading_repeating_a_header_text_on_its_page_is_kept(tmp_path: Path):
+    pages = [[("Notes", 10, 770), *_body(700)] for _ in range(8)]
+    pages[2].insert(1, ("Notes", 14, 740))
+    path, writer = _layout_pdf(tmp_path, pages)
+    assert _hints(_save(path, writer)) == [("Notes", 1, 3)]
+
+
+def test_run_of_same_style_lines_without_body_text_is_dropped(tmp_path: Path):
+    title_page = [("Paper Title", 24, 740), ("Ada Lovelace", 14, 690), ("Alan Turing", 14, 660),
+                  ("Grace Hopper", 14, 630), *_body(560)]
+    path, writer = _layout_pdf(tmp_path, [title_page, [("Methods", 14, 740), *_body(700)]])
+    assert _hints(_save(path, writer)) == [("Paper Title", 1, 1), ("Methods", 2, 2)]
+
+
+def test_same_style_headings_with_body_between_are_kept(tmp_path: Path):
+    body = _body(700)
+    lines = [("First", 14, 740), *body[:3], ("Second", 14, 640), *[(t, s, y - 36) for t, s, y in body[3:]]]
+    lines += [("Third", 14, 500)]
+    path, writer = _layout_pdf(tmp_path, [lines])
+    assert [h.title for h in extract_pdf(_save(path, writer), ignore_progress, None).outline_hints] == [
+        "First", "Second", "Third"
+    ]
+
+
+def test_slightly_larger_formula_or_long_line_is_not_a_heading(tmp_path: Path):
+    formula = ("x = y + z and more", 13, 740)
+    prose = ("one two three four five six seven eight nine ten eleven twelve thirteen", 13, 700)
+    path, writer = _layout_pdf(tmp_path, [[formula, prose, ("Short Title", 13, 660), *_body(620)]])
+    assert _hints(_save(path, writer)) == [("Short Title", 1, 1)]

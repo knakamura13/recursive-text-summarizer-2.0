@@ -200,14 +200,17 @@ _MIN_LETTER_RATIO = 0.5  # Mostly non-letters is a formula, a table row or a pag
 _MERGE_GAP_EM = 1.8  # Lines of one style closer than this many line sizes are one wrapped title.
 _SAME_LINE_EM = 0.3  # Fragments whose baselines differ by less than this many sizes share a line.
 _SPACE_GAP_EM = -0.25  # Between fragments of a line, a gap above this (in sizes, vs an estimated 0.5em per char) is a space.
-_REPEAT_MIN_PAGES = 3  # A line on fewer pages than this is not a running header or footer.
-_REPEAT_PAGE_FRACTION = 0.25  # ...and it must be on at least this share of the pages.
+_REPEAT_MIN_PAGES = 3  # Text at the same place on fewer pages than this is not a running header or footer.
 _SIZE_CLUSTER_RATIO = 0.05  # Heading sizes within 5% of each other (OCR or rounding noise) are one level.
 _MIN_CAPS_LETTERS = 2  # A single capital letter is not "all caps".
 _SET_OFF_RATIO = 1.3  # A heading sits above more space than this times the page's body line spacing...
 _BODY_GAP_MAX_EM = 3.0  # ...where body spacing ignores gaps over this many body sizes (paragraph/figure breaks).
 _MIN_PAGE_GAPS = 3  # A page with fewer body line gaps than this borrows the document's typical spacing.
 _POSITION_TOLERANCE = 6.0  # Points: text this close in y on another page is "the same place".
+_MIN_BYLINE_RUN = 3  # This many same-style candidates in a row with no body text between are bylines or a contents list, not sections.
+_NEAR_BODY_RATIO = 1.25  # Non-bold lines set less than this much larger than body are suspect (OCR size noise)...
+_MAX_HEADING_WORDS_NEAR_BODY = 12  # ...so they must be short...
+_FORMULA_CHARS = "=<>\u2264\u2265\u2260"  # ...and free of comparison operators, which mark formula lines.
 _BOLD_WEIGHT = 600  # FontDescriptor /FontWeight at or above this is bold (600 = semibold).
 _FORCE_BOLD_FLAG = 1 << 18  # FontDescriptor /Flags bit for ForceBold.
 _BOLD_NAME = re.compile(
@@ -328,8 +331,10 @@ def _repeat_key(text: str) -> str:
     return " ".join("".join(ch for ch in text.lower() if not ch.isdigit()).split())
 
 
-def _looks_like_heading_text(text: str, words_limit: int) -> bool:
+def _looks_like_heading_text(text: str, words_limit: int, formula_free: bool = False) -> bool:
     if len(text) > _MAX_HEADING_CHARS:
+        return False
+    if formula_free and any(ch in _FORMULA_CHARS for ch in text):
         return False
     words = text.split()
     if len(words) > words_limit:
@@ -369,29 +374,27 @@ def _cluster_sizes(sizes: set[float]) -> dict[float, float]:
 def _headings_from_lines(pages: dict[int, list[_Line]]) -> list[OutlineHint]:
     """Headings from laid-out lines: larger than body text, or bold on a line of their own."""
     chars: dict[float, int] = {}
-    seen_on: dict[str, set[int]] = {}
     placed: dict[str, list[tuple[int, float]]] = {}
+    for number, lines in pages.items():
+        for line in lines:
+            chars[line.size] = chars.get(line.size, 0) + len(line.text)
+            placed.setdefault(_repeat_key(line.text), []).append((number, line.y))
+    if not chars:
+        return []
+    body = max(chars.items(), key=lambda item: item[1])[0]
+
+    def is_running(line: _Line) -> bool:
+        """The same text (page numbers aside) at the same place on several pages: a header or footer."""
+        near = {n for n, y in placed[_repeat_key(line.text)] if abs(y - line.y) <= _POSITION_TOLERANCE}
+        return len(near) >= _REPEAT_MIN_PAGES
+
+    # A running header does not count against a heading that repeats its text on the page.
     per_page: dict[int, dict[str, int]] = {}
     for number, lines in pages.items():
         counts = per_page[number] = {}
         for line in lines:
-            chars[line.size] = chars.get(line.size, 0) + len(line.text)
-            key = _repeat_key(line.text)
-            seen_on.setdefault(key, set()).add(number)
-            placed.setdefault(key, []).append((number, line.y))
-            counts[key] = counts.get(key, 0) + 1
-    if not chars:
-        return []
-    body = max(chars.items(), key=lambda item: item[1])[0]
-    repeat_at = max(_REPEAT_MIN_PAGES, math.ceil(_REPEAT_PAGE_FRACTION * len(pages)))
-    repeated = {key for key, on in seen_on.items() if len(on) >= repeat_at}
-
-    def is_running(line: _Line, key: str) -> bool:
-        """Repeated across many pages, or at the same place on a few: a header or footer."""
-        if key in repeated:
-            return True
-        near = {n for n, y in placed[key] if abs(y - line.y) <= _POSITION_TOLERANCE}
-        return len(near) >= _REPEAT_MIN_PAGES
+            if not is_running(line):
+                counts[line.text] = counts.get(line.text, 0) + 1
 
     gaps_all = [
         gap
@@ -400,12 +403,13 @@ def _headings_from_lines(pages: dict[int, list[_Line]]) -> list[OutlineHint]:
     ]
     document_gap = _median(gaps_all) if gaps_all else 0.0
 
-    found: list[tuple[int, _Line, str]] = []  # page, first line, title
+    found: list[tuple[int, _Line, str, int, int]] = []  # page, first line, title, first and last line index
     for number in sorted(pages):
         lines = pages[number]
         page_gaps = _body_gaps(lines, body)
         typical = _median(page_gaps) if len(page_gaps) >= _MIN_PAGE_GAPS else document_gap
         run: list[_Line] = []
+        run_start = 0
         run_set_off = False
 
         def flush() -> None:
@@ -414,17 +418,19 @@ def _headings_from_lines(pages: dict[int, list[_Line]]) -> list[OutlineHint]:
             title = " ".join(line.text for line in run)
             first = run[0]
             larger = first.size >= body * _MIN_SIZE_RATIO
+            near_body = larger and not first.bold and first.size < body * _NEAR_BODY_RATIO
             limit = _MAX_HEADING_WORDS_LARGE if larger else _MAX_HEADING_WORDS_BOLD
-            if _looks_like_heading_text(title, limit) and per_page[number].get(_repeat_key(title), 0) < 2:
-                found.append((number, first, title))
+            if near_body:
+                limit = _MAX_HEADING_WORDS_NEAR_BODY
+            if _looks_like_heading_text(title, limit, near_body) and per_page[number].get(title, 0) < 2:
+                found.append((number, first, title, run_start, run_start + len(run) - 1))
 
         for index, line in enumerate(lines):
             larger = line.size >= body * _MIN_SIZE_RATIO
-            key = _repeat_key(line.text)
             candidate = (larger or (line.bold and line.size >= body)) and any(
                 ch.isalpha() for ch in line.text
             )
-            candidate = candidate and not is_running(line, key) and per_page[number][key] < 2
+            candidate = candidate and not is_running(line) and per_page[number][line.text] < 2
             if candidate and run:
                 last = run[-1]
                 if (
@@ -437,13 +443,15 @@ def _headings_from_lines(pages: dict[int, list[_Line]]) -> list[OutlineHint]:
             flush()
             run = [line] if candidate else []
             if candidate:
+                run_start = index
                 above = lines[index - 1].y - line.y if index else None
                 run_set_off = above is None or above <= 0 or above > _SET_OFF_RATIO * typical
 
         flush()
 
+    found = _without_runs(found, pages, body)
     styles = {
-        (line.size, line.bold, _is_caps(title)): None for _, line, title in found
+        (line.size, line.bold, _is_caps(title)): None for _, line, title, _, _ in found
     }
     clusters = _cluster_sizes({size for size, _, _ in styles})
     order = sorted(
@@ -457,8 +465,31 @@ def _headings_from_lines(pages: dict[int, list[_Line]]) -> list[OutlineHint]:
             rank[(clusters[line.size], line.bold, _is_caps(title))],
             number,
         )
-        for number, line, title in found
+        for number, line, title, _, _ in found
     ]
+
+
+def _without_runs(
+    found: list[tuple[int, _Line, str, int, int]], pages: dict[int, list[_Line]], body: float
+) -> list[tuple[int, _Line, str, int, int]]:
+    """Drop runs of _MIN_BYLINE_RUN same-style headings on a page with no body text between them."""
+    drop: set[int] = set()
+    start = 0
+    for end in range(1, len(found) + 1):
+        if end < len(found):
+            number, line, _, first, _ = found[end]
+            pnumber, pline, _, _, plast = found[end - 1]
+            between = pages[number][plast + 1 : first] if number == pnumber else None
+            if (
+                between is not None
+                and (line.size, line.bold) == (pline.size, pline.bold)
+                and not any(b.size == body and not b.bold for b in between)
+            ):
+                continue
+        if end - start >= _MIN_BYLINE_RUN:
+            drop.update(range(start, end))
+        start = end
+    return [item for index, item in enumerate(found) if index not in drop]
 
 
 def _body_gaps(lines: list[_Line], body: float) -> list[float]:
