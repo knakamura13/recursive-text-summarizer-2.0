@@ -178,20 +178,35 @@ def test_a_supported_sentence_whose_quotes_share_too_few_of_its_words_is_not_sup
     assert "evidence_overlap_below_floor" in result.diagnostic_codes
 
 
-def test_the_floor_keeps_a_supported_sentence_in_a_script_without_word_spaces() -> None:
-    source = "港は五月に開港した。"
+@pytest.mark.parametrize(
+    ("sentence", "quote"),
+    [("港は五月に開港した。", "五月に開港"), ("ﾐﾅﾄﾊｺﾞｶﾞﾂﾆｶｲｺｳｼﾀ。", "ｺﾞｶﾞﾂﾆｶｲｺｳ")],
+)
+def test_the_floor_keeps_a_supported_sentence_in_a_script_without_word_spaces(
+    sentence: str, quote: str
+) -> None:
     provider = Provider(
         [
             '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
-            '{"findings":[{"claim_id":"V01C000001","verdict":"supported","evidence":'
-            '[{"segment_id":"S000001","exact_quote":"五月に開港"}]}]}',
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "claim_id": "V01C000001",
+                            "verdict": "supported",
+                            "evidence": [{"segment_id": "S000001", "exact_quote": quote}],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
         ]
     )
 
     result = verify_draft_once(
-        "港は五月に開港した。",
+        sentence,
         source_id="a" * 64,
-        source_index=build_source_lexical_index(provenance_ids=("S000001",), source={"S000001": source}),
+        source_index=build_source_lexical_index(provenance_ids=("S000001",), source={"S000001": sentence}),
         runtime=runtime(provider),
         config=VerificationConfig(enabled=True),
         pass_index=1,
