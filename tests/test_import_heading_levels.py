@@ -165,3 +165,19 @@ def test_odt_levels_deeper_than_nine_are_kept(tmp_path) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("content.xml", content)
     assert pairs(read(path, "odt")) == [("Deep", 12)]
+
+
+def test_docx_style_based_on_a_heading_id_inherits_its_level_despite_its_name(tmp_path) -> None:
+    path = tmp_path / "doc.docx"
+    styles = (
+        _style("Heading2", "Überschrift 2")
+        + _style("Derived", "Derived", based_on="Heading2")
+        + _style("FromMissing", "From missing", based_on="Subtitle")
+        + _style("QuietBase", "Quiet base", outline=9).replace('w:styleId="QuietBase"', 'w:styleId="Heading3"')
+        + _style("Quiet", "Quiet", based_on="Heading3")
+    )
+    body = _p("Inherited", "Derived") + _p("Missing base", "FromMissing") + _p("Body", "Quiet")
+    _docx(path, body, styles)
+    extraction = read(path, "docx")
+    assert pairs(extraction) == [("Inherited", 2), ("Missing base", 2)]
+    assert "Body" in extraction.text

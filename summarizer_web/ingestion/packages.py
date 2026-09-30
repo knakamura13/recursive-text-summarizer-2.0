@@ -146,7 +146,7 @@ def _docx_styles(
         named_heading = name.startswith("heading") or name in ("title", "subtitle")
         if outline_level is None and named_heading or outline_level:
             headings.add(style_id)
-        level = outline_level if outline_level is not None else _named_level(name)
+        level = outline_level if outline_level is not None else _named_level(name) or _named_level(style_id)
         if level is not None:
             own_levels[style_id] = level
         based_on = style.find(f"{_W}basedOn")
@@ -160,8 +160,9 @@ def _docx_styles(
         current: str | None = style_id
         while current is not None and current not in seen:
             seen.add(current)
-            if current in own_levels:
-                levels[style_id] = own_levels[current]
+            level = own_levels.get(current, _named_level(current))
+            if level is not None:
+                levels[style_id] = level
                 break
             current = parents.get(current)
     headings.update(style_id for style_id, level in levels.items() if level != _BODY_TEXT)
