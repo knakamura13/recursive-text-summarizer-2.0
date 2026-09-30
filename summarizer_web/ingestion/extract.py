@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from summarizer.ingestion import ingest_text
+from summarizer.segmentation import detect_markdown_headings
 from summarizer_web.config import EXTRACTION_VERSION
 from summarizer_web.ingestion.common import (
     Extraction,
@@ -324,7 +325,12 @@ def extract_document(
         text = html_to_text(decoded.text)
     else:
         text = decoded.text
-    return Extraction(document_format, text=text, encoding=decoded.encoding, notices=notices)
+    hints = (
+        [OutlineHint(heading.title, heading.level) for heading in detect_markdown_headings(text)]
+        if document_format in ("txt", "md")
+        else []
+    )
+    return Extraction(document_format, text=text, encoding=decoded.encoding, notices=notices, outline_hints=hints)
 
 
 def preview_text(text: str) -> str:

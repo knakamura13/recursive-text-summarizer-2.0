@@ -401,6 +401,49 @@ def detect_structural_blocks(text: str) -> list[StructuralBlock]:
     return blocks
 
 
+@dataclass(frozen=True)
+class MarkdownHeading:
+    """An ATX or setext heading: `text[start:end]` is the heading itself
+    (marker and underline included, trailing blank lines excluded)."""
+
+    level: int
+    title: str
+    start: int
+    end: int
+
+
+_ATX_CLOSING_MARKERS = re.compile(r"(?:^|[ \t]+)#+[ \t]*$")
+
+
+def detect_markdown_headings(text: str) -> list[MarkdownHeading]:
+    """Return every ATX and setext heading in document order.
+
+    Uses the same heading and fence rules as `detect_structural_blocks`, so
+    headings inside fenced code are ignored. ATX levels are 1-6; setext
+    levels are 1 (`=` underline) and 2 (`-` underline). Closing `#` markers
+    are stripped from titles. Headings with an empty title are skipped.
+    """
+    headings: list[MarkdownHeading] = []
+    for block in detect_structural_blocks(text):
+        if block.boundary_kind is not BoundaryKind.HEADING:
+            continue
+        first = _line_spans(text[block.start : block.end])[0]
+        if _ATX_HEADING.match(first.content):
+            stripped = first.content.strip()
+            level = len(stripped) - len(stripped.lstrip("#"))
+            title = _ATX_CLOSING_MARKERS.sub("", stripped[level:].strip())
+            end = block.start + len(first.content)
+        else:
+            lines = _line_spans(text[block.start : block.end])
+            level = 1 if lines[1].content.lstrip().startswith("=") else 2
+            title = first.content.strip()
+            end = block.start + lines[1].start + len(lines[1].content.rstrip())
+        title = title.strip()
+        if title:
+            headings.append(MarkdownHeading(level, title, block.start, end))
+    return headings
+
+
 _SENTENCE_ABBREVS = {
     "co",
     "dept",
