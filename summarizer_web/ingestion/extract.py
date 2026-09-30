@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from summarizer.ingestion import ingest_text
+from summarizer.segmentation import detect_markdown_headings
 from summarizer_web.config import EXTRACTION_VERSION
 from summarizer_web.ingestion.common import (
     Extraction,
@@ -152,7 +153,8 @@ def anchor_outline(
     Hints are searched in order, each after the previous one's title, so a
     repeated title lands on its next occurrence. A hint with a page is
     searched within that page, after the previous title when that is on the
-    page. Two hints found at one place keep the first.
+    page. Two hints found at one place keep the first. A hint with an
+    offset is placed exactly there, or counted as not found.
     """
     by_page = {span.page: span for span in pages or () if not span.blank}
     placed: dict[int, tuple[str, int]] = {}
@@ -162,7 +164,11 @@ def anchor_outline(
         patterns = _title_patterns(hint.title)
         found = None
         if patterns is not None:
-            if hint.page is None:
+            if hint.offset is not None:
+                # The extractor knows where the title is: place it there, never earlier.
+                match = patterns[-1].match(text, hint.offset)
+                found = match.span(1) if match is not None else None
+            elif hint.page is None:
                 found = _find_title(patterns, text, cursor, len(text))
             elif (span := by_page.get(hint.page)) is not None:
                 found = _find_title(
@@ -325,9 +331,12 @@ def extract_document(
         text, hints = html_to_text_and_outline(decoded.text)
     else:
         text = decoded.text
-    return Extraction(
-        document_format, text=text, encoding=decoded.encoding, notices=notices, outline_hints=hints
-    )
+    if document_format in ("txt", "md"):
+        hints = [
+            OutlineHint(heading.title, heading.level, offset=heading.title_start)
+            for heading in detect_markdown_headings(clean_text(text))
+        ]
+    return Extraction(document_format, text=text, encoding=decoded.encoding, notices=notices, outline_hints=hints)
 
 
 def preview_text(text: str) -> str:

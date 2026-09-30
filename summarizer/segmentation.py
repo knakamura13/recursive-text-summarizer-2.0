@@ -293,7 +293,7 @@ class SourceSegment:
 _ATX_HEADING = re.compile(r" {0,3}#{1,6}(?:[ \t]+|$)")
 _SETEXT_UNDERLINE = re.compile(r" {0,3}(?:=+|-+)[ \t]*$")
 _LIST_ITEM = re.compile(r" {0,3}(?:[-+*][ \t]+|\d+[.)][ \t]+)")
-_FENCE_OPEN = re.compile(r"(`{3,}|~{3,})")
+_FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})")
 
 
 @dataclass(frozen=True)
@@ -344,7 +344,7 @@ def detect_structural_blocks(text: str) -> list[StructuralBlock]:
         fence_match = _FENCE_OPEN.match(content)
         if fence_match:
             fence_marker = fence_match.group(1)
-            close_pattern = re.compile(r"^\s*" + re.escape(fence_marker[0] * len(fence_marker)) + r"+\s*$")
+            close_pattern = re.compile(r" {0,3}" + re.escape(fence_marker[0] * len(fence_marker)) + r"+\s*$")
             index += 1
             while index < len(lines):
                 if close_pattern.match(lines[index].content):
@@ -399,6 +399,67 @@ def detect_structural_blocks(text: str) -> list[StructuralBlock]:
             )
         )
     return blocks
+
+
+@dataclass(frozen=True)
+class MarkdownHeading:
+    """An ATX or setext heading: `text[start:end]` is the heading itself
+    (marker and underline included, trailing blank lines excluded)."""
+
+    level: int
+    title: str
+    start: int
+    end: int
+    title_start: int  # where the title text begins, after any `#` marker
+
+
+_ATX_CLOSING_MARKERS = re.compile(r"(?:^|[ \t]+)#+[ \t]*$")
+
+
+def detect_markdown_headings(text: str) -> list[MarkdownHeading]:
+    """Return every ATX and setext heading in document order.
+
+    Uses the same heading and fence rules as `detect_structural_blocks`, so
+    headings inside fenced code are ignored. ATX levels are 1-6; setext
+    levels are 1 (`=` underline) and 2 (`-` underline). Closing `#` markers
+    are stripped from titles. Headings with an empty title are skipped.
+    """
+    headings: list[MarkdownHeading] = []
+    previous: StructuralBlock | None = None
+    for block in detect_structural_blocks(text):
+        before, previous = previous, block
+        if block.boundary_kind is not BoundaryKind.HEADING:
+            continue
+        lines = _line_spans(text[block.start : block.end])
+        first = lines[0]
+        start = block.start
+        if _ATX_HEADING.match(first.content):
+            stripped = first.content.strip()
+            level = len(stripped) - len(stripped.lstrip("#"))
+            title = _ATX_CLOSING_MARKERS.sub("", stripped[level:].strip())
+            end = block.start + len(first.content)
+            title_start = block.start + re.match(r" *#+[ \t]*", first.content).end()  # type: ignore[union-attr]
+        else:
+            level = 1 if lines[1].content.lstrip().startswith("=") else 2
+            title_lines = [first.content]
+            title_start = start + (len(first.content) - len(first.content.lstrip()))
+            # A paragraph directly above the heading line (no blank line
+            # between) is the earlier lines of a multi-line setext title.
+            if (
+                before is not None
+                and before.boundary_kind is BoundaryKind.PARAGRAPH
+                and before.end == block.start
+                and not text[before.start : before.end].endswith("\n\n")
+            ):
+                start = before.start
+                title_lines = text[before.start : before.end].splitlines() + title_lines
+                title_start = start + (len(title_lines[0]) - len(title_lines[0].lstrip()))
+            title = " ".join(line.strip() for line in title_lines)
+            end = block.start + lines[1].start + len(lines[1].content.rstrip())
+        title = title.strip()
+        if title:
+            headings.append(MarkdownHeading(level, title, start, end, title_start))
+    return headings
 
 
 _SENTENCE_ABBREVS = {
