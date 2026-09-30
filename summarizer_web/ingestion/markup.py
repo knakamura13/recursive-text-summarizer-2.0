@@ -10,7 +10,14 @@ from __future__ import annotations
 import re
 from html.parser import HTMLParser
 
-from summarizer_web.ingestion.common import Block, BlockKind, collapse_spaces, render_blocks
+from summarizer_web.ingestion.common import (
+    Block,
+    BlockKind,
+    OutlineHint,
+    collapse_spaces,
+    outline_hints,
+    render_blocks,
+)
 
 _SKIPPED = frozenset(
     {"script", "style", "template", "noscript", "svg", "title", "iframe", "canvas", "select"}
@@ -75,6 +82,13 @@ class _BlockParser(HTMLParser):
                 return "list_item"
         return "paragraph"
 
+    def _level(self) -> int | None:
+        """The depth of the innermost open heading (`h1` is 1), if any."""
+        for tag in reversed(self._open):
+            if tag in _HEADINGS:
+                return int(tag[1])
+        return None
+
     def _in_row(self) -> bool:
         return bool(self._row_cells)
 
@@ -98,7 +112,8 @@ class _BlockParser(HTMLParser):
         if self._prefix:
             text = self._prefix + text
             self._prefix = ""
-        self.blocks.append(Block(kind, text, breaks_before=self._break_next))
+        level = self._level() if kind == "heading" else None
+        self.blocks.append(Block(kind, text, breaks_before=self._break_next, level=level))
         self._break_next = False
 
     def _close_to(self, tag: str, *, stop_at: frozenset[str] = frozenset()) -> bool:
@@ -234,3 +249,9 @@ def html_to_blocks(markup: str) -> list[Block]:
 
 def html_to_text(markup: str) -> str:
     return render_blocks(html_to_blocks(markup))
+
+
+def html_to_text_and_outline(markup: str) -> tuple[str, list[OutlineHint]]:
+    """The rendered text and the headings, with their levels, in document order."""
+    blocks = html_to_blocks(markup)
+    return render_blocks(blocks), outline_hints(blocks)

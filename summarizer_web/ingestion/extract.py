@@ -33,7 +33,7 @@ from summarizer_web.ingestion.common import (
     plural,
 )
 from summarizer_web.ingestion.encoding import DecodedText, decode_text
-from summarizer_web.ingestion.markup import declared_charset, html_to_text
+from summarizer_web.ingestion.markup import declared_charset, html_to_text_and_outline
 from summarizer_web.ingestion.ocr import Tesseract, extract_image
 from summarizer_web.ingestion.packages import extract_docx, extract_epub, extract_odt
 from summarizer_web.ingestion.pdf import extract_pdf
@@ -296,11 +296,11 @@ def extract_document(
         return extract_image(path, document_format, progress, tesseract)
     progress("reading")
     if document_format == "epub":
-        return Extraction("epub", text=extract_epub(path, progress))
+        return extract_epub(path, progress)
     if document_format in ("docx", "odt"):
         progress("extracting")
         reader = extract_docx if document_format == "docx" else extract_odt
-        return Extraction(document_format, text=reader(path))
+        return reader(path)
     data = path.read_bytes()
     if document_format == "rtf":
         progress("extracting")
@@ -308,6 +308,7 @@ def extract_document(
     decoded = decode_text(data, declared=declared_charset(data) if document_format == "html" else None)
     del data
     notices = _decoding_notices(decoded)
+    hints: list[OutlineHint] = []
     if document_format in ("srt", "vtt"):
         progress("extracting")
         convert = srt_to_text if document_format == "srt" else vtt_to_text
@@ -321,10 +322,12 @@ def extract_document(
             )
     elif document_format == "html":
         progress("extracting")
-        text = html_to_text(decoded.text)
+        text, hints = html_to_text_and_outline(decoded.text)
     else:
         text = decoded.text
-    return Extraction(document_format, text=text, encoding=decoded.encoding, notices=notices)
+    return Extraction(
+        document_format, text=text, encoding=decoded.encoding, notices=notices, outline_hints=hints
+    )
 
 
 def preview_text(text: str) -> str:

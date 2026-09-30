@@ -19,9 +19,11 @@ from xml.etree import ElementTree
 
 from summarizer_web.ingestion.common import (
     Block,
+    Extraction,
     ImportFailure,
     ProgressCallback,
     collapse_spaces,
+    outline_hints,
     render_blocks,
 )
 from summarizer_web.ingestion.encoding import decode_text
@@ -92,13 +94,47 @@ def _int(value: str | None, default: int) -> int:
         return default
 
 
-def _docx_styles(archive: zipfile.ZipFile) -> tuple[frozenset[str], frozenset[str]]:
-    """Paragraph style ids that are headings and those that are list styles."""
+_MAX_HEADING_LEVEL = 9
+_HEADING_NAME = re.compile(r"heading\s*(\d+)$")
+
+
+_BODY_TEXT = 0
+
+
+def _outline_level(properties: ElementTree.Element | None) -> int | None:
+    """The 1-based level of a paragraph or style's `outlineLvl`; `_BODY_TEXT`
+    when it says body text (9); None when the property is absent."""
+    outline = properties.find(f"{_W}outlineLvl") if properties is not None else None
+    if outline is None:
+        return None
+    value = _int(outline.get(_W_VAL), _MAX_HEADING_LEVEL)
+    return value + 1 if 0 <= value < _MAX_HEADING_LEVEL else _BODY_TEXT
+
+
+def _named_level(name: str) -> int | None:
+    """Level from a style name or id: "Heading N", Title (1), Subtitle (2)."""
+    name = name.lower()
+    if name == "title":
+        return 1
+    if name == "subtitle":
+        return 2
+    match = _HEADING_NAME.match(name)
+    return max(1, min(int(match.group(1)), _MAX_HEADING_LEVEL)) if match else None
+
+
+def _docx_styles(
+    archive: zipfile.ZipFile,
+) -> tuple[frozenset[str], frozenset[str], dict[str, int]]:
+    """Paragraph style ids that are headings, those that are list styles, and
+    the heading level each heading style resolves to (own name or outline
+    level first, then the style it is based on)."""
     if "word/styles.xml" not in archive.namelist():
-        return frozenset(), frozenset()
+        return frozenset(), frozenset(), {}
     root = _parse_xml(_read_member(archive, "word/styles.xml", "DOCX"), "word/styles.xml", "DOCX")
     headings: set[str] = set()
     lists: set[str] = set()
+    own_levels: dict[str, int] = {}
+    parents: dict[str, str] = {}
     for style in root.iter(f"{_W}style"):
         if style.get(f"{_W}type") != "paragraph":
             continue
@@ -106,16 +142,31 @@ def _docx_styles(archive: zipfile.ZipFile) -> tuple[frozenset[str], frozenset[st
         name_element = style.find(f"{_W}name")
         name = (name_element.get(_W_VAL) or "").lower() if name_element is not None else ""
         properties = style.find(f"{_W}pPr")
-        outline = properties.find(f"{_W}outlineLvl") if properties is not None else None
-        if (
-            name.startswith("heading")
-            or name in ("title", "subtitle")
-            or (outline is not None and _int(outline.get(_W_VAL), 9) < 9)
-        ):
+        outline_level = _outline_level(properties)
+        named_heading = name.startswith("heading") or name in ("title", "subtitle")
+        if outline_level is None and named_heading or outline_level:
             headings.add(style_id)
+        level = outline_level if outline_level is not None else _named_level(name) or _named_level(style_id)
+        if level is not None:
+            own_levels[style_id] = level
+        based_on = style.find(f"{_W}basedOn")
+        if based_on is not None and based_on.get(_W_VAL):
+            parents[style_id] = based_on.get(_W_VAL) or ""
         if properties is not None and properties.find(f"{_W}numPr") is not None:
             lists.add(style_id)
-    return frozenset(headings), frozenset(lists)
+    levels: dict[str, int] = {}
+    for style_id in set(parents) | headings:
+        seen: set[str] = set()
+        current: str | None = style_id
+        while current is not None and current not in seen:
+            seen.add(current)
+            level = own_levels.get(current, _named_level(current))
+            if level is not None:
+                levels[style_id] = level
+                break
+            current = parents.get(current)
+    headings.update(style_id for style_id, level in levels.items() if level != _BODY_TEXT)
+    return frozenset(headings), frozenset(lists), levels
 
 
 def _docx_text(element: ElementTree.Element) -> str:
@@ -143,6 +194,7 @@ def _docx_paragraph(
     paragraph: ElementTree.Element,
     headings: frozenset[str],
     list_styles: frozenset[str],
+    heading_levels: dict[str, int],
 ) -> Block | None:
     text = _docx_text(paragraph)
     if not text:
@@ -153,14 +205,18 @@ def _docx_paragraph(
     style = properties.find(f"{_W}pStyle")
     style_id = (style.get(_W_VAL) or "") if style is not None else ""
     lowered = style_id.lower()
-    outline = properties.find(f"{_W}outlineLvl")
-    if (
+    outline_level = _outline_level(properties)
+    style_level = heading_levels.get(style_id)
+    # A stated "body text" outline level, on the paragraph or else its style, wins over a heading name.
+    body_text = outline_level == _BODY_TEXT or (outline_level is None and style_level == _BODY_TEXT)
+    if not body_text and (
         style_id in headings
         or lowered.startswith("heading")
         or lowered in ("title", "subtitle")
-        or (outline is not None and _int(outline.get(_W_VAL), 9) < 9)
+        or outline_level
     ):
-        return Block("heading", text)
+        level = outline_level or style_level or _named_level(lowered)
+        return Block("heading", text, level=level)
     numbering = properties.find(f"{_W}numPr")
     if numbering is not None:
         number_id = numbering.find(f"{_W}numId")
@@ -198,12 +254,13 @@ def _docx_blocks(
     container: ElementTree.Element,
     headings: frozenset[str],
     list_styles: frozenset[str],
+    heading_levels: dict[str, int],
     blocks: list[Block],
 ) -> None:
     for child in container:
         tag = child.tag
         if tag == f"{_W}p":
-            block = _docx_paragraph(child, headings, list_styles)
+            block = _docx_paragraph(child, headings, list_styles, heading_levels)
             if block is not None:
                 blocks.append(block)
         elif tag == f"{_W}tbl":
@@ -217,23 +274,23 @@ def _docx_blocks(
         elif tag == f"{_W}sdt":
             content = child.find(f"{_W}sdtContent")
             if content is not None:
-                _docx_blocks(content, headings, list_styles, blocks)
+                _docx_blocks(content, headings, list_styles, heading_levels, blocks)
         elif tag in _DOCX_WRAPPERS:
-            _docx_blocks(child, headings, list_styles, blocks)
+            _docx_blocks(child, headings, list_styles, heading_levels, blocks)
 
 
-def extract_docx(path: Path) -> str:
+def extract_docx(path: Path) -> Extraction:
     with _package(path, "DOCX") as archive:
         document = _parse_xml(
             _read_member(archive, "word/document.xml", "DOCX"), "word/document.xml", "DOCX"
         )
-        headings, list_styles = _docx_styles(archive)
+        headings, list_styles, heading_levels = _docx_styles(archive)
     body = document.find(f"{_W}body")
     if body is None:
         raise ImportFailure("The DOCX file has no document body.")
     blocks: list[Block] = []
-    _docx_blocks(body, headings, list_styles, blocks)
-    return render_blocks(blocks)
+    _docx_blocks(body, headings, list_styles, heading_levels, blocks)
+    return Extraction("docx", text=render_blocks(blocks), outline_hints=outline_hints(blocks))
 
 
 # --- ODT ----------------------------------------------------------------------
@@ -310,7 +367,8 @@ def _odt_blocks(container: ElementTree.Element, blocks: list[Block]) -> None:
         if tag == f"{_TEXT}h":
             text = _odt_inline(child)
             if text:
-                blocks.append(Block("heading", text))
+                level = max(1, _int(child.get(f"{_TEXT}outline-level"), 1))
+                blocks.append(Block("heading", text, level=level))
         elif tag == f"{_TEXT}p":
             text = _odt_inline(child)
             if text:
@@ -330,7 +388,7 @@ def _odt_blocks(container: ElementTree.Element, blocks: list[Block]) -> None:
             _odt_blocks(child, blocks)
 
 
-def extract_odt(path: Path) -> str:
+def extract_odt(path: Path) -> Extraction:
     with _package(path, "ODT") as archive:
         root = _parse_xml(_read_member(archive, "content.xml", "ODT"), "content.xml", "ODT")
     body = root.find(f"{_OFFICE}body/{_OFFICE}text")
@@ -338,7 +396,7 @@ def extract_odt(path: Path) -> str:
         raise ImportFailure("The ODT file has no text body.")
     blocks: list[Block] = []
     _odt_blocks(body, blocks)
-    return render_blocks(blocks)
+    return Extraction("odt", text=render_blocks(blocks), outline_hints=outline_hints(blocks))
 
 
 # --- EPUB ---------------------------------------------------------------------
@@ -404,7 +462,7 @@ def _epub_spine(archive: zipfile.ZipFile) -> list[str]:
     return linear or auxiliary
 
 
-def extract_epub(path: Path, progress: ProgressCallback) -> str:
+def extract_epub(path: Path, progress: ProgressCallback) -> Extraction:
     blocks: list[Block] = []
     with _package(path, "EPUB") as archive:
         spine = _epub_spine(archive)
@@ -417,4 +475,4 @@ def extract_epub(path: Path, progress: ProgressCallback) -> str:
             data = _read_member(archive, member, "EPUB")
             blocks.extend(html_to_blocks(decode_text(data, declared=declared_charset(data)).text))
             progress("extracting", index, len(spine))
-    return render_blocks(blocks)
+    return Extraction("epub", text=render_blocks(blocks), outline_hints=outline_hints(blocks))
