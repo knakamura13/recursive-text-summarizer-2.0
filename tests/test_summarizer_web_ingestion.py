@@ -88,7 +88,7 @@ def test_ocr_fixtures_extract_when_tesseract_is_available(filename: str, documen
 
 def test_caption_sized_pdf_text_layer_is_ocr_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
     layer = "caption text " * 25  # 275 non-space characters, below the 1,000-char floor.
-    reader = type("Reader", (), {"pages": [type("Page", (), {"extract_text": lambda self: layer})()]})()
+    reader = type("Reader", (), {"pages": [type("Page", (), {"extract_text": lambda self, visitor_text=None: layer})()]})()
     calls: list[list[int]] = []
 
     def recognize(_path, numbers, _progress, _tesseract):
@@ -108,7 +108,7 @@ def test_ocr_replaces_layer_only_when_over_one_and_a_half_times_longer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     layer = "x" * 300
-    reader = type("Reader", (), {"pages": [type("Page", (), {"extract_text": lambda self: layer})()]})()
+    reader = type("Reader", (), {"pages": [type("Page", (), {"extract_text": lambda self, visitor_text=None: layer})()]})()
     monkeypatch.setattr(pdf, "_open_reader", lambda _path: reader)
     monkeypatch.setattr(
         pdf,

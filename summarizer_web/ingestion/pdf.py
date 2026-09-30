@@ -10,7 +10,9 @@ extract.assemble).
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -186,17 +188,242 @@ def _bookmark_hints(reader: PdfReader, page_count: int) -> list[OutlineHint]:
     return hints
 
 
+# Layout heading heuristic (PDFs without bookmarks). Each constant is a tunable.
+_SIZE_STEP = 0.5  # Sizes are bucketed to half a point so rounding noise does not split a size.
+_MIN_SIZE_RATIO = 1.1  # A line must be set at least 10% larger than body text to count as larger.
+_MAX_HEADING_CHARS = 120  # A longer line is prose, not a title.
+_MAX_HEADING_WORDS_LARGE = 20  # A title set larger than body may be a sentence-length phrase.
+_MAX_HEADING_WORDS_BOLD = 12  # A bold line at body size must be short, or it is an emphasized sentence.
+_MAX_SENTENCE_WORDS = 5  # A line ending in a period with more words than this is a sentence.
+_MIN_LETTERS = 3  # Fewer letters than this is a label, a number or a formula.
+_MIN_LETTER_RATIO = 0.5  # Mostly non-letters is a formula, a table row or a page number.
+_MERGE_GAP_EM = 1.8  # Lines of one style closer than this many line sizes are one wrapped title.
+_SAME_LINE_EM = 0.3  # Fragments whose baselines differ by less than this many sizes share a line.
+_SPACE_GAP_EM = -0.25  # Between fragments of a line, a gap above this (in sizes, vs an estimated 0.5em per char) is a space.
+_REPEAT_MIN_PAGES = 3  # A line on fewer pages than this is not a running header or footer.
+_REPEAT_PAGE_FRACTION = 0.25  # ...and it must be on at least this share of the pages.
+_BOLD_WEIGHT = 600  # FontDescriptor /FontWeight at or above this is bold (600 = semibold).
+_FORCE_BOLD_FLAG = 1 << 18  # FontDescriptor /Flags bit for ForceBold.
+_BOLD_NAME = re.compile(r"bold|black|heavy|semibold|demi(?!-?light)|extrabold", re.IGNORECASE)
+_SENTENCE_END = re.compile(r"[.!?]$")
+
+
+@dataclass
+class _Line:
+    page: int
+    y: float
+    size: float  # Dominant size by characters, bucketed.
+    bold: bool
+    text: str
+
+
+@dataclass
+class _Fragment:
+    x: float
+    y: float
+    size: float
+    bold: bool
+    text: str
+
+
+def _is_bold(font: object) -> bool:
+    try:
+        font = font.get_object() if hasattr(font, "get_object") else font  # type: ignore[union-attr]
+        if not font:
+            return False
+        name = str(font.get("/BaseFont", ""))  # type: ignore[union-attr]
+        if _BOLD_NAME.search(name):
+            return True
+        descriptor = font.get("/FontDescriptor")  # type: ignore[union-attr]
+        descriptor = descriptor.get_object() if descriptor is not None else None
+        if descriptor is None:
+            return False
+        if float(descriptor.get("/FontWeight", 0)) >= _BOLD_WEIGHT:
+            return True
+        return bool(int(descriptor.get("/Flags", 0)) & _FORCE_BOLD_FLAG)
+    except Exception:
+        return False
+
+
+class _PageCollector:
+    """A pypdf text visitor that records each shown string with its position, size and weight."""
+
+    def __init__(self) -> None:
+        self.fragments: list[_Fragment] = []
+        self._bold_by_font: dict[int, bool] = {}
+
+    def __call__(self, text, cm, tm, font_dict, font_size) -> None:
+        try:
+            if not text or not text.strip():
+                return
+            a = tm[0] * cm[0] + tm[1] * cm[2]
+            b = tm[0] * cm[1] + tm[1] * cm[3]
+            c = tm[2] * cm[0] + tm[3] * cm[2]
+            d = tm[2] * cm[1] + tm[3] * cm[3]
+            size = float(font_size) * math.sqrt(abs(a * d - b * c))
+            if size <= 0:
+                return
+            x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
+            y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+            key = id(font_dict)
+            bold = self._bold_by_font.get(key)
+            if bold is None:
+                bold = self._bold_by_font[key] = _is_bold(font_dict)
+            self.fragments.append(_Fragment(x, y, size, bold, text))
+        except Exception:
+            return
+
+    def lines(self, page: int) -> list[_Line]:
+        groups: list[list[_Fragment]] = []
+        for fragment in self.fragments:
+            if groups:
+                last = groups[-1][-1]
+                if abs(fragment.y - last.y) < _SAME_LINE_EM * max(fragment.size, last.size):
+                    groups[-1].append(fragment)
+                    continue
+            groups.append([fragment])
+        lines = []
+        for group in groups:
+            parts: list[str] = []
+            weight: dict[float, int] = {}
+            bold_chars = letters = 0
+            previous: _Fragment | None = None
+            for fragment in group:
+                text = fragment.text
+                if previous is not None and not previous.text[-1:].isspace() and not text[:1].isspace():
+                    end = previous.x + 0.5 * previous.size * len(previous.text)
+                    if fragment.x - end > _SPACE_GAP_EM * fragment.size:
+                        parts.append(" ")
+                parts.append(text)
+                count = sum(1 for ch in text if not ch.isspace())
+                bucket = round(fragment.size / _SIZE_STEP) * _SIZE_STEP
+                weight[bucket] = weight.get(bucket, 0) + count
+                letters += count
+                if fragment.bold:
+                    bold_chars += count
+                previous = fragment
+            text = " ".join("".join(parts).split())
+            if text and letters:
+                size = max(weight.items(), key=lambda item: item[1])[0]
+                lines.append(_Line(page, group[0].y, size, bold_chars == letters, text))
+        return lines
+
+
+def _collect_lines(reader: PdfReader, number: int) -> list[_Line]:
+    collector = _PageCollector()
+    reader.pages[number - 1].extract_text(visitor_text=collector)
+    return collector.lines(number)
+
+
+def _repeat_key(text: str) -> str:
+    return " ".join("".join(ch for ch in text.lower() if not ch.isdigit()).split())
+
+
+def _looks_like_heading_text(text: str, words_limit: int) -> bool:
+    if len(text) > _MAX_HEADING_CHARS:
+        return False
+    words = text.split()
+    if len(words) > words_limit:
+        return False
+    letters = sum(1 for ch in text if ch.isalpha())
+    if letters < _MIN_LETTERS or letters < _MIN_LETTER_RATIO * len(text.replace(" ", "")):
+        return False
+    first = next((ch for ch in text if ch.isalpha()), "")
+    if first.islower():  # A fragment continuing a paragraph or a sentence.
+        return False
+    if text[-1] in ",;:":
+        return False
+    return not (_SENTENCE_END.search(text) and len(words) > _MAX_SENTENCE_WORDS)
+
+
+def _headings_from_lines(pages: dict[int, list[_Line]]) -> list[OutlineHint]:
+    """Headings from laid-out lines: larger than body text, or bold on a line of their own."""
+    chars: dict[float, int] = {}
+    seen_on: dict[str, set[int]] = {}
+    for number, lines in pages.items():
+        for line in lines:
+            chars[line.size] = chars.get(line.size, 0) + len(line.text)
+            seen_on.setdefault(_repeat_key(line.text), set()).add(number)
+    if not chars:
+        return []
+    body = max(chars.items(), key=lambda item: item[1])[0]
+    repeat_at = max(_REPEAT_MIN_PAGES, math.ceil(_REPEAT_PAGE_FRACTION * len(pages)))
+    repeated = {key for key, on in seen_on.items() if len(on) >= repeat_at}
+
+    found: list[tuple[int, float, bool, str]] = []  # page, size, bold body-size, title
+    for number in sorted(pages):
+        run: list[_Line] = []
+
+        def flush() -> None:
+            if not run:
+                return
+            title = " ".join(line.text for line in run)
+            first = run[0]
+            larger = first.size >= body * _MIN_SIZE_RATIO
+            limit = _MAX_HEADING_WORDS_LARGE if larger else _MAX_HEADING_WORDS_BOLD
+            if _looks_like_heading_text(title, limit) and _repeat_key(title) not in repeated:
+                found.append((number, first.size, not larger, title))
+
+        for line in pages[number]:
+            larger = line.size >= body * _MIN_SIZE_RATIO
+            candidate = (larger or (line.bold and line.size >= body)) and _repeat_key(line.text) not in repeated
+            candidate = candidate and any(ch.isalpha() for ch in line.text)
+            if candidate and run:
+                last = run[-1]
+                if (
+                    last.size == line.size
+                    and last.bold == line.bold
+                    and 0 < last.y - line.y <= _MERGE_GAP_EM * line.size
+                ):
+                    run.append(line)
+                    continue
+            flush()
+            run = [line] if candidate else []
+        flush()
+
+    sizes = sorted({size for _, size, bold_body, _ in found if not bold_body}, reverse=True)
+    rank = {size: level for level, size in enumerate(sizes, start=1)}
+    bold_level = len(sizes) + 1
+    return [
+        OutlineHint(title, bold_level if bold_body else rank[size], number)
+        for number, size, bold_body, title in found
+    ]
+
+
+def detect_layout_headings(reader: PdfReader) -> list[OutlineHint]:
+    """Headings found from text layout alone, for PDFs without bookmarks; never raises."""
+    try:
+        pages: dict[int, list[_Line]] = {}
+        for number in range(1, _page_count(reader) + 1):
+            try:
+                pages[number] = _collect_lines(reader, number)
+            except Exception:
+                continue
+        return _headings_from_lines(pages)
+    except Exception:
+        return []
+
+
 def extract_pdf(path: Path, progress: ProgressCallback, tesseract: Tesseract | None) -> Extraction:
     progress("reading")
     reader = _open_reader(path)
     page_count = _page_count(reader)
 
+    hints = _bookmark_hints(reader, page_count)
+    layout: dict[int, list[_Line]] = {}
     layer: list[str] = []
     unreadable: list[int] = []
     progress("extracting", 0, page_count, unit="pages")
     for number in range(1, page_count + 1):
         try:
-            raw = reader.pages[number - 1].extract_text() or ""
+            # Bookmark-free PDFs collect layout in this same walk, for the heading heuristic.
+            collector = None if hints else _PageCollector()
+            raw = reader.pages[number - 1].extract_text(visitor_text=collector) or ""
+            if collector is not None:
+                try:
+                    layout[number] = collector.lines(number)
+                except Exception:
+                    pass
         except Exception:  # A damaged page must not fail the whole Import.
             raw = ""
             unreadable.append(number)
@@ -272,10 +499,18 @@ def extract_pdf(path: Path, progress: ProgressCallback, tesseract: Tesseract | N
                 message=f"No text on {plural(len(blank), 'page')}: {format_page_ranges(blank)}.",
             )
         )
+    if not hints:
+        ocr_numbers = {page.number for page in pages if page.ocr}
+        try:
+            hints = _headings_from_lines(
+                {number: lines for number, lines in layout.items() if number not in ocr_numbers}
+            )
+        except Exception:
+            hints = []
     return Extraction(
         "pdf",
         pages=pages,
         text_layer_pages=sum(1 for page in pages if not page.ocr and has_text(page.text)),
         notices=notices,
-        outline_hints=_bookmark_hints(reader, page_count),
+        outline_hints=hints,
     )
