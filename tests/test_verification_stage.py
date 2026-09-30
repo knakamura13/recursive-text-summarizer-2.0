@@ -148,6 +148,35 @@ def test_verify_once_leaves_a_span_unresolved_after_malformed_answers() -> None:
     assert len(provider.requests) == 2
 
 
+def test_a_supported_sentence_whose_quotes_share_too_few_of_its_words_is_not_supported() -> None:
+    quote = '{"segment_id":"S000001","exact_quote":"measured value is 42"}'
+    provider = Provider(
+        [
+            '{"spans":[{"span_id":"V01S000001","anchors":[]},{"span_id":"V01S000002","anchors":[]}]}',
+            '{"findings":['
+            f'{{"claim_id":"V01C000001","verdict":"supported","evidence":[{quote}]}},'
+            f'{{"claim_id":"V01C000002","verdict":"supported","evidence":[{quote}]}}'
+            "]}",
+        ]
+    )
+
+    result = verify_draft_once(
+        "The measured value is 42. The harbour closed for repairs after the storm.",
+        source_id="a" * 64,
+        source_index=index(),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+    )
+
+    assert [assessment.verdict for assessment in result.assessments] == [
+        ClaimVerdict.SUPPORTED,
+        ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+    ]
+    assert "evidence_overlap_below_floor" in result.diagnostic_codes
+
+
+
 def test_verify_once_retries_invalid_anchor_with_specific_feedback() -> None:
     provider = Provider(
         [
@@ -344,7 +373,7 @@ def test_verify_once_keeps_provider_provenance_per_classification_batch() -> Non
 
 
 def test_verify_once_merges_multiple_decomposition_batches() -> None:
-    sentence = "x" * 1_300 + "."
+    sentence = "evidence " + "x" * 1_291 + "."
     provider = Provider(
         [
             '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
