@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Literal, TypeVar
 
+from nltk.stem.snowball import SnowballStemmer
 from nltk.tokenize.punkt import PunktSentenceTokenizer
 from pydantic import (
     BaseModel,
@@ -663,9 +664,16 @@ def _terms(text: str) -> frozenset[str]:
 
 
 # A sentence the verifier supports must share at least this fraction of its
-# content words with the quotes that support it; below it, the quotes are
-# about something else (#148).
+# content words with the quotes that support it, and so must each of its
+# clauses of at least `MIN_CLAUSE_WORDS` content words. Below it, the quotes
+# are about something else, or leave a joined clause, reason or example
+# unstated (#148).
 MIN_EVIDENCE_TERM_SHARE = 0.15
+MIN_CLAUSE_WORDS = 3
+_CLAUSE_BREAK = re.compile(r"[,;:()\u2013\u2014]| - ")
+# English stems, so that word forms match ("gatherings" and "gather",
+# "cities" and "city").
+_STEMMER = SnowballStemmer("english")
 _FUNCTION_WORDS = frozenset(
     """a about above after again against all am an and any are as at be because
     been before being below between both but by can could did do does doing down
@@ -708,21 +716,43 @@ def _is_unsegmented(word: str) -> bool:
     )
 
 
-def evidence_term_share(text: str, quotes: Sequence[str]) -> float:
-    """Share of `text`'s content words that occur in `quotes`.
+def _stem(word: str) -> str:
+    return _STEMMER.stem(word)
+
+
+def _content_words(text: str) -> set[str]:
+    """`text`'s words minus function words, with common suffixes stripped.
 
     A word in a script without spaces between words can't be told apart from
-    its neighbours, so it is left out. It is 1.0, so the floor never applies,
-    when no other content word remains.
+    its neighbours, so it is left out.
     """
-    words = {
-        word
+    return {
+        _stem(word)
         for word in _terms(text) - _FUNCTION_WORDS
         if not _is_unsegmented(word)
     }
-    if not words:
-        return 1.0
-    return len(words & _terms(" ".join(quotes))) / len(words)
+
+
+def evidence_overlap_too_low(text: str, quotes: Sequence[str]) -> bool:
+    """True when `quotes` share too few of the content words of `text`, or of
+    one of its clauses, to support it.
+
+    Clauses are split at commas, semicolons, colons, dashes and brackets, and
+    a clause with fewer than `MIN_CLAUSE_WORDS` content words is not checked
+    on its own. Text with no content words is never too low.
+    """
+    quoted = _content_words(" ".join(quotes))
+
+    def too_low(words: set[str]) -> bool:
+        return bool(words) and len(words & quoted) / len(words) < MIN_EVIDENCE_TERM_SHARE
+
+    if too_low(_content_words(text)):
+        return True
+    return any(
+        too_low(words)
+        for clause in _CLAUSE_BREAK.split(text)
+        if len(words := _content_words(clause)) >= MIN_CLAUSE_WORDS
+    )
 
 
 _PROPER_NAME = re.compile(
@@ -2687,7 +2717,7 @@ def verify_draft_once(
             if finding.verdict is ClaimVerdict.SUPPORTED
             for quote in finding.exact_quotes
         ]
-        if evidence_term_share(span_text[span_id], quotes) < MIN_EVIDENCE_TERM_SHARE:
+        if evidence_overlap_too_low(span_text[span_id], quotes):
             for claim in supported:
                 verdicts[claim.claim_id] = ClaimVerdict.INSUFFICIENTLY_SUPPORTED
                 # Its supported verdict was already reported; report the one returned.
@@ -2768,7 +2798,7 @@ def verify_and_repair(
     return coordinator.resolve(
         stage="verification",
         work_id="V01",
-        prompt_version="verification/8",
+        prompt_version="verification/9",
         schema_version="verification/1",
         input_value={
             "source_id": source_id,

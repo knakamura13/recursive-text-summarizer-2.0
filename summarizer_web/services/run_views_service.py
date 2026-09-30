@@ -102,7 +102,7 @@ _NOTICE_TEXT: dict[str, tuple[Literal["info", "warning", "error"], str]] = {
     "conflicting_evidence": ("warning", "The verifier found conflicting evidence for some claims."),
     "evidence_overlap_below_floor": (
         "info",
-        "Some sentences were removed because their quotes shared too few of their words.",
+        "Some sentences were removed because their quotes left part of them unstated.",
     ),
     "inconsistent_meaningfulness": (
         "info",
