@@ -93,3 +93,8 @@ def test_an_empty_target_set_is_not_a_caught_degradation() -> None:
     summary = (REFERENCE / "article.summary.txt").read_text().strip()
     base = score_summary(LexicalJudge(), summary, quads)
     assert degradation_check(base, base, [])["all_targets_caught"] is False
+
+
+def test_drop_sentences_does_not_split_after_a_title() -> None:
+    summary = "Lina found dust. Testing by Dr. Chen showed clay. It rained."
+    assert drop_sentences_with(summary, "Dr. Chen") == "Lina found dust. It rained."
