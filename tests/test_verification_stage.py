@@ -180,7 +180,11 @@ def test_a_supported_sentence_whose_quotes_share_too_few_of_its_words_is_not_sup
 
 @pytest.mark.parametrize(
     ("sentence", "quote"),
-    [("港は五月に開港した。", "五月に開港"), ("ﾐﾅﾄﾊｺﾞｶﾞﾂﾆｶｲｺｳｼﾀ。", "ｺﾞｶﾞﾂﾆｶｲｺｳ")],
+    [
+        ("港は五月に開港した。", "五月に開港"),
+        ("ﾐﾅﾄﾊｺﾞｶﾞﾂﾆｶｲｺｳｼﾀ。", "ｺﾞｶﾞﾂﾆｶｲｺｳ"),
+        ("\U00030000\U00030001\U00030002\U00030003。", "\U00030001\U00030002"),
+    ],
 )
 def test_the_floor_keeps_a_supported_sentence_in_a_script_without_word_spaces(
     sentence: str, quote: str

@@ -685,7 +685,7 @@ _FUNCTION_WORDS = frozenset(
 _UNSEGMENTED_SCRIPT = re.compile(
     "[\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff\u3005-\u3007\u3040-\u30ff"
     "\u31f0-\u31ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff65-\uff9f"
-    "\U0001b000-\U0001b16f\U00020000-\U0002ffff]"
+    "\U0001b000-\U0001b16f\U00020000-\U0003ffff]"
 )
 
 
