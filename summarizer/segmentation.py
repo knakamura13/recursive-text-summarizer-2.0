@@ -293,7 +293,7 @@ class SourceSegment:
 _ATX_HEADING = re.compile(r" {0,3}#{1,6}(?:[ \t]+|$)")
 _SETEXT_UNDERLINE = re.compile(r" {0,3}(?:=+|-+)[ \t]*$")
 _LIST_ITEM = re.compile(r" {0,3}(?:[-+*][ \t]+|\d+[.)][ \t]+)")
-_FENCE_OPEN = re.compile(r"(`{3,}|~{3,})")
+_FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})")
 
 
 @dataclass(frozen=True)
@@ -424,23 +424,37 @@ def detect_markdown_headings(text: str) -> list[MarkdownHeading]:
     are stripped from titles. Headings with an empty title are skipped.
     """
     headings: list[MarkdownHeading] = []
+    previous: StructuralBlock | None = None
     for block in detect_structural_blocks(text):
+        before, previous = previous, block
         if block.boundary_kind is not BoundaryKind.HEADING:
             continue
-        first = _line_spans(text[block.start : block.end])[0]
+        lines = _line_spans(text[block.start : block.end])
+        first = lines[0]
+        start = block.start
         if _ATX_HEADING.match(first.content):
             stripped = first.content.strip()
             level = len(stripped) - len(stripped.lstrip("#"))
             title = _ATX_CLOSING_MARKERS.sub("", stripped[level:].strip())
             end = block.start + len(first.content)
         else:
-            lines = _line_spans(text[block.start : block.end])
             level = 1 if lines[1].content.lstrip().startswith("=") else 2
-            title = first.content.strip()
+            title_lines = [first.content]
+            # A paragraph directly above the heading line (no blank line
+            # between) is the earlier lines of a multi-line setext title.
+            if (
+                before is not None
+                and before.boundary_kind is BoundaryKind.PARAGRAPH
+                and before.end == block.start
+                and not text[before.start : before.end].endswith("\n\n")
+            ):
+                start = before.start
+                title_lines = text[before.start : before.end].splitlines() + title_lines
+            title = " ".join(line.strip() for line in title_lines)
             end = block.start + lines[1].start + len(lines[1].content.rstrip())
         title = title.strip()
         if title:
-            headings.append(MarkdownHeading(level, title, block.start, end))
+            headings.append(MarkdownHeading(level, title, start, end))
     return headings
 
 

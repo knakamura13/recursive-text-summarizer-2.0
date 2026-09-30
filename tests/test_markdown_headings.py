@@ -67,3 +67,39 @@ def test_markdown_import_yields_outline_and_keeps_canonical_text(tmp_path: Path)
     # Sections start at the title text, as for every other format.
     assert md_import.text == body
     assert (md_import.text, md_import.source_id) == (txt_import.text, txt_import.source_id)
+
+
+def test_an_atx_heading_anchors_at_its_line_not_at_a_paragraph_repeating_the_title(tmp_path: Path) -> None:
+    body = "# Guide\n\nGuide explains the setup.\n\n## Setup ##\n\nSetup steps follow."
+    path = tmp_path / "a.md"
+    path.write_text(body, encoding="utf-8")
+
+    imported = assemble(extract_document(path, "md", tesseract=None))
+
+    assert [(e.title, imported.text[e.start : e.end].split("\n")[0]) for e in imported.outline] == [
+        ("Guide", "Guide"),
+        ("Setup", "Setup ##"),
+    ]
+    assert [e.start for e in imported.outline] == [body.index("Guide"), body.index("Setup ##")]
+    assert imported.unplaced_headings == 0
+
+
+def test_crlf_setext_headings_are_detected(tmp_path: Path) -> None:
+    path = tmp_path / "a.md"
+    path.write_bytes(b"Title\r\n=====\r\n\r\nBody.\r\n\r\nSub\r\n---\r\n\r\nMore.\r\n")
+
+    imported = assemble(extract_document(path, "md", tesseract=None))
+
+    assert [(e.title, e.level) for e in imported.outline] == [("Title", 1), ("Sub", 2)]
+
+
+def test_an_indented_fence_hides_its_headings() -> None:
+    text = "# Real\n\n  ```\n# not a heading\n  ```\n\n   ~~~\nFake\n---\n   ~~~\n\n## Next\n"
+    assert [h.title for h in detect_markdown_headings(text)] == ["Real", "Next"]
+
+
+def test_a_multiline_setext_heading_is_one_heading() -> None:
+    text = "Intro.\n\nFirst line\nsecond line\n---\n\nBody."
+    [heading] = detect_markdown_headings(text)
+    assert (heading.level, heading.title) == (2, "First line second line")
+    assert text[heading.start : heading.end] == "First line\nsecond line\n---"

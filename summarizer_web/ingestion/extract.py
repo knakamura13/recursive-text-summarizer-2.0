@@ -120,15 +120,16 @@ class ImportedText:
 
 def _title_patterns(title: str) -> tuple[re.Pattern[str], ...] | None:
     """Patterns for a title with any whitespace between its words, ignoring
-    case, from most to least likely a heading: the title as a whole line,
-    then at the start of a line, then anywhere. Each needs whole words, so
-    "Intro" does not match inside "Introduction"."""
+    case, from most to least likely a heading: the title as a whole line
+    (optionally between `#` heading markers), then at the start of a line,
+    then anywhere. Each needs whole words, so "Intro" does not match inside
+    "Introduction"."""
     words = clean_text(title).split()
     if not words:
         return None
     body = r"(?<!\w)" + r"\s+".join(re.escape(word) for word in words) + r"(?!\w)"
     return (
-        re.compile(rf"^[ \t]*({body})[ \t]*$", re.IGNORECASE | re.MULTILINE),
+        re.compile(rf"^[ \t]*(?:#{{1,6}}[ \t]+)?({body})(?:[ \t]+#+)?[ \t]*$", re.IGNORECASE | re.MULTILINE),
         re.compile(rf"^[ \t]*({body})", re.IGNORECASE | re.MULTILINE),
         re.compile(f"({body})", re.IGNORECASE),
     )
@@ -326,7 +327,7 @@ def extract_document(
     else:
         text = decoded.text
     hints = (
-        [OutlineHint(heading.title, heading.level) for heading in detect_markdown_headings(text)]
+        [OutlineHint(heading.title, heading.level) for heading in detect_markdown_headings(clean_text(text))]
         if document_format in ("txt", "md")
         else []
     )
