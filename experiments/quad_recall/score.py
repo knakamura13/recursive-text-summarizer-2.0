@@ -81,8 +81,12 @@ class LLMJudge:
                 rows = json.loads(result.text)["verdicts"]
             except (ValueError, KeyError, TypeError):
                 rows = []
+            if not isinstance(rows, list):
+                rows = []
+            batch_ids = {quad.quad_id for quad in batch}
             for row in rows:
-                if isinstance(row, dict) and row.get("status") in _RANK and isinstance(row.get("id"), str):
+                # Only this batch's ids count, so a stray id from an earlier batch cannot overwrite its verdict.
+                if isinstance(row, dict) and row.get("status") in _RANK and row.get("id") in batch_ids:
                     verdicts[row["id"]] = row["status"]
         # A fact the judge never answered counts as missed, never as a silent pass.
         return {quad.quad_id: verdicts.get(quad.quad_id, MISSED) for quad in quads}
@@ -166,5 +170,6 @@ def degradation_check(base: Score, degraded: Score, target_ids: Sequence[str]) -
         "caught": sorted(targets & worse),
         "collateral": sorted(worse - targets),
         "improved": sorted(better),
-        "all_targets_caught": targets <= worse,
+        # An empty target set tests nothing, so it must not read as success.
+        "all_targets_caught": bool(targets) and targets <= worse,
     }

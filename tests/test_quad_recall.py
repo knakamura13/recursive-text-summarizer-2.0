@@ -74,3 +74,22 @@ def test_partial_is_reported_separately_from_missed() -> None:
     degraded = drop_phrase(summary, "but the award is not yet signed")
     score = score_summary(LexicalJudge(), degraded, quads)
     assert score.counts[PARTIAL] == 1 and score.recall_any == 1.0 and score.recall_full < 1.0
+
+
+def test_llm_judge_ignores_ids_from_other_batches_and_non_list_payloads() -> None:
+    rows = [_row(object=f"item {i}") for i in range(3)]
+    quads = parse_quads(json.dumps({"quads": rows}), "S1", SEGMENT)
+    stray = {"verdicts": [{"id": "S1-Q001", "status": MISSED}, {"id": "S1-Q002", "status": FULL}]}
+    judge = LLMJudge(ScriptedProvider(json.dumps({"verdicts": [{"id": "S1-Q001", "status": FULL}]}), json.dumps(stray)), "m", batch_size=1)
+    verdicts = judge.judge("x", quads[:2])
+    # Batch 2 answered for Q001 (not its own id) and for Q002, so only Q002 is taken.
+    assert verdicts == {"S1-Q001": FULL, "S1-Q002": FULL}
+    for payload in ({"verdicts": None}, {"verdicts": 3}, {"verdicts": "x"}):
+        assert LLMJudge(ScriptedProvider(json.dumps(payload)), "m").judge("x", quads[:1]) == {"S1-Q001": MISSED}
+
+
+def test_an_empty_target_set_is_not_a_caught_degradation() -> None:
+    quads = quads_from_json((REFERENCE / "article.quads.json").read_text())
+    summary = (REFERENCE / "article.summary.txt").read_text().strip()
+    base = score_summary(LexicalJudge(), summary, quads)
+    assert degradation_check(base, base, [])["all_targets_caught"] is False

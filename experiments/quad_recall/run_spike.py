@@ -105,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
     degraded = drop_phrase(summary, args.drop_phrase) if args.drop_phrase else drop_sentences_with(summary, args.drop_sentences_with)
     base, worse = score_summary(judge, summary, quads), score_summary(judge, degraded, quads)
     targets = [q.quad_id for q in quads if args.target_contains.lower() in q.text().lower()]
+    if not targets:
+        parser.error(f"--target-contains {args.target_contains!r} matches no quad")
     print(json.dumps({"base": _score_dict(base), "degraded": _score_dict(worse),
                       "check": degradation_check(base, worse, targets)}, indent=2))
     return 0
