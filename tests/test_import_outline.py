@@ -58,6 +58,19 @@ def test_a_title_is_placed_where_it_begins_a_line_and_whitespace_and_case_may_di
     assert titles == [("Early Days", "Early Days"), ("Later Years", "Later Years")]
 
 
+def test_a_title_matches_a_whole_heading_line_before_a_line_it_only_begins() -> None:
+    text = "Results from the pilot were mixed.\n\nIntroduction\n\nResults\n\nThe final numbers."
+    hints = [OutlineHint("Results", 1), OutlineHint("Intro", 1)]
+    extraction = Extraction("txt", text=text, outline_hints=hints)
+
+    imported = assemble(extraction)
+
+    [results] = imported.outline
+    assert imported.text[results.start :] == "Results\n\nThe final numbers."
+    # "Intro" is only a prefix of "Introduction", so it is not placed.
+    assert imported.unplaced_headings == 1
+
+
 def test_a_repeated_title_lands_on_its_next_occurrence() -> None:
     text = "Summary\n\nFirst part.\n\nSummary\n\nSecond part."
     hints = [OutlineHint("Summary", 1), OutlineHint("Summary", 1)]

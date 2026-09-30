@@ -117,23 +117,26 @@ class ImportedText:
     unplaced_headings: int = 0
 
 
-def _title_patterns(title: str) -> tuple[re.Pattern[str], re.Pattern[str]] | None:
+def _title_patterns(title: str) -> tuple[re.Pattern[str], ...] | None:
     """Patterns for a title with any whitespace between its words, ignoring
-    case: one that must begin a line, and one that may start anywhere."""
+    case, from most to least likely a heading: the title as a whole line,
+    then at the start of a line, then anywhere. Each needs whole words, so
+    "Intro" does not match inside "Introduction"."""
     words = clean_text(title).split()
     if not words:
         return None
-    body = r"\s+".join(re.escape(word) for word in words)
+    body = r"(?<!\w)" + r"\s+".join(re.escape(word) for word in words) + r"(?!\w)"
     return (
+        re.compile(rf"^[ \t]*({body})[ \t]*$", re.IGNORECASE | re.MULTILINE),
         re.compile(rf"^[ \t]*({body})", re.IGNORECASE | re.MULTILINE),
         re.compile(f"({body})", re.IGNORECASE),
     )
 
 
 def _find_title(
-    patterns: tuple[re.Pattern[str], re.Pattern[str]], text: str, start: int, end: int
+    patterns: tuple[re.Pattern[str], ...], text: str, start: int, end: int
 ) -> tuple[int, int] | None:
-    """The title's first occurrence in `text[start:end]`, preferring one that begins a line."""
+    """The title's first occurrence in `text[start:end]` under the most likely pattern."""
     for pattern in patterns:
         match = pattern.search(text, start, end)
         if match is not None:
