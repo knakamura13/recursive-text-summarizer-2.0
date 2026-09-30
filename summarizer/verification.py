@@ -679,14 +679,33 @@ _FUNCTION_WORDS = frozenset(
 )
 
 
-# Scripts written without spaces between words (Thai, Lao, Myanmar, Khmer,
-# kana including its halfwidth forms, and CJK ideographs), where `_TERM`
-# cannot find word boundaries.
-_UNSEGMENTED_SCRIPT = re.compile(
-    "[\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff\u3005-\u3007\u3040-\u30ff"
-    "\u31f0-\u31ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff65-\uff9f"
-    "\U0001b000-\U0001b16f\U00020000-\U0003ffff]"
+# Character-name prefixes of scripts written without spaces between words,
+# where `_TERM` cannot find word boundaries. Names rather than code-point
+# ranges keep every block of a script covered, including later extensions.
+_UNSEGMENTED_NAME_PREFIXES = (
+    "CJK ",
+    "HALFWIDTH KATAKANA",
+    "HENTAIGANA",
+    "HIRAGANA",
+    "IDEOGRAPHIC",
+    "KATAKANA",
+    "KHITAN",
+    "KHMER ",
+    "LAO ",
+    "MYANMAR ",
+    "NUSHU",
+    "TANGUT",
+    "THAI ",
+    "VERTICAL KANA",
 )
+
+
+def _is_unsegmented(word: str) -> bool:
+    return any(
+        unicodedata.name(character, "").startswith(_UNSEGMENTED_NAME_PREFIXES)
+        for character in word
+        if ord(character) > 0x2FF
+    )
 
 
 def evidence_term_share(text: str, quotes: Sequence[str]) -> float:
@@ -699,7 +718,7 @@ def evidence_term_share(text: str, quotes: Sequence[str]) -> float:
     words = {
         word
         for word in _terms(text) - _FUNCTION_WORDS
-        if not _UNSEGMENTED_SCRIPT.search(word)
+        if not _is_unsegmented(word)
     }
     if not words:
         return 1.0
