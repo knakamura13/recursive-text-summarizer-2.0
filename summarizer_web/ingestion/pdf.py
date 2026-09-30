@@ -20,6 +20,7 @@ from summarizer_web.config import MAX_IMPORT_PAGES, OCR_DPI
 from summarizer_web.ingestion.common import (
     Extraction,
     ImportFailure,
+    OutlineHint,
     PageText,
     ProgressCallback,
     clean_text,
@@ -148,6 +149,43 @@ def _recognize(
         document.close()
 
 
+_MAX_OUTLINE_DEPTH = 32
+
+
+def _bookmark_hints(reader: PdfReader, page_count: int) -> list[OutlineHint]:
+    """Bookmarks as outline hints in document order; never raises.
+
+    Nesting depth is the level (top level is 1) and the destination page is
+    1-based like `PageText.number`. A destination that cannot be resolved, or
+    falls outside the document, leaves the hint without a page.
+    """
+    hints: list[OutlineHint] = []
+
+    def walk(items: list, depth: int) -> None:
+        if depth > _MAX_OUTLINE_DEPTH:
+            return
+        for item in items:
+            if isinstance(item, list):
+                walk(item, depth + 1)
+                continue
+            title = str(getattr(item, "title", None) or "").strip()
+            if not title:
+                continue
+            try:
+                page = reader.get_destination_page_number(item) + 1
+            except Exception:
+                page = None
+            if page is not None and not 1 <= page <= page_count:
+                page = None
+            hints.append(OutlineHint(title, depth, page))
+
+    try:
+        walk(reader.outline, 1)
+    except Exception:  # A malformed outline must not fail the Import.
+        pass
+    return hints
+
+
 def extract_pdf(path: Path, progress: ProgressCallback, tesseract: Tesseract | None) -> Extraction:
     progress("reading")
     reader = _open_reader(path)
@@ -239,4 +277,5 @@ def extract_pdf(path: Path, progress: ProgressCallback, tesseract: Tesseract | N
         pages=pages,
         text_layer_pages=sum(1 for page in pages if not page.ocr and has_text(page.text)),
         notices=notices,
+        outline_hints=_bookmark_hints(reader, page_count),
     )
