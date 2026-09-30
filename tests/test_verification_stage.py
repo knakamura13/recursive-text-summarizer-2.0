@@ -4,6 +4,7 @@ import re
 import pytest
 
 from summarizer.providers.base import GenerationRequest, GenerationResult, ProviderResponseError
+from summarizer.runtime.observers import RuntimeObserver
 from summarizer.tokenization import ConservativeUtf8TokenCounter
 from summarizer.verification import (
     BatchFinding,
@@ -11,6 +12,7 @@ from summarizer.verification import (
     GenerationPhase,
     UnresolvedWork,
     VerificationConfig,
+    VerificationProgress,
     VerificationRuntime,
     _redact_finding,
     build_decomposition_request,
@@ -175,6 +177,41 @@ def test_a_supported_sentence_whose_quotes_share_too_few_of_its_words_is_not_sup
     ]
     assert "evidence_overlap_below_floor" in result.diagnostic_codes
 
+
+def test_the_floor_also_rejects_a_poorly_quoted_claim_beside_an_uncheckable_one() -> None:
+    provider = Provider(
+        [
+            '{"spans":[{"span_id":"V01S000001","anchors":["The harbour closed"]}]}',
+            '{"findings":['
+            '{"claim_id":"V01C000001","verdict":"supported","evidence":'
+            '[{"segment_id":"S000001","exact_quote":"measured value is 42"}]},'
+            '{"claim_id":"V01C000002","verdict":"not_meaningfully_verifiable","evidence":[]}'
+            "]}",
+        ]
+    )
+    events = []
+
+    result = verify_draft_once(
+        "The harbour closed for repairs after the storm.",
+        source_id="a" * 64,
+        source_index=index(),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+        progress=VerificationProgress(RuntimeObserver(on_item=events.append)),
+    )
+
+    assert [assessment.verdict for assessment in result.assessments] == [
+        ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+        ClaimVerdict.NOT_MEANINGFULLY_VERIFIABLE,
+    ]
+    last_reported = {
+        event.work_id: event.message for event in events if event.state == "completed"
+    }
+    assert last_reported == {
+        "V01C000001": "insufficiently_supported",
+        "V01C000002": "not_meaningfully_verifiable",
+    }
 
 
 def test_verify_once_retries_invalid_anchor_with_specific_feedback() -> None:

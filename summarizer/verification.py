@@ -2636,19 +2636,25 @@ def verify_draft_once(
     claims_by_span: dict[str, list[Claim]] = {}
     for claim in assessed:
         claims_by_span.setdefault(claim.span_id, []).append(claim)
+    publishable = {ClaimVerdict.SUPPORTED, ClaimVerdict.NOT_MEANINGFULLY_VERIFIABLE}
     for span_id, span_claims in claims_by_span.items():
-        if any(verdicts[claim.claim_id] is not ClaimVerdict.SUPPORTED for claim in span_claims):
+        supported = [
+            claim for claim in span_claims if verdicts[claim.claim_id] is ClaimVerdict.SUPPORTED
+        ]
+        if not supported or any(verdicts[claim.claim_id] not in publishable for claim in span_claims):
             continue
         quotes = [
             quote
-            for claim in span_claims
+            for claim in supported
             for finding in findings_by_claim[claim.claim_id]
             if finding.verdict is ClaimVerdict.SUPPORTED
             for quote in finding.exact_quotes
         ]
         if evidence_term_share(span_text[span_id], quotes) < MIN_EVIDENCE_TERM_SHARE:
-            for claim in span_claims:
+            for claim in supported:
                 verdicts[claim.claim_id] = ClaimVerdict.INSUFFICIENTLY_SUPPORTED
+                # Its supported verdict was already reported; report the one returned.
+                claim_progress.completed(claim.claim_id, ClaimVerdict.INSUFFICIENTLY_SUPPORTED)
             diagnostic_codes.append("evidence_overlap_below_floor")
     for claim in assessed:
         findings = tuple(findings_by_claim[claim.claim_id])
@@ -2725,7 +2731,7 @@ def verify_and_repair(
     return coordinator.resolve(
         stage="verification",
         work_id="V01",
-        prompt_version="verification/7",
+        prompt_version="verification/8",
         schema_version="verification/1",
         input_value={
             "source_id": source_id,
