@@ -82,9 +82,12 @@ def short_lived_parent(pid_file: str) -> None:
 # --- Helpers ---------------------------------------------------------------------------
 
 
-def _supervisor(target: Callable[[str, int], None]) -> RunSupervisor:
+def _supervisor(target: Callable[[str, int], None], grace_seconds: float = 0.3) -> RunSupervisor:
     return RunSupervisor(
-        stop_grace_seconds=0.3, kill_grace_seconds=0.3, poll_seconds=0.02, worker_target=target
+        stop_grace_seconds=grace_seconds,
+        kill_grace_seconds=grace_seconds,
+        poll_seconds=0.02,
+        worker_target=target,
     )
 
 
@@ -136,8 +139,10 @@ def supervisors():
         supervisor.shutdown()
 
 
-def _running(supervisors: list[RunSupervisor], run_id: str, target) -> tuple[RunSupervisor, int]:
-    supervisor = _supervisor(target)
+def _running(
+    supervisors: list[RunSupervisor], run_id: str, target, grace_seconds: float = 0.3
+) -> tuple[RunSupervisor, int]:
+    supervisor = _supervisor(target, grace_seconds)
     supervisors.append(supervisor)
     supervisor.enqueue(run_id)
     _wait_for(lambda: _attempt(run_id)["worker_pid"] is not None and _run_state(run_id) == "running")
@@ -153,19 +158,22 @@ def test_stop_returns_at_once_and_a_hung_worker_is_killed_after_the_grace_period
     from summarizer_web.services import runs_service
 
     run_id = seed_run(*document)
-    supervisor, pid = _running(supervisors, run_id, hung_worker)
+    supervisor, pid = _running(supervisors, run_id, hung_worker, grace_seconds=0.75)
     ready = stop_flag_path(run_id).with_name("hung.ready")
     _wait_for(ready.exists)
     monkeypatch.setattr(runs_service, "get_supervisor", lambda: supervisor)
+    # The worker ignores SIGTERM, so it cannot exit before both grace periods have
+    # passed. A stop that waited for it would therefore take at least this long.
+    both_graces = supervisor.stop_grace_seconds + supervisor.kill_grace_seconds
 
     started = time.monotonic()
     response = runs_service.stop_run(run_id)
-    assert time.monotonic() - started < 0.25
+    assert time.monotonic() - started < both_graces
     assert (response.state, response.can_stop) == ("stopping", False)
 
     _wait_for(lambda: _run_state(run_id) == "stopped", timeout=5)
     # SIGTERM after the stop grace, then SIGKILL after the kill grace.
-    assert time.monotonic() - started >= 0.6
+    assert time.monotonic() - started >= both_graces
     assert not _alive(pid)
     attempt = _attempt(run_id)
     assert (attempt["state"], attempt["failure_json"]) == ("stopped", None)
