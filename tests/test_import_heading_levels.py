@@ -137,3 +137,31 @@ def test_odt_levels_come_from_the_outline_level(tmp_path) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("content.xml", content)
     assert pairs(read(path, "odt")) == [("One", 1), ("Three", 3), ("Two", 2)]
+
+
+def test_docx_body_text_outline_level_beats_a_heading_style_on_the_paragraph_or_the_style(tmp_path) -> None:
+    path = tmp_path / "doc.docx"
+    styles = _style("Heading1", "heading 1") + _style("Quiet", "Heading Quiet", outline=9)
+    body = (
+        _p("Real", "Heading1")
+        + _p("Demoted paragraph", "Heading1", outline=9)
+        + _p("Demoted style", "Quiet")
+        + _p("Promoted again", "Quiet", outline=1)
+    )
+    _docx(path, body, styles)
+    extraction = read(path, "docx")
+    assert pairs(extraction) == [("Real", 1), ("Promoted again", 2)]
+    assert "Demoted paragraph" in extraction.text and "Demoted style" in extraction.text
+
+
+def test_odt_levels_deeper_than_nine_are_kept(tmp_path) -> None:
+    path = tmp_path / "doc.odt"
+    content = (
+        '<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:text>'
+        '<text:h text:outline-level="12">Deep</text:h>'
+        "</office:text></office:body></office:document-content>"
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("content.xml", content)
+    assert pairs(read(path, "odt")) == [("Deep", 12)]

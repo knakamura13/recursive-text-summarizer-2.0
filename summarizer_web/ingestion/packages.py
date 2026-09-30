@@ -98,13 +98,17 @@ _MAX_HEADING_LEVEL = 9
 _HEADING_NAME = re.compile(r"heading\s*(\d+)$")
 
 
+_BODY_TEXT = 0
+
+
 def _outline_level(properties: ElementTree.Element | None) -> int | None:
-    """The 1-based level of a paragraph or style's `outlineLvl`; None for body text."""
+    """The 1-based level of a paragraph or style's `outlineLvl`; `_BODY_TEXT`
+    when it says body text (9); None when the property is absent."""
     outline = properties.find(f"{_W}outlineLvl") if properties is not None else None
     if outline is None:
         return None
     value = _int(outline.get(_W_VAL), _MAX_HEADING_LEVEL)
-    return value + 1 if 0 <= value < _MAX_HEADING_LEVEL else None
+    return value + 1 if 0 <= value < _MAX_HEADING_LEVEL else _BODY_TEXT
 
 
 def _named_level(name: str) -> int | None:
@@ -139,9 +143,10 @@ def _docx_styles(
         name = (name_element.get(_W_VAL) or "").lower() if name_element is not None else ""
         properties = style.find(f"{_W}pPr")
         outline_level = _outline_level(properties)
-        if name.startswith("heading") or name in ("title", "subtitle") or outline_level is not None:
+        named_heading = name.startswith("heading") or name in ("title", "subtitle")
+        if outline_level is None and named_heading or outline_level:
             headings.add(style_id)
-        level = _named_level(name) or outline_level
+        level = outline_level if outline_level is not None else _named_level(name)
         if level is not None:
             own_levels[style_id] = level
         based_on = style.find(f"{_W}basedOn")
@@ -159,7 +164,7 @@ def _docx_styles(
                 levels[style_id] = own_levels[current]
                 break
             current = parents.get(current)
-    headings.update(levels)
+    headings.update(style_id for style_id, level in levels.items() if level != _BODY_TEXT)
     return frozenset(headings), frozenset(lists), levels
 
 
@@ -199,15 +204,17 @@ def _docx_paragraph(
     style = properties.find(f"{_W}pStyle")
     style_id = (style.get(_W_VAL) or "") if style is not None else ""
     lowered = style_id.lower()
-    outline = properties.find(f"{_W}outlineLvl")
     outline_level = _outline_level(properties)
-    if (
+    style_level = heading_levels.get(style_id)
+    # A stated "body text" outline level, on the paragraph or else its style, wins over a heading name.
+    body_text = outline_level == _BODY_TEXT or (outline_level is None and style_level == _BODY_TEXT)
+    if not body_text and (
         style_id in headings
         or lowered.startswith("heading")
         or lowered in ("title", "subtitle")
-        or (outline is not None and outline_level is not None)
+        or outline_level
     ):
-        level = outline_level or heading_levels.get(style_id) or _named_level(lowered)
+        level = outline_level or style_level or _named_level(lowered)
         return Block("heading", text, level=level)
     numbering = properties.find(f"{_W}numPr")
     if numbering is not None:
@@ -359,8 +366,8 @@ def _odt_blocks(container: ElementTree.Element, blocks: list[Block]) -> None:
         if tag == f"{_TEXT}h":
             text = _odt_inline(child)
             if text:
-                level = _int(child.get(f"{_TEXT}outline-level"), 1)
-                blocks.append(Block("heading", text, level=max(1, min(level, _MAX_HEADING_LEVEL))))
+                level = max(1, _int(child.get(f"{_TEXT}outline-level"), 1))
+                blocks.append(Block("heading", text, level=level))
         elif tag == f"{_TEXT}p":
             text = _odt_inline(child)
             if text:
