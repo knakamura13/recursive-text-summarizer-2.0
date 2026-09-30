@@ -1,8 +1,9 @@
 import json
+import re
 
 import pytest
 
-from summarizer.providers.base import GenerationRequest, GenerationResult
+from summarizer.providers.base import GenerationRequest, GenerationResult, ProviderResponseError
 from summarizer.tokenization import ConservativeUtf8TokenCounter
 from summarizer.verification import (
     BatchFinding,
@@ -331,7 +332,7 @@ def test_verify_once_keeps_provider_provenance_per_classification_batch() -> Non
         source_id="a" * 64,
         source_index=index(),
         runtime=runtime(provider),
-        config=VerificationConfig(enabled=True, request_tokens=2400, output_reserve_tokens=1, safety_margin_tokens=0),
+        config=VerificationConfig(enabled=True, request_tokens=2400, output_reserve_tokens=500, safety_margin_tokens=0),
         pass_index=1,
     )
 
@@ -448,3 +449,78 @@ def test_batch_finding_reducer_is_conservative(
 
     assert result is expected
     assert result_codes == codes
+
+
+class _ByOperation:
+    """Answer every span with its whole text and every claim as unsupported.
+
+    `cut_off` decomposition calls raise as a provider does for an answer that
+    stopped at its output reserve.
+    """
+
+    def __init__(self, cut_off: int = 0) -> None:
+        self.cut_off = cut_off
+        self.requests: list[GenerationRequest] = []
+
+    def generate(self, request: GenerationRequest) -> GenerationResult:
+        self.requests.append(request)
+        if request.operation_id.startswith("verification-decompose"):
+            if self.cut_off:
+                self.cut_off -= 1
+                raise ProviderResponseError("Ollama stopped at the configured output token limit")
+            spans = [
+                {"span_id": span_id, "anchors": []}
+                for span_id in dict.fromkeys(re.findall(r"V01S\d{6}", request.input_text))
+            ]
+            text = json.dumps({"spans": spans})
+        else:
+            findings = [
+                {"claim_id": claim_id, "verdict": "insufficiently_supported", "evidence": []}
+                for claim_id in dict.fromkeys(re.findall(r"V01C\d{6}", request.input_text))
+            ]
+            text = json.dumps({"findings": findings})
+        return GenerationResult(text=text, provider="fake", model="model")
+
+
+def _decompositions(provider: _ByOperation) -> list[list[str]]:
+    return [
+        list(dict.fromkeys(re.findall(r"V01S\d{6}", request.input_text)))
+        for request in provider.requests
+        if request.operation_id.startswith("verification-decompose")
+    ]
+
+
+_LONG_DRAFT = " ".join(f"Measurement {index} recorded a value near forty-two units." for index in range(3))
+
+
+def test_decomposition_batches_are_sized_by_their_expected_answer() -> None:
+    spans = split_draft_spans(_LONG_DRAFT, pass_index=1)
+    one_answer = ConservativeUtf8TokenCounter().count(json.dumps(
+        {"spans": [{"span_id": spans[0].span_id, "anchors": [spans[0].text]}]}, ensure_ascii=False
+    ))
+    provider = _ByOperation()
+
+    result = verify_draft_once(
+        _LONG_DRAFT, source_id="a" * 64, source_index=index(), runtime=runtime(provider),
+        config=VerificationConfig(enabled=True, output_reserve_tokens=one_answer + 5, safety_margin_tokens=0),
+        pass_index=1,
+    )
+
+    assert _decompositions(provider) == [[span.span_id] for span in spans]
+    assert not result.failed
+
+
+def test_a_cut_off_decomposition_answer_is_asked_again_in_smaller_groups() -> None:
+    provider = _ByOperation(cut_off=1)
+
+    result = verify_draft_once(
+        _LONG_DRAFT, source_id="a" * 64, source_index=index(), runtime=runtime(provider),
+        config=VerificationConfig(enabled=True, safety_margin_tokens=0),
+        pass_index=1,
+    )
+
+    first, *retries = _decompositions(provider)
+    assert len(first) == 3
+    assert retries and all(len(group) < 3 for group in retries)
+    assert not result.failed
+    assert len(result.claims) == 3
