@@ -210,6 +210,38 @@ def test_a_supported_sentence_with_an_unquoted_clause_is_not_supported() -> None
     ]
 
 
+def test_plural_and_singular_forms_of_a_word_count_as_the_same_word() -> None:
+    source = "The crew had three roles: worker, painter and driver."
+    provider = Provider(
+        [
+            '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "claim_id": "V01C000001",
+                            "verdict": "supported",
+                            "evidence": [{"segment_id": "S000001", "exact_quote": source}],
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+
+    result = verify_draft_once(
+        "The crew had three roles: workers and painters and drivers.",
+        source_id="a" * 64,
+        source_index=build_source_lexical_index(provenance_ids=("S000001",), source={"S000001": source}),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+    )
+
+    assert [assessment.verdict for assessment in result.assessments] == [ClaimVerdict.SUPPORTED]
+
+
+
 @pytest.mark.parametrize(
     ("sentence", "quote"),
     [
