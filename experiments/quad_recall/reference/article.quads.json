@@ -1,0 +1,92 @@
+[
+  {
+    "quad_id": "S000001-Q001",
+    "segment_id": "S000001",
+    "subject": "Bellweather",
+    "predicate": "began planting",
+    "object": "the first of 2,400 trees",
+    "context": "on March 18, 2027; part of a three-year effort to cool neighborhoods with sparse shade",
+    "evidence": "The fictional city of Bellweather began planting the first of 2,400 trees on March 18, 2027",
+    "anchored": true
+  },
+  {
+    "quad_id": "S000001-Q002",
+    "segment_id": "S000001",
+    "subject": "Mayor Elena Ruiz",
+    "predicate": "announced",
+    "object": "the Canopy Corridors program",
+    "context": "at Harbor Park",
+    "evidence": "Mayor Elena Ruiz announced the Canopy Corridors program at Harbor Park",
+    "anchored": true
+  },
+  {
+    "quad_id": "S000001-Q003",
+    "segment_id": "S000001",
+    "subject": "crews",
+    "predicate": "planted",
+    "object": "twelve coast live oaks",
+    "context": "along Mason Avenue at Harbor Park",
+    "evidence": "crews planted twelve coast live oaks along Mason Avenue",
+    "anchored": true
+  },
+  {
+    "quad_id": "S000001-Q004",
+    "segment_id": "S000001",
+    "subject": "first phase",
+    "predicate": "will focus on",
+    "object": "four census tracts",
+    "context": "stated by city forester Dev Malik; tracts averaged six degrees higher summer surface temperatures than the citywide reading in a 2026 survey",
+    "evidence": "the first phase will focus on four census tracts where summer surface temperatures averaged six degrees higher than the citywide reading in a 2026 survey",
+    "anchored": true
+  },
+  {
+    "quad_id": "S000001-Q005",
+    "segment_id": "S000001",
+    "subject": "2026 survey",
+    "predicate": "covered",
+    "object": "only clear afternoons",
+    "context": "Dev Malik cautioned it should not be treated as a complete measure of residents' heat exposure",
+    "evidence": "He cautioned that the survey covered only clear afternoons and should not be treated as a complete measure of residents' heat exposure.",
+    "anchored": true
+  },
+  {
+    "quad_id": "S000001-Q006",
+    "segment_id": "S000001",
+    "subject": "council",
+    "predicate": "approved",
+    "object": "$1.8 million for planting and two years of maintenance",
+    "context": "on February 27",
+    "evidence": "The council approved $1.8 million for planting and two years of maintenance on February 27.",
+    "anchored": true
+  },
+  {
+    "quad_id": "S000001-Q007",
+    "segment_id": "S000001",
+    "subject": "regional grant",
+    "predicate": "will cover",
+    "object": "about half the cost",
+    "context": "according to budget director Nia Cole; the final award has not yet been signed",
+    "evidence": "According to budget director Nia Cole, a regional grant will cover about half the cost, although the final award has not yet been signed.",
+    "anchored": true
+  },
+  {
+    "quad_id": "S000001-Q008",
+    "segment_id": "S000001",
+    "subject": "residents",
+    "predicate": "may request",
+    "object": "a street tree",
+    "context": "beginning April 2",
+    "evidence": "Residents may request a street tree beginning April 2.",
+    "anchored": true
+  },
+  {
+    "quad_id": "S000001-Q009",
+    "segment_id": "S000001",
+    "subject": "first 700 plantings",
+    "predicate": "are expected to be complete",
+    "object": "by December",
+    "context": "officials expect; weather permitting",
+    "evidence": "Officials expect the first 700 plantings to be complete by December, weather permitting.",
+    "anchored": true
+  }
+]
