@@ -690,12 +690,15 @@ _UNSEGMENTED_SCRIPT = re.compile(
 def evidence_term_share(text: str, quotes: Sequence[str]) -> float:
     """Share of `text`'s content words that occur in `quotes`.
 
-    It is 1.0, so the floor never applies, when `text` has no content words or
-    is written in a script without spaces between words.
+    A word in a script without spaces between words can't be told apart from
+    its neighbours, so it is left out. It is 1.0, so the floor never applies,
+    when no other content word remains.
     """
-    if _UNSEGMENTED_SCRIPT.search(text):
-        return 1.0
-    words = _terms(text) - _FUNCTION_WORDS
+    words = {
+        word
+        for word in _terms(text) - _FUNCTION_WORDS
+        if not _UNSEGMENTED_SCRIPT.search(word)
+    }
     if not words:
         return 1.0
     return len(words & _terms(" ".join(quotes))) / len(words)

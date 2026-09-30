@@ -163,7 +163,7 @@ def test_a_supported_sentence_whose_quotes_share_too_few_of_its_words_is_not_sup
     )
 
     result = verify_draft_once(
-        "The measured value is 42. The harbour closed for repairs after the storm.",
+        "The measured value is 42. The harbour in 北京 closed for repairs after the storm.",
         source_id="a" * 64,
         source_index=index(),
         runtime=runtime(provider),
