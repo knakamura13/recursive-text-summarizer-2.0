@@ -178,6 +178,38 @@ def test_a_supported_sentence_whose_quotes_share_too_few_of_its_words_is_not_sup
     assert "evidence_overlap_below_floor" in result.diagnostic_codes
 
 
+def test_a_supported_sentence_with_an_unquoted_clause_is_not_supported() -> None:
+    source = "The harbour opened in May and welcomed a boat that arrived."
+    opening = '{"segment_id":"S000001","exact_quote":"The harbour opened in May"}'
+    whole = f'{{"segment_id":"S000001","exact_quote":"{source}"}}'
+    provider = Provider(
+        [
+            '{"spans":[{"span_id":"V01S000001","anchors":[]},{"span_id":"V01S000002","anchors":[]}]}',
+            '{"findings":['
+            f'{{"claim_id":"V01C000001","verdict":"supported","evidence":[{opening}]}},'
+            f'{{"claim_id":"V01C000002","verdict":"supported","evidence":[{whole}]}}'
+            "]}",
+        ]
+    )
+
+    result = verify_draft_once(
+        "The harbour opened in May, after storms flooded the northern villages. "
+        "The harbour opened in May, welcoming boats arriving.",
+        source_id="a" * 64,
+        source_index=build_source_lexical_index(provenance_ids=("S000001",), source={"S000001": source}),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+    )
+
+    # The first sentence's second clause is not in its quote. The second
+    # sentence's clause differs from its quote only in word forms.
+    assert [assessment.verdict for assessment in result.assessments] == [
+        ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+        ClaimVerdict.SUPPORTED,
+    ]
+
+
 @pytest.mark.parametrize(
     ("sentence", "quote"),
     [
