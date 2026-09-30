@@ -12,8 +12,12 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from summarizer.budget import OverheadMeasurement, RequestLimits, measure_request_tokens
 from summarizer.leaf import _describe, _extract_json_object, _sanitize
-from summarizer.providers.base import GenerationRequest, GenerationResult, ModelProvider
-from summarizer.reask import INVALID_OUTPUT_ERRORS
+from summarizer.providers.base import (
+    GenerationRequest,
+    GenerationResult,
+    ModelProvider,
+    ProviderResponseError,
+)
 from summarizer.safety import redact_text
 from summarizer.segmentation import CacheCoordinator
 from summarizer.text import (
@@ -361,9 +365,13 @@ def _compress_chunk(
         nonlocal generation, kept
         try:
             generation = provider.generate(request)
-            return redact_text(parse_compressed_draft(generation.text, subject=work_id).text).strip()
-        except INVALID_OUTPUT_ERRORS:
+        except ProviderResponseError:
             generation, kept = None, True
+            return chunk.strip()
+        try:
+            return redact_text(parse_compressed_draft(generation.text, subject=work_id).text).strip()
+        except CompressionError:
+            kept = True
             return chunk.strip()
 
     if coordinator is None:

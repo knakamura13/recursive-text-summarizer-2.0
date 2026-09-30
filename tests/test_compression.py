@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from summarizer.compression import (
     BAND_TOLERANCE,
     RETENTION_RATIO,
@@ -474,3 +476,15 @@ def test_a_kept_chunk_is_not_cached(tmp_path) -> None:
 
     assert later.calls >= 1
     assert result.text == "The coach told the team the plan."
+
+
+class _Broken:
+    """A provider defect, not a model answer."""
+
+    def generate(self, request):
+        raise ValueError("provider misconfigured")
+
+
+def test_a_provider_defect_is_not_treated_as_a_model_answer() -> None:
+    with pytest.raises(ValueError, match="misconfigured"):
+        _compress_with(_Broken())
