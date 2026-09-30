@@ -119,6 +119,8 @@ export interface ImportReport {
 	blank_pages: number[];
 	char_count: number;
 	word_count: number;
+	heading_count: number;
+	unplaced_headings: number;
 	notices: Notice[];
 	preview: string;
 	extraction_version: string;

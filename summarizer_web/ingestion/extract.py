@@ -1,15 +1,22 @@
-"""Import extraction: pick the extractor for a format, assemble canonical text
-and its page map, and describe the result in an Import report.
+"""Import extraction: pick the extractor for a format, assemble canonical text,
+its page map and its outline, and describe the result in an Import report.
 
 Canonical text always comes from `summarizer.ingestion.ingest_text`. For paged
 formats (PDF, images) the page texts are joined with the page markers
 "--- Page N ---" (none before the first page). Every piece is already a fixed
 point of the pipeline's normalization, so page offsets computed while joining
 are exact code-point offsets into the final canonical text.
+
+The outline never changes the canonical text. Extractors report headings as
+hints, and each is placed by finding its title in the finished text, so its
+offsets hold whatever the extractor did to whitespace.
 """
 
 from __future__ import annotations
 
+import bisect
+import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,6 +25,7 @@ from summarizer_web.config import EXTRACTION_VERSION
 from summarizer_web.ingestion.common import (
     Extraction,
     ImportFailure,
+    OutlineHint,
     ProgressCallback,
     clean_text,
     has_text,
@@ -72,11 +80,125 @@ class PageSpan:
 
 
 @dataclass(frozen=True)
+class OutlineEntry:
+    """A heading placed in the canonical text.
+
+    `start` is where its title begins. Its section runs to `end` (exclusive):
+    the start of the next heading at the same or a higher level, or the end
+    of the text. Pages are 1-based and inclusive, and None without pages.
+    """
+
+    title: str
+    level: int
+    start: int
+    end: int
+    page_start: int | None
+    page_end: int | None
+
+    def as_json(self) -> dict[str, str | int | None]:
+        return {
+            "title": self.title,
+            "level": self.level,
+            "start": self.start,
+            "end": self.end,
+            "page_start": self.page_start,
+            "page_end": self.page_end,
+        }
+
+
+@dataclass(frozen=True)
 class ImportedText:
     text: str
     source_id: str
     pages: list[PageSpan] | None
     word_count: int
+    outline: tuple[OutlineEntry, ...] = ()
+    # Hints whose title was not found in the text.
+    unplaced_headings: int = 0
+
+
+def _title_patterns(title: str) -> tuple[re.Pattern[str], re.Pattern[str]] | None:
+    """Patterns for a title with any whitespace between its words, ignoring
+    case: one that must begin a line, and one that may start anywhere."""
+    words = clean_text(title).split()
+    if not words:
+        return None
+    body = r"\s+".join(re.escape(word) for word in words)
+    return (
+        re.compile(rf"^[ \t]*({body})", re.IGNORECASE | re.MULTILINE),
+        re.compile(f"({body})", re.IGNORECASE),
+    )
+
+
+def _find_title(
+    patterns: tuple[re.Pattern[str], re.Pattern[str]], text: str, start: int, end: int
+) -> tuple[int, int] | None:
+    """The title's first occurrence in `text[start:end]`, preferring one that begins a line."""
+    for pattern in patterns:
+        match = pattern.search(text, start, end)
+        if match is not None:
+            return match.span(1)
+    return None
+
+
+def anchor_outline(
+    text: str, hints: Sequence[OutlineHint], pages: Sequence[PageSpan] | None
+) -> tuple[tuple[OutlineEntry, ...], int]:
+    """Place each hint in `text`; returns the outline and how many hints were not found.
+
+    Hints are searched in order, each after the previous one's title, so a
+    repeated title lands on its next occurrence. A hint with a page is
+    searched within that page, after the previous title when that is on the
+    page. Two hints found at one place keep the first.
+    """
+    by_page = {span.page: span for span in pages or () if not span.blank}
+    placed: dict[int, tuple[str, int]] = {}
+    cursor = 0
+    unplaced = 0
+    for hint in hints:
+        patterns = _title_patterns(hint.title)
+        found = None
+        if patterns is not None:
+            if hint.page is None:
+                found = _find_title(patterns, text, cursor, len(text))
+            elif (span := by_page.get(hint.page)) is not None:
+                found = _find_title(
+                    patterns, text, max(cursor, span.start), span.end
+                ) or _find_title(patterns, text, span.start, span.end)
+        if found is None or found[0] in placed:
+            unplaced += 1
+            continue
+        start, stop = found
+        placed[start] = (" ".join(text[start:stop].split()), hint.level)
+        cursor = max(cursor, stop)
+
+    text_pages = [span for span in pages or () if not span.blank]
+    page_starts = [span.start for span in text_pages]
+
+    def page_at(offset: int) -> int | None:
+        index = bisect.bisect_right(page_starts, offset) - 1
+        return text_pages[max(index, 0)].page if text_pages else None
+
+    starts = sorted(placed)
+    ends = [len(text)] * len(starts)
+    open_sections: list[int] = []
+    for index, start in enumerate(starts):
+        level = placed[start][1]
+        while open_sections and placed[starts[open_sections[-1]]][1] >= level:
+            ends[open_sections.pop()] = start
+        open_sections.append(index)
+    outline = tuple(
+        OutlineEntry(
+            title=placed[start][0],
+            level=placed[start][1],
+            start=start,
+            end=end,
+            page_start=page_at(start),
+            page_end=page_at(end - 1),
+        )
+        for start, end in zip(starts, ends, strict=True)
+    )
+    return outline, unplaced
 
 
 def count_words(text: str) -> int:
@@ -96,7 +218,10 @@ def assemble(extraction: Extraction) -> ImportedText:
         if not has_text(text):
             raise ImportFailure(_EMPTY_MESSAGES.get(extraction.format, "The file contains no text."))
         document = ingest_text(text)
-        return ImportedText(document.text, document.source_id, None, count_words(document.text))
+        outline, unplaced = anchor_outline(document.text, extraction.outline_hints, None)
+        return ImportedText(
+            document.text, document.source_id, None, count_words(document.text), outline, unplaced
+        )
 
     parts: list[str] = []
     spans: list[PageSpan] = []
@@ -128,7 +253,8 @@ def assemble(extraction: Extraction) -> ImportedText:
     document = ingest_text(text)
     if document.text != text:
         raise RuntimeError("assembled page text is not in canonical form; page offsets would shift")
-    return ImportedText(document.text, document.source_id, spans, words)
+    outline, unplaced = anchor_outline(document.text, extraction.outline_hints, spans)
+    return ImportedText(document.text, document.source_id, spans, words, outline, unplaced)
 
 
 def _decoding_notices(decoded: DecodedText) -> list[Notice]:
@@ -213,6 +339,17 @@ def build_report(
     extraction: Extraction, imported: ImportedText, *, duration_seconds: float
 ) -> ImportReport:
     pages = imported.pages or []
+    notices = list(extraction.notices)
+    if imported.unplaced_headings:
+        notices.append(
+            Notice(
+                code="headings_unplaced",
+                message=(
+                    f"The outline leaves out {plural(imported.unplaced_headings, 'heading')} "
+                    "that could not be found in the text."
+                ),
+            )
+        )
     return ImportReport(
         detected_format=extraction.format,
         encoding=extraction.encoding,
@@ -222,7 +359,9 @@ def build_report(
         blank_pages=[span.page for span in pages if span.blank],
         char_count=len(imported.text),
         word_count=imported.word_count,
-        notices=extraction.notices,
+        heading_count=len(imported.outline),
+        unplaced_headings=imported.unplaced_headings,
+        notices=notices,
         preview=preview_text(imported.text),
         extraction_version=EXTRACTION_VERSION,
         duration_seconds=round(duration_seconds, 2),

@@ -91,11 +91,34 @@ _TIGHT_KINDS = frozenset({"list_item", "table_row"})
 class Block:
     """One structural unit of a document: a paragraph, heading, list item,
     table row, or preformatted section. `breaks_before` starts a new list or
-    table right after another one."""
+    table right after another one. `level` is a heading's depth (1 is the
+    top), when the format states one."""
 
     kind: BlockKind
     text: str
     breaks_before: bool = False
+    level: int | None = None
+
+
+@dataclass(frozen=True)
+class OutlineHint:
+    """A heading an extractor found, before it is placed in the canonical text.
+
+    `page` (1-based) limits the search to that page, when the format knows it.
+    """
+
+    title: str
+    level: int
+    page: int | None = None
+
+
+def outline_hints(blocks: Iterable[Block]) -> list[OutlineHint]:
+    """The heading blocks as outline hints, in document order; level 1 when unstated."""
+    return [
+        OutlineHint(block.text, block.level or 1)
+        for block in blocks
+        if block.kind == "heading" and has_text(block.text)
+    ]
 
 
 def render_blocks(blocks: Iterable[Block]) -> str:
@@ -129,7 +152,8 @@ class PageText:
 
 @dataclass
 class Extraction:
-    """What an extractor produced: flowing `text` or a list of `pages`."""
+    """What an extractor produced: flowing `text` or a list of `pages`, and
+    the headings it found as `outline_hints`."""
 
     format: DocumentFormat
     text: str | None = None
@@ -137,6 +161,7 @@ class Extraction:
     encoding: str | None = None
     text_layer_pages: int | None = None
     notices: list[Notice] = field(default_factory=list)
+    outline_hints: list[OutlineHint] = field(default_factory=list)
 
 
 def format_page_ranges(pages: Sequence[int], *, limit: int = 12) -> str:

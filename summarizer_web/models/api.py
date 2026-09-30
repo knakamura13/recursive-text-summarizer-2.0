@@ -164,6 +164,9 @@ class ImportReport(ApiModel):
     blank_pages: list[int] = Field(default_factory=list)
     char_count: int
     word_count: int
+    # Outline headings placed in the text, and those whose title was not found.
+    heading_count: int = 0
+    unplaced_headings: int = 0
     notices: list[Notice] = Field(default_factory=list)
     preview: str
     extraction_version: str
