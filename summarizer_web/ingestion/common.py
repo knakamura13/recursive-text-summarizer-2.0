@@ -105,11 +105,14 @@ class OutlineHint:
     """A heading an extractor found, before it is placed in the canonical text.
 
     `page` (1-based) limits the search to that page, when the format knows it.
+    `offset` is where the title begins in the canonical text, when the
+    extractor knows it; the title is then placed there and not searched for.
     """
 
     title: str
     level: int
     page: int | None = None
+    offset: int | None = None
 
 
 def outline_hints(blocks: Iterable[Block]) -> list[OutlineHint]:

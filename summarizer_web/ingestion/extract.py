@@ -120,16 +120,15 @@ class ImportedText:
 
 def _title_patterns(title: str) -> tuple[re.Pattern[str], ...] | None:
     """Patterns for a title with any whitespace between its words, ignoring
-    case, from most to least likely a heading: the title as a whole line
-    (optionally between `#` heading markers), then at the start of a line,
-    then anywhere. Each needs whole words, so "Intro" does not match inside
-    "Introduction"."""
+    case, from most to least likely a heading: the title as a whole line,
+    then at the start of a line, then anywhere. Each needs whole words, so
+    "Intro" does not match inside "Introduction"."""
     words = clean_text(title).split()
     if not words:
         return None
     body = r"(?<!\w)" + r"\s+".join(re.escape(word) for word in words) + r"(?!\w)"
     return (
-        re.compile(rf"^[ \t]*(?:#{{1,6}}[ \t]+)?({body})(?:[ \t]+#+)?[ \t]*$", re.IGNORECASE | re.MULTILINE),
+        re.compile(rf"^[ \t]*({body})[ \t]*$", re.IGNORECASE | re.MULTILINE),
         re.compile(rf"^[ \t]*({body})", re.IGNORECASE | re.MULTILINE),
         re.compile(f"({body})", re.IGNORECASE),
     )
@@ -154,7 +153,8 @@ def anchor_outline(
     Hints are searched in order, each after the previous one's title, so a
     repeated title lands on its next occurrence. A hint with a page is
     searched within that page, after the previous title when that is on the
-    page. Two hints found at one place keep the first.
+    page. Two hints found at one place keep the first. A hint with an
+    offset is placed exactly there, or counted as not found.
     """
     by_page = {span.page: span for span in pages or () if not span.blank}
     placed: dict[int, tuple[str, int]] = {}
@@ -164,7 +164,11 @@ def anchor_outline(
         patterns = _title_patterns(hint.title)
         found = None
         if patterns is not None:
-            if hint.page is None:
+            if hint.offset is not None:
+                # The extractor knows where the title is: place it there, never earlier.
+                match = patterns[-1].match(text, hint.offset)
+                found = match.span(1) if match is not None else None
+            elif hint.page is None:
                 found = _find_title(patterns, text, cursor, len(text))
             elif (span := by_page.get(hint.page)) is not None:
                 found = _find_title(
@@ -327,7 +331,10 @@ def extract_document(
     else:
         text = decoded.text
     hints = (
-        [OutlineHint(heading.title, heading.level) for heading in detect_markdown_headings(clean_text(text))]
+        [
+            OutlineHint(heading.title, heading.level, offset=heading.title_start)
+            for heading in detect_markdown_headings(clean_text(text))
+        ]
         if document_format in ("txt", "md")
         else []
     )

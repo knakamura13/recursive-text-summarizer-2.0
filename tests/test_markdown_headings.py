@@ -103,3 +103,37 @@ def test_a_multiline_setext_heading_is_one_heading() -> None:
     [heading] = detect_markdown_headings(text)
     assert (heading.level, heading.title) == (2, "First line second line")
     assert text[heading.start : heading.end] == "First line\nsecond line\n---"
+
+
+def test_a_heading_anchors_at_its_own_position_when_the_title_appears_earlier(tmp_path: Path) -> None:
+    body = "Guide\n\nPreface.\n\n# Guide\n\nText."
+    path = tmp_path / "a.md"
+    path.write_text(body, encoding="utf-8")
+
+    imported = assemble(extract_document(path, "md", tesseract=None))
+
+    [entry] = imported.outline
+    assert entry.start == body.rindex("Guide")
+    assert imported.unplaced_headings == 0
+
+
+def test_detection_offsets_are_valid_in_canonical_text(tmp_path: Path) -> None:
+    raw = "\ufeff# Top  \r\n\r\nBody\u00a0text. \r\n\r\nNext\r\n----\r\n\r\n\r\n\r\n## Last\r\n"
+    path = tmp_path / "a.md"
+    path.write_bytes(raw.encode("utf-8"))
+
+    extraction = extract_document(path, "md", tesseract=None)
+    imported = assemble(extraction)
+
+    assert [hint.offset for hint in extraction.outline_hints] == [e.start for e in imported.outline]
+    assert [(e.title, imported.text[e.start : e.start + len(e.title)]) for e in imported.outline] == [
+        ("Top", "Top"),
+        ("Next", "Next"),
+        ("Last", "Last"),
+    ]
+    assert imported.unplaced_headings == 0
+
+
+def test_a_fence_marker_indented_four_spaces_does_not_close_a_fence() -> None:
+    text = "```\n    ```\n# example\n```\n\n## After\n"
+    assert [h.title for h in detect_markdown_headings(text)] == ["After"]
