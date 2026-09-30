@@ -12,7 +12,7 @@ APP_NAME = "recursive-text-summarizer"
 
 # Imports (D3-D5). The version is stored on every source revision so the text
 # of a Document can be traced to the extraction rules that produced it.
-EXTRACTION_VERSION = "import/4"
+EXTRACTION_VERSION = "import/5"
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 MAX_PASTE_BYTES = 20 * 1024 * 1024
 MAX_IMPORT_PAGES = 5_000
