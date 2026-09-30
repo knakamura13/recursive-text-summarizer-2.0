@@ -210,8 +210,17 @@ def test_a_supported_sentence_with_an_unquoted_clause_is_not_supported() -> None
     ]
 
 
-def test_plural_and_singular_forms_of_a_word_count_as_the_same_word() -> None:
-    source = "The crew had three roles: worker, painter and driver."
+@pytest.mark.parametrize(
+    ("sentence", "source"),
+    [
+        (
+            "The crew had three roles: workers and painters and drivers.",
+            "The crew had three roles: worker, painter and driver.",
+        ),
+        ("Cities house agencies.", "A city houses an agency."),
+    ],
+)
+def test_plural_and_singular_forms_of_a_word_count_as_the_same_word(sentence: str, source: str) -> None:
     provider = Provider(
         [
             '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
@@ -230,7 +239,7 @@ def test_plural_and_singular_forms_of_a_word_count_as_the_same_word() -> None:
     )
 
     result = verify_draft_once(
-        "The crew had three roles: workers and painters and drivers.",
+        sentence,
         source_id="a" * 64,
         source_index=build_source_lexical_index(provenance_ids=("S000001",), source={"S000001": source}),
         runtime=runtime(provider),

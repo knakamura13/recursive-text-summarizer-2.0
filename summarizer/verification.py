@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Literal, TypeVar
 
+from nltk.stem.snowball import SnowballStemmer
 from nltk.tokenize.punkt import PunktSentenceTokenizer
 from pydantic import (
     BaseModel,
@@ -670,10 +671,9 @@ def _terms(text: str) -> frozenset[str]:
 MIN_EVIDENCE_TERM_SHARE = 0.15
 MIN_CLAUSE_WORDS = 3
 _CLAUSE_BREAK = re.compile(r"[,;:()\u2013\u2014]| - ")
-# English suffixes stripped so that word forms match ("gatherings", "gather"),
-# longest first, so "workers" loses "ers" rather than only "s".
-_SUFFIXES = ("ation", "ings", "ions", "ers", "ing", "ion", "es", "ed", "er", "ly", "s")
-_MIN_STEM = 4
+# English stems, so that word forms match ("gatherings" and "gather",
+# "cities" and "city").
+_STEMMER = SnowballStemmer("english")
 _FUNCTION_WORDS = frozenset(
     """a about above after again against all am an and any are as at be because
     been before being below between both but by can could did do does doing down
@@ -717,19 +717,7 @@ def _is_unsegmented(word: str) -> bool:
 
 
 def _stem(word: str) -> str:
-    """Strip suffixes until none applies, so every form reaches one stem:
-    "gatherings" and "gather" both become "gath"."""
-    while True:
-        for suffix in _SUFFIXES:
-            if (
-                word.endswith(suffix)
-                and len(word) - len(suffix) >= _MIN_STEM
-                and not (suffix == "s" and word.endswith("ss"))
-            ):
-                word = word[: -len(suffix)]
-                break
-        else:
-            return word
+    return _STEMMER.stem(word)
 
 
 def _content_words(text: str) -> set[str]:
