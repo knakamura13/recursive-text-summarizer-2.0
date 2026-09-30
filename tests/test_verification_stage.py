@@ -4,6 +4,7 @@ import re
 import pytest
 
 from summarizer.providers.base import GenerationRequest, GenerationResult, ProviderResponseError
+from summarizer.runtime.observers import RuntimeObserver
 from summarizer.tokenization import ConservativeUtf8TokenCounter
 from summarizer.verification import (
     BatchFinding,
@@ -11,6 +12,7 @@ from summarizer.verification import (
     GenerationPhase,
     UnresolvedWork,
     VerificationConfig,
+    VerificationProgress,
     VerificationRuntime,
     _redact_finding,
     build_decomposition_request,
@@ -146,6 +148,113 @@ def test_verify_once_leaves_a_span_unresolved_after_malformed_answers() -> None:
     )
     assert result.diagnostic_codes == ("decomposition_incomplete",)
     assert len(provider.requests) == 2
+
+
+def test_a_supported_sentence_whose_quotes_share_too_few_of_its_words_is_not_supported() -> None:
+    quote = '{"segment_id":"S000001","exact_quote":"measured value is 42"}'
+    provider = Provider(
+        [
+            '{"spans":[{"span_id":"V01S000001","anchors":[]},{"span_id":"V01S000002","anchors":[]}]}',
+            '{"findings":['
+            f'{{"claim_id":"V01C000001","verdict":"supported","evidence":[{quote}]}},'
+            f'{{"claim_id":"V01C000002","verdict":"supported","evidence":[{quote}]}}'
+            "]}",
+        ]
+    )
+
+    result = verify_draft_once(
+        "The measured value is 42. The harbour in 北京 closed for repairs after the storm.",
+        source_id="a" * 64,
+        source_index=index(),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+    )
+
+    assert [assessment.verdict for assessment in result.assessments] == [
+        ClaimVerdict.SUPPORTED,
+        ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+    ]
+    assert "evidence_overlap_below_floor" in result.diagnostic_codes
+
+
+@pytest.mark.parametrize(
+    ("sentence", "quote"),
+    [
+        ("港は五月に開港した。", "五月に開港"),
+        ("ﾐﾅﾄﾊｺﾞｶﾞﾂﾆｶｲｺｳｼﾀ。", "ｺﾞｶﾞﾂﾆｶｲｺｳ"),
+        ("\U00030000\U00030001\U00030002\U00030003。", "\U00030001\U00030002"),
+        ("\u3031\u3032\u3033\u3034。", "\u3032\u3033"),
+        ("\U0001aff0\U0001aff1\U0001aff2\U0001aff3。", "\U0001aff1\U0001aff2"),
+    ],
+)
+def test_the_floor_keeps_a_supported_sentence_in_a_script_without_word_spaces(
+    sentence: str, quote: str
+) -> None:
+    provider = Provider(
+        [
+            '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "claim_id": "V01C000001",
+                            "verdict": "supported",
+                            "evidence": [{"segment_id": "S000001", "exact_quote": quote}],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+        ]
+    )
+
+    result = verify_draft_once(
+        sentence,
+        source_id="a" * 64,
+        source_index=build_source_lexical_index(provenance_ids=("S000001",), source={"S000001": sentence}),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+    )
+
+    assert [assessment.verdict for assessment in result.assessments] == [ClaimVerdict.SUPPORTED]
+
+
+def test_the_floor_also_rejects_a_poorly_quoted_claim_beside_an_uncheckable_one() -> None:
+    provider = Provider(
+        [
+            '{"spans":[{"span_id":"V01S000001","anchors":["The harbour closed"]}]}',
+            '{"findings":['
+            '{"claim_id":"V01C000001","verdict":"supported","evidence":'
+            '[{"segment_id":"S000001","exact_quote":"measured value is 42"}]},'
+            '{"claim_id":"V01C000002","verdict":"not_meaningfully_verifiable","evidence":[]}'
+            "]}",
+        ]
+    )
+    events = []
+
+    result = verify_draft_once(
+        "The harbour closed for repairs after the storm.",
+        source_id="a" * 64,
+        source_index=index(),
+        runtime=runtime(provider),
+        config=VerificationConfig(enabled=True),
+        pass_index=1,
+        progress=VerificationProgress(RuntimeObserver(on_item=events.append)),
+    )
+
+    assert [assessment.verdict for assessment in result.assessments] == [
+        ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
+        ClaimVerdict.NOT_MEANINGFULLY_VERIFIABLE,
+    ]
+    last_reported = {
+        event.work_id: event.message for event in events if event.state == "completed"
+    }
+    assert last_reported == {
+        "V01C000001": "insufficiently_supported",
+        "V01C000002": "not_meaningfully_verifiable",
+    }
 
 
 def test_verify_once_retries_invalid_anchor_with_specific_feedback() -> None:
@@ -344,7 +453,7 @@ def test_verify_once_keeps_provider_provenance_per_classification_batch() -> Non
 
 
 def test_verify_once_merges_multiple_decomposition_batches() -> None:
-    sentence = "x" * 1_300 + "."
+    sentence = "evidence " + "x" * 1_291 + "."
     provider = Provider(
         [
             '{"spans":[{"span_id":"V01S000001","anchors":[]}]}',

@@ -662,6 +662,69 @@ def _terms(text: str) -> frozenset[str]:
     return frozenset(match.group() for match in _TERM.finditer(normalized))
 
 
+# A sentence the verifier supports must share at least this fraction of its
+# content words with the quotes that support it; below it, the quotes are
+# about something else (#148).
+MIN_EVIDENCE_TERM_SHARE = 0.15
+_FUNCTION_WORDS = frozenset(
+    """a about above after again against all am an and any are as at be because
+    been before being below between both but by can could did do does doing down
+    during each few for from further had has have having he her here hers herself
+    him himself his how i if in into is it its itself just me more most my myself
+    no nor not now of off on once only or other our ours ourselves out over own
+    same she should so some such than that the their theirs them themselves then
+    there these they this those through to too under until up very was we were
+    what when where which while who whom why will with would you your yours
+    yourself yourselves also may might must shall one s t""".split()
+)
+
+
+# Character-name prefixes of scripts written without spaces between words,
+# where `_TERM` cannot find word boundaries. Names rather than code-point
+# ranges keep every block of a script covered, including later extensions.
+_UNSEGMENTED_NAME_PREFIXES = (
+    "CJK ",
+    "HALFWIDTH KATAKANA",
+    "HENTAIGANA",
+    "HIRAGANA",
+    "IDEOGRAPHIC",
+    "KATAKANA",
+    "KHITAN",
+    "KHMER ",
+    "LAO ",
+    "MYANMAR ",
+    "NUSHU",
+    "TANGUT",
+    "THAI ",
+    "VERTICAL KANA",
+)
+
+
+def _is_unsegmented(word: str) -> bool:
+    return any(
+        unicodedata.name(character, "").startswith(_UNSEGMENTED_NAME_PREFIXES)
+        for character in word
+        if ord(character) > 0x2FF
+    )
+
+
+def evidence_term_share(text: str, quotes: Sequence[str]) -> float:
+    """Share of `text`'s content words that occur in `quotes`.
+
+    A word in a script without spaces between words can't be told apart from
+    its neighbours, so it is left out. It is 1.0, so the floor never applies,
+    when no other content word remains.
+    """
+    words = {
+        word
+        for word in _terms(text) - _FUNCTION_WORDS
+        if not _is_unsegmented(word)
+    }
+    if not words:
+        return 1.0
+    return len(words & _terms(" ".join(quotes))) / len(words)
+
+
 _PROPER_NAME = re.compile(
     r"(?:[A-Z][a-z]+(?:['-][A-Za-z]+)?)"
     r"(?:\s+(?:[A-Z][a-z]+(?:['-][A-Za-z]+)?))+"
@@ -2596,16 +2659,43 @@ def verify_draft_once(
         *decomposition_diagnostics,
         *classification_diagnostics,
     ]
+    verdicts: dict[str, ClaimVerdict] = {}
     for claim in assessed:
         bundle = bundles[claim.claim_id]
-        findings = tuple(findings_by_claim[claim.claim_id])
         verdict, codes = reduce_batch_findings(
             claim.claim_id,
-            findings,
+            tuple(findings_by_claim[claim.claim_id]),
             retrieval_complete=bundle.selection.retrieval_complete,
         )
-        verdict = verdict_after_unresolved_escalation(claim.claim_id, verdict)
+        verdicts[claim.claim_id] = verdict_after_unresolved_escalation(claim.claim_id, verdict)
         diagnostic_codes.extend(codes)
+    span_text = {span.span_id: span.text for span in spans}
+    claims_by_span: dict[str, list[Claim]] = {}
+    for claim in assessed:
+        claims_by_span.setdefault(claim.span_id, []).append(claim)
+    publishable = {ClaimVerdict.SUPPORTED, ClaimVerdict.NOT_MEANINGFULLY_VERIFIABLE}
+    for span_id, span_claims in claims_by_span.items():
+        supported = [
+            claim for claim in span_claims if verdicts[claim.claim_id] is ClaimVerdict.SUPPORTED
+        ]
+        if not supported or any(verdicts[claim.claim_id] not in publishable for claim in span_claims):
+            continue
+        quotes = [
+            quote
+            for claim in supported
+            for finding in findings_by_claim[claim.claim_id]
+            if finding.verdict is ClaimVerdict.SUPPORTED
+            for quote in finding.exact_quotes
+        ]
+        if evidence_term_share(span_text[span_id], quotes) < MIN_EVIDENCE_TERM_SHARE:
+            for claim in supported:
+                verdicts[claim.claim_id] = ClaimVerdict.INSUFFICIENTLY_SUPPORTED
+                # Its supported verdict was already reported; report the one returned.
+                claim_progress.completed(claim.claim_id, ClaimVerdict.INSUFFICIENTLY_SUPPORTED)
+            diagnostic_codes.append("evidence_overlap_below_floor")
+    for claim in assessed:
+        findings = tuple(findings_by_claim[claim.claim_id])
+        verdict = verdicts[claim.claim_id]
         assessments.append(
             ClaimAssessment(
                 claim_id=claim.claim_id,
@@ -2678,7 +2768,7 @@ def verify_and_repair(
     return coordinator.resolve(
         stage="verification",
         work_id="V01",
-        prompt_version="verification/7",
+        prompt_version="verification/8",
         schema_version="verification/1",
         input_value={
             "source_id": source_id,

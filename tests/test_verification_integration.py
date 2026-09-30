@@ -54,7 +54,12 @@ class VerificationPipelineProvider:
         self.requests.append(request)
         operation = request.operation_id or ""
         if operation == "editorial-final":
-            text = "42. The value is 41." if self.verification == "omit-second" else "42."
+            if self.verification == "omit-second":
+                text = "41. The value is 41."
+            elif self.verification == "supported":
+                text = "41."
+            else:
+                text = "42."
             response = {"text": text}
         elif operation == "D000001" or operation.startswith("S"):
             response = self._node(0, operation or "S000001")
@@ -159,7 +164,7 @@ def _verify_with_global_cache(
     source_index: SourceLexicalIndex,
 ) -> None:
     verify_and_repair(
-        "42.",
+        "41.",
         source_id=source_id,
         source_index=source_index,
         runtime=VerificationRuntime(
@@ -251,7 +256,7 @@ def test_direct_verification_uses_bounded_source_passages_for_large_document(tmp
         ),
     )
 
-    assert result.final.text == "42."
+    assert result.final.text == "41."
     assert result.root.covered_segments == ("D000001",)
     assert result.final.audit is not None
     assert result.final.audit.verification.passes[0].assessments
@@ -488,7 +493,7 @@ def test_provider_cache_coordinator_attribute_cannot_enable_verification_caching
         implicit_provider = VerificationPipelineProvider(verification="supported")
         implicit_provider.cache_coordinator = coordinator
         implicit_result = verify_and_repair(
-            "42.",
+            "41.",
             source_id=source_id,
             source_index=source_index,
             runtime=VerificationRuntime(
@@ -507,7 +512,7 @@ def test_provider_cache_coordinator_attribute_cannot_enable_verification_caching
 
         explicit_provider = VerificationPipelineProvider(verification="supported")
         explicit_result = verify_and_repair(
-            "42.",
+            "41.",
             source_id=source_id,
             source_index=source_index,
             runtime=VerificationRuntime(
@@ -527,7 +532,7 @@ def test_provider_cache_coordinator_attribute_cannot_enable_verification_caching
 
         reused_provider = VerificationPipelineProvider(verification="supported")
         reused_result = verify_and_repair(
-            "42.",
+            "41.",
             source_id=source_id,
             source_index=source_index,
             runtime=VerificationRuntime(
@@ -794,7 +799,7 @@ def test_injected_verifier_runtime_reuses_its_own_cached_terminal_result(tmp_pat
         ),
     )
 
-    assert resumed.final.text == "42."
+    assert resumed.final.text == "41."
     assert resumed_summary.requests == []
     assert resumed_verifier.requests == []
 
@@ -898,7 +903,7 @@ def test_published_subset_audit_keeps_the_withheld_unresolved_span(tmp_path) -> 
 
     body = json.loads(audit_path.read_text())
     last_pass = body["verification"]["passes"][-1]
-    assert result.final.text.startswith("42.")
+    assert result.final.text.startswith("41.")
     assert "The value is 41." not in result.final.text
     assert body["publication"]["kind"] == "verified_subset"
     assert "verification_incomplete" in body["verification"]["warning_codes"]
@@ -981,7 +986,7 @@ def test_successful_frozen_verification_reuses_its_terminal_result(tmp_path) -> 
     run_pipeline(document, first, CharacterCounter(), app=app(), strategy=strategy(), config=config)
     result = run_pipeline(document, second, CharacterCounter(), app=app(), strategy=strategy(), config=PipelineConfig(**{**config.__dict__, "reliability": ReliabilityConfig(run_id="verification-success", run_mode="resume")}))
 
-    assert result.final.text == "42."
+    assert result.final.text == "41."
     assert second.requests == []
 
 

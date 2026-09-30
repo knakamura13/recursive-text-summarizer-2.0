@@ -100,6 +100,10 @@ _NOTICE_TEXT: dict[str, tuple[Literal["info", "warning", "error"], str]] = {
         "Some verifier quotes did not match the source, so they were not counted as support.",
     ),
     "conflicting_evidence": ("warning", "The verifier found conflicting evidence for some claims."),
+    "evidence_overlap_below_floor": (
+        "info",
+        "Some sentences were removed because their quotes shared too few of their words.",
+    ),
     "inconsistent_meaningfulness": (
         "info",
         "The verifier disagreed about whether some claims can be checked against the source.",
