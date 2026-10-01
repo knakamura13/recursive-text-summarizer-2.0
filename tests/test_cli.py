@@ -346,3 +346,141 @@ def test_ollama_uses_offline_conservative_counter() -> None:
         )
     )
     assert counter.identity == "estimate:utf8-bytes"
+
+
+class SectionProvider:
+    """Answer every stage with a valid node citing the segments the request supplies."""
+
+    def generate(self, request: GenerationRequest) -> GenerationResult:
+        operation = request.operation_id or ""
+        if operation == "editorial-final" or operation.endswith("-editorial"):
+            payload: dict[str, object] = {"text": "Concise summary."}
+        elif operation.startswith("compression:"):
+            payload = compression_generation_payload(request)
+        else:
+            level = 0 if operation.startswith("S") else int(operation.rsplit("L", 1)[1])
+            identifiers = (
+                [operation]
+                if operation.startswith("S")
+                else list(dict.fromkeys(re.findall(r'"segment_id":"(S\d+)"', request.input_text)))
+            )
+            payload = {
+                "summary": f"Grounded level {level}.",
+                "content_units": [],
+                "entities": [],
+                "qualifications": [],
+                "contradictions": [],
+                "quotations": [],
+                "provenance": identifiers,
+                "level": level,
+            }
+        return GenerationResult(json.dumps(payload), "fake", request.model)
+
+
+SECTIONED = "# Alpha\n\nAlpha body text here.\n\n# Beta\n\nBeta body text here.\n"
+
+
+def _capture_results(monkeypatch: pytest.MonkeyPatch) -> list:
+    results: list = []
+    real = cli.run_pipeline
+
+    def recording(*args, **kwargs):
+        result = real(*args, **kwargs)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(cli, "run_pipeline", recording)
+    return results
+
+
+def test_preserve_sections_off_by_default() -> None:
+    assert parse_args([]).preserve_sections is False
+    assert parse_args(["--preserve-sections"]).preserve_sections is True
+
+
+def test_preserve_sections_summarizes_markdown_by_heading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "input.txt").write_text(SECTIONED, encoding="utf-8")
+    results = _capture_results(monkeypatch)
+
+    exit_code = main(
+        ["--preserve-sections"],
+        provider_factory=lambda _config: SectionProvider(),
+        counter_factory=counter_factory,
+    )
+
+    assert exit_code == 0
+    (result,) = results
+    assert result.sections is not None
+    assert [node.heading for node in result.sections.nodes] == ["Alpha", "Beta"]
+    assert set(result.section_nodes) == {node.id for node in result.sections.nodes}
+    assert (tmp_path / "output.txt").read_text(encoding="utf-8") == "Concise summary."
+
+
+def test_preserve_sections_without_headings_prints_notice_and_matches_mode_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "input.txt").write_text("Plain text without headings.", encoding="utf-8")
+    results = _capture_results(monkeypatch)
+    provider = RecordingProvider("Concise summary.")
+
+    exit_code = main(
+        ["--preserve-sections"],
+        provider_factory=lambda _config: provider,
+        counter_factory=counter_factory,
+    )
+
+    assert exit_code == 0
+    assert (
+        "This document has no headings, so it was summarized without preserving sections."
+        in capsys.readouterr().err
+    )
+    assert results[0].sections is None
+    assert (tmp_path / "output.txt").read_text(encoding="utf-8") == "Concise summary."
+    assert [call.operation_id for call in provider.calls] == ["D000001", "editorial-final"]
+
+
+def test_mode_off_ignores_headings_and_prints_no_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "input.txt").write_text(SECTIONED, encoding="utf-8")
+    results = _capture_results(monkeypatch)
+
+    exit_code = main(
+        [],
+        provider_factory=lambda _config: RecordingProvider("Concise summary."),
+        counter_factory=counter_factory,
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().err == ""
+    assert results[0].sections is None
+
+
+def test_dry_run_reports_section_count_only_with_the_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "input.txt").write_text(SECTIONED, encoding="utf-8")
+
+    def refuse(_config: AppConfig) -> ModelProvider:
+        raise AssertionError("provider constructed during dry run")
+
+    assert main(["--dry-run"], provider_factory=refuse, counter_factory=counter_factory) == 0
+    assert "Sections" not in capsys.readouterr().out
+
+    assert (
+        main(
+            ["--dry-run", "--preserve-sections", "--target-words", "400"],
+            provider_factory=refuse,
+            counter_factory=counter_factory,
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "Strategy:" in out
+    assert "Sections: 2" in out
