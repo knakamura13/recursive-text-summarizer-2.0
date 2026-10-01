@@ -27,6 +27,7 @@ from summarizer.finalization import (
     SectionPublication,
     _finalize_summary,
     attach_section_records,
+    finalize_assembled_summary,
     finalize_sections,
     publish_final_output,
 )
@@ -112,7 +113,7 @@ class PipelineResult:
     section_nodes: Mapping[str, str] = field(default_factory=dict)
     # Section mode only: the prose written and verified for each section that
     # has a node, by section id, checked against that section's own source.
-    # It is extra output: `final` stays the root editorial and its verification.
+    # `final` is assembled from it: the sections' prose under their headings.
     section_publications: Mapping[str, SectionPublication] = field(default_factory=dict)
 
 
@@ -724,52 +725,31 @@ def _run_pipeline(
             max_in_flight=coordinator.max_in_flight,
             reliability_tracker=reliability_tracker,
         )
-    final = _finalize_summary(
-        root.summary,
-        recording,
-        source_id=document.source_id,
-        model=app.model,
-        timeout_seconds=app.timeout_seconds,
-        target_words=config.target_words,
-        strategy=strategy_name,
-        segments=segments,
-        nodes=nodes,
-        root_node_id=root.node_id,
-        request_limits=limits,
-        include_citations=config.include_citations,
-        audit_configuration={
-            "app": asdict(app),
-            "strategy": asdict(strategy),
-            "pipeline": {
-                "target_words": config.target_words,
-                "max_merge_children": config.max_merge_children,
-                "include_citations": config.include_citations,
-            },
-            "verification": asdict(config.verification),
-            "budget": asdict(report),
-        },
-        audit_path=config.audit_path,
-        generations=completed_before_editorial,
-        warnings=config.audit_warnings,
-        counter=counter,
-        source_cores={
-            segment.segment_id: document.text[segment.core_start : segment.core_end]
-            for segment in segments
-        },
-        verification=config.verification,
-        verification_runtime=verifier_runtime,
-        verification_context_window_tokens=report.context_window_tokens,
-        verification_coordinator=verification_coordinator,
-        reliability_tracker=reliability_tracker,
-        observer=observer,
-        materialize_audit=not (
-            config.audit_path is not None
-            and coordinator is not None
-            and coordinator.session is not None
-        ),
+    session_publishes = (
+        config.audit_path is not None
+        and coordinator is not None
+        and coordinator.session is not None
     )
+    audit_configuration = {
+        "app": asdict(app),
+        "strategy": asdict(strategy),
+        "pipeline": {
+            "target_words": config.target_words,
+            "max_merge_children": config.max_merge_children,
+            "include_citations": config.include_citations,
+        },
+        "verification": asdict(config.verification),
+        "budget": asdict(report),
+    }
+    source_cores = {
+        segment.segment_id: document.text[segment.core_start : segment.core_end]
+        for segment in segments
+    }
     section_publications: Mapping[str, SectionPublication] = {}
     if section_tree is not None and section_nodes:
+        # The final summary is the sections' verified prose under their source
+        # headings, so there is no root editorial and no verification of one.
+        assert config.sections is not None
         observer.raise_if_stopped("before section prose")
         section_publications = finalize_sections(
             section_tree,
@@ -781,11 +761,8 @@ def _run_pipeline(
             timeout_seconds=app.timeout_seconds,
             target_words=config.target_words,
             segments=segments,
-            source_cores={
-                segment.segment_id: document.text[segment.core_start : segment.core_end]
-                for segment in segments
-            },
-            pages=config.sections.pages if config.sections is not None else None,
+            source_cores=source_cores,
+            pages=config.sections.pages,
             request_limits=limits,
             counter=counter,
             verification=config.verification,
@@ -794,12 +771,54 @@ def _run_pipeline(
             verification_coordinator=verification_coordinator,
             observer=observer,
         )
-    if section_tree is not None:
-        session_publishes = (
-            config.audit_path is not None
-            and coordinator is not None
-            and coordinator.session is not None
+        final = finalize_assembled_summary(
+            section_tree,
+            section_publications,
+            config.sections.headings,
+            source_id=document.source_id,
+            model=app.model,
+            strategy=strategy_name,
+            segments=segments,
+            nodes=nodes,
+            root_node_id=root.node_id,
+            include_citations=config.include_citations,
+            audit_configuration=audit_configuration,
+            audit_path=config.audit_path,
+            generations=completed_before_editorial,
+            warnings=config.audit_warnings,
+            verification_enabled=config.verification.enabled,
+            reliability_tracker=reliability_tracker,
+            materialize_audit=not session_publishes,
         )
+    else:
+        final = _finalize_summary(
+            root.summary,
+            recording,
+            source_id=document.source_id,
+            model=app.model,
+            timeout_seconds=app.timeout_seconds,
+            target_words=config.target_words,
+            strategy=strategy_name,
+            segments=segments,
+            nodes=nodes,
+            root_node_id=root.node_id,
+            request_limits=limits,
+            include_citations=config.include_citations,
+            audit_configuration=audit_configuration,
+            audit_path=config.audit_path,
+            generations=completed_before_editorial,
+            warnings=config.audit_warnings,
+            counter=counter,
+            source_cores=source_cores,
+            verification=config.verification,
+            verification_runtime=verifier_runtime,
+            verification_context_window_tokens=report.context_window_tokens,
+            verification_coordinator=verification_coordinator,
+            reliability_tracker=reliability_tracker,
+            observer=observer,
+            materialize_audit=not session_publishes,
+        )
+    if section_tree is not None:
         final = attach_section_records(
             final,
             section_tree,

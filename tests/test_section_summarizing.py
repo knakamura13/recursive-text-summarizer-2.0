@@ -175,7 +175,9 @@ def test_nested_sections_get_their_own_nodes_and_merges_stay_inside(tmp_path) ->
 
     assert set(result.root.covered_segments) == set(owner)
     assert len(nodes) == len(result.nodes)
-    assert result.final.text == "A concise, coherent final summary."
+    assert [line for line in result.final.text.splitlines() if line.startswith("#")] == [
+        f"{'#' * node.level} {node.heading}" for node in result.sections.nodes
+    ]
 
 
 def test_the_root_merges_top_level_sections_and_belongs_to_none() -> None:

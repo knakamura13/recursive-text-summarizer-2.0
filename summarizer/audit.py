@@ -136,7 +136,8 @@ class AuditError(ValueError):
 _CLOSED_CODE = re.compile(r"^[a-z][a-z0-9_]*$")
 _AUDIT_WORK_ID = re.compile(
     r"^(?:[DS]\d{6}|L\d+N\d{4}|M(?:\d{6}|\d+N\d{4})|V\d{2}(?:[CS]\d{6})?|"
-    r"editorial-final|segmentation|Qs[1-9][0-9]*-L\d+N\d{4})$"
+    r"editorial-final|segmentation|"
+    r"Qs[1-9][0-9]*-(?:L\d+N\d{4}|editorial|V\d{2}|T?C\d{2}K\d{6}))$"
 )
 _VERIFICATION_SPAN_ID = re.compile(r"^V\d{2}S\d{6}$")
 _VERIFICATION_CLAIM_ID = re.compile(r"^V\d{2}C\d{6}$")
@@ -737,13 +738,80 @@ class AuditSubstitution(_AuditRecord):
         return self
 
 
+def _audit_section_id(value: str) -> str:
+    if _SECTION_ID.fullmatch(value):
+        return value
+    raise ValueError("audit section id must be a section identity")
+
+
+def _audit_section_ids(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(_audit_section_id(value) for value in values)
+
+
+def _audit_heading(value: str | None) -> str | None:
+    """Keep a heading as the import stored it, with credential-like text replaced."""
+    return None if value is None else redact_text(value)
+
+
+MAX_HEADING_LEVEL = 6
+
+
+class AuditHeading(_AuditRecord):
+    """One heading line of the assembled final summary.
+
+    `start:end` is the whole line, the `#` marks included, in the published
+    text. `text` is the outline heading after the marks, as a section record
+    keeps it: credential-like text is replaced, so a redacted heading's text
+    can differ in length from its line.
+    """
+
+    section_id: str
+    level: int = Field(ge=1, le=MAX_HEADING_LEVEL)
+    text: str
+    start: int = Field(ge=0)
+    end: int
+
+    _valid_section_id = field_validator("section_id")(_audit_section_id)
+    _valid_text = field_validator("text", mode="before")(
+        lambda value: _audit_heading(_audit_prose(value))
+    )
+
+    @model_validator(mode="after")
+    def _range_holds_the_line(self) -> AuditHeading:
+        if self.end - self.start <= self.level:
+            raise ValueError("heading range must hold its marks and text")
+        return self
+
+
+class AuditSectionWords(_AuditRecord):
+    """The words a section was asked for and the words of its published prose.
+
+    Heading lines are not counted on either side.
+    """
+
+    section_id: str
+    requested: int = Field(ge=1)
+    published: int = Field(ge=0)
+
+    _valid_section_id = field_validator("section_id")(_audit_section_id)
+
+
 class AuditPublication(_AuditRecord):
-    """How the published summary was chosen and what supports each sentence."""
+    """How the published summary was chosen and what supports each sentence.
+
+    A section mode summary is assembled from section prose under source
+    headings: `headings` places each heading line in the published text and
+    `section_words` gives each section's requested and published words. Both
+    are empty for a summary written whole. Sentence offsets index the whole
+    published text, heading lines included.
+    """
 
     kind: PublicationKind
     sentences: tuple[AuditPublishedSentence, ...]
     removed_sentences: tuple[AuditRemovedSentence, ...]
     substitutions: tuple[AuditSubstitution, ...] = ()
+    headings: tuple[AuditHeading, ...] = ()
+    section_words: tuple[AuditSectionWords, ...] = ()
 
     @model_validator(mode="after")
     def _sentences_are_ordered(self) -> AuditPublication:
@@ -764,31 +832,32 @@ class AuditPublication(_AuditRecord):
                 " ".join(substitution.replacement_text.split()) not in published
             ):
                 raise ValueError("a replaced sentence must be published")
+        previous_end = -1
+        for heading in self.headings:
+            if heading.start < previous_end:
+                raise ValueError("headings must be ordered and disjoint")
+            previous_end = heading.end
+            if any(
+                sentence.start < heading.end and heading.start < sentence.end
+                for sentence in self.sentences
+            ):
+                raise ValueError("a heading must not overlap a published sentence")
+        words_ids = tuple(item.section_id for item in self.section_words)
+        if len(set(words_ids)) != len(words_ids):
+            raise ValueError("section words must name each section once")
+        if not {heading.section_id for heading in self.headings} <= set(words_ids):
+            raise ValueError("every heading's section must record its words")
         return self
 
     @model_serializer(mode="wrap")
-    def _omit_absent_substitutions(
+    def _omit_absent_optional_records(
         self, handler: SerializerFunctionWrapHandler
     ) -> dict[str, Any]:
         data = handler(self)
-        if not data.get("substitutions"):
-            data.pop("substitutions", None)
+        for key in ("substitutions", "headings", "section_words"):
+            if not data.get(key):
+                data.pop(key, None)
         return data
-
-
-def _audit_section_id(value: str) -> str:
-    if _SECTION_ID.fullmatch(value):
-        return value
-    raise ValueError("audit section id must be a section identity")
-
-
-def _audit_section_ids(values: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(_audit_section_id(value) for value in values)
-
-
-def _audit_heading(value: str | None) -> str | None:
-    """Keep a heading as the import stored it, with credential-like text replaced."""
-    return None if value is None else redact_text(value)
 
 
 def _audit_page_range(start: int | None, end: int | None) -> None:
@@ -1125,6 +1194,22 @@ class _AuditArtifactBase(_AuditRecord):
                 nodes=set(nodes),
                 segment_ids=set(segments) - passage_ids,
             )
+            if self.publication is not None:
+                published = {
+                    section.section_id: section.publication
+                    for section in self.sections
+                    if section.publication is not None
+                }
+                for item in self.publication.section_words:
+                    record = published.get(item.section_id)
+                    if (
+                        record is None
+                        or record.target_words != item.requested
+                        or record.words != item.published
+                    ):
+                        raise ValueError(
+                            "publication section words must match the section records"
+                        )
         return self
 
 
