@@ -909,6 +909,7 @@ export class MockApi {
 						available: false,
 						text: null,
 						sentences: [],
+						headings: [],
 						removed_sentences: [],
 						citations: [],
 						word_count: null,

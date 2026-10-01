@@ -410,10 +410,24 @@ export interface RemovedSentence {
 	reason: string | null;
 }
 
+// One heading line of a summary assembled by section, in reading order. level is
+// its Markdown level (1-6) and text the outline heading after its marks.
+// before_sentence is the position in sentences of the first sentence after the
+// line, or sentences.length when none follows.
+export interface SummaryHeading {
+	section_id: string;
+	level: number;
+	text: string;
+	before_sentence: number;
+}
+
+// text is the published text as written, heading lines included; headings is
+// empty for a summary written whole, and word_count leaves heading lines out.
 export interface FinalSummary {
 	available: boolean;
 	text: string | null;
 	sentences: SummarySentence[];
+	headings: SummaryHeading[];
 	removed_sentences: RemovedSentence[];
 	citations: SummaryCitation[];
 	word_count: number | null;
