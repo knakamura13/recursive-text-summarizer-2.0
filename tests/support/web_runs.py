@@ -39,8 +39,13 @@ def seed_document(
     title: str = "Harbor report",
     import_state: str = "ready",
     pages: list[dict[str, int]] | None = None,
+    outline: list[dict[str, object]] | None = None,
 ) -> tuple[str, str]:
-    """Insert a Document with one source revision; returns (document_id, revision_id)."""
+    """Insert a Document with one source revision; returns (document_id, revision_id).
+
+    `outline` is the revision's `outline_json`; None leaves it NULL (a revision
+    imported before the outline was extracted) and `[]` means no headings.
+    """
     document_id = str(uuid.uuid4())
     revision_id = str(uuid.uuid4())
     directory = load_paths().documents / document_id
@@ -60,8 +65,8 @@ def seed_document(
         """
         INSERT INTO source_revisions (
             revision_id, document_id, source_sha256, extraction_version, canonical_path,
-            page_map_json, created_at
-        ) VALUES (?, ?, ?, 'text/1', ?, ?, ?)
+            page_map_json, outline_json, created_at
+        ) VALUES (?, ?, ?, 'text/1', ?, ?, ?, ?)
         """,
         (
             revision_id,
@@ -69,6 +74,7 @@ def seed_document(
             hashlib.sha256(text.encode()).hexdigest(),
             str(canonical),
             json.dumps(pages) if pages is not None else None,
+            json.dumps(outline) if outline is not None else None,
             NOW,
         ),
     )

@@ -82,6 +82,15 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "ALTER TABLE source_revisions ADD COLUMN outline_json TEXT",
         ),
     ),
+    (
+        4,
+        (
+            # Node projections: the section a node belongs to, as JSON (section
+            # id, heading, level, pages, parent section, root flag). NULL
+            # outside a section mode Run.
+            "ALTER TABLE node_projections ADD COLUMN section_json TEXT",
+        ),
+    ),
 )
 
 LATEST_VERSION = MIGRATIONS[-1][0]

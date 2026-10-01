@@ -5,12 +5,14 @@ from summarizer_web.models.api import (
     FinalSummaryResponse,
     NodeDetailResponse,
     NodeTreeResponse,
+    RunSectionsResponse,
     SegmentListResponse,
 )
 from summarizer_web.services.run_views_service import (
     get_final_summary,
     get_node_detail,
     get_node_tree,
+    get_sections,
     get_segments,
 )
 
@@ -45,3 +47,10 @@ def run_segments(run_id: str) -> SegmentListResponse:
 )
 def run_summary(run_id: str) -> FinalSummaryResponse:
     return get_final_summary(run_id)
+
+
+@router.get(
+    "/runs/{run_id}/sections", response_model=RunSectionsResponse, responses=_RUN_NOT_FOUND
+)
+def run_sections(run_id: str) -> RunSectionsResponse:
+    return get_sections(run_id)

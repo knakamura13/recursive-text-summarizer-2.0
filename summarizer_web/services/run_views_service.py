@@ -48,6 +48,8 @@ from summarizer_web.models.api import (
     Notice,
     RemovedSentence,
     RunConfig,
+    RunSection,
+    RunSectionsResponse,
     SegmentListResponse,
     SegmentRef,
     SummaryCitation,
@@ -58,6 +60,7 @@ from summarizer_web.worker.projections import (
     PageMap,
     max_event_id,
     node_duration_seconds,
+    parse_node_section,
     tree_items,
 )
 
@@ -76,6 +79,15 @@ _UNSAFE_FILENAME = re.compile(r'[\x00-\x1f\x7f/\\:*?"<>|]+')
 # Readable messages for every code audit.json can carry in `warnings` and in
 # `verification.{warning,limitation,failure}_codes`.
 _NOTICE_TEXT: dict[str, tuple[Literal["info", "warning", "error"], str]] = {
+    "sections_no_outline": (
+        "info",
+        "This document has no headings, so it was summarized without preserving sections.",
+    ),
+    "sections_outline_not_extracted": (
+        "info",
+        "This document has no headings, so it was summarized without preserving sections. "
+        "It was imported before headings were recorded; importing it again may find them.",
+    ),
     "verified_sentence_subset": (
         "warning",
         "Some sentences of the written draft could not be verified and were removed; "
@@ -491,6 +503,92 @@ def get_node_detail(run_id: str, node_id: str) -> NodeDetailResponse:
         completed_at=row["completed_at"],
         duration_seconds=node_duration_seconds(row),
         error=row["error"],
+        section=parse_node_section(row["section_json"]),
+    )
+
+
+def get_sections(run_id: str) -> RunSectionsResponse:
+    """Each section of a section mode Run with its verified prose, from audit.json."""
+    context = _RunContext.load(run_id)
+    audit = context.audit
+    records = _dicts((audit or {}).get("sections"))
+    notices = [
+        notice
+        for notice in _audit_notices(audit if context.run["state"] == "completed" else None)
+        if notice.code.startswith("sections_")
+    ]
+    if context.run["state"] != "completed" or not records:
+        return RunSectionsResponse(available=False, notices=notices)
+    return RunSectionsResponse(
+        available=True,
+        sections=[_run_section(context, record) for record in records],
+        notices=notices,
+    )
+
+
+def _run_section(context: _RunContext, record: dict[str, Any]) -> RunSection:
+    publication = record.get("publication")
+    publication = publication if isinstance(publication, dict) else {}
+    sentences = _published_sentences(context, publication)
+    paragraphs: dict[int, list[str]] = {}
+    for sentence in sentences:
+        paragraphs.setdefault(sentence.paragraph, []).append(" ".join(sentence.text.split()))
+    segments = {
+        item["segment_id"]: item
+        for item in _dicts(publication.get("citations"))
+        if isinstance(item.get("segment_id"), str)
+    }
+    citations = []
+    for segment_id, item in segments.items():
+        segment = context.segment(segment_id)
+        citations.append(
+            SummaryCitation(
+                citation_id=str(len(citations) + 1),
+                segment_id=segment_id,
+                start=segment.core_start if segment else None,
+                end=segment.core_end if segment else None,
+                page_start=item["page_start"] if type(item.get("page_start")) is int else None,
+                page_end=item["page_end"] if type(item.get("page_end")) is int else None,
+            )
+        )
+
+    def integer(source: dict[str, Any], key: str) -> int | None:
+        return source[key] if type(source.get(key)) is int else None
+
+    def strings(value: object) -> list[str]:
+        return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+    status = publication.get("status")
+    return RunSection(
+        section_id=record["section_id"],
+        heading=record["heading"] if isinstance(record.get("heading"), str) else None,
+        level=record["level"] if type(record.get("level")) is int else 1,
+        page_start=integer(record, "page_start"),
+        page_end=integer(record, "page_end"),
+        parent_section_id=record["parent_id"] if isinstance(record.get("parent_id"), str) else None,
+        child_section_ids=strings(record.get("child_ids")),
+        folded_headings=strings(record.get("folded_headings")),
+        node_id=record["node_id"] if isinstance(record.get("node_id"), str) else None,
+        status=status if status in ("verified", "unverified", "empty") else None,
+        reason=publication["reason"] if isinstance(publication.get("reason"), str) else None,
+        text="\n\n".join(" ".join(parts) for _, parts in sorted(paragraphs.items()))
+        if paragraphs
+        else None,
+        sentences=sentences,
+        removed_sentences=[
+            RemovedSentence(
+                text=item["text"],
+                verdict=item["verdict"] if isinstance(item.get("verdict"), str) else "unverified",
+                reason=item["reason"] if isinstance(item.get("reason"), str) else None,
+            )
+            for item in _dicts(publication.get("removed_sentences"))
+            if isinstance(item.get("text"), str)
+        ],
+        citations=citations,
+        publication_page_start=integer(publication, "page_start"),
+        publication_page_end=integer(publication, "page_end"),
+        target_words=integer(publication, "target_words"),
+        word_count=integer(publication, "words"),
     )
 
 

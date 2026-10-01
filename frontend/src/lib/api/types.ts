@@ -57,6 +57,7 @@ export interface RunConfig {
 	max_retries: number;
 	strict_numbers: boolean;
 	strict_names: boolean;
+	preserve_sections: boolean;
 }
 
 export type ClearableConfigField = 'context_window' | 'chunk_tokens' | 'max_merge_children';
@@ -293,6 +294,20 @@ export interface Activity {
 export type NodeKind = 'leaf' | 'merge' | 'passthrough';
 export type NodeState = 'pending' | 'active' | 'completed' | 'failed';
 
+// The section a node belongs to in a section mode Run: the section whose
+// reduction built it. is_root marks the node that summarizes the section.
+// Pages are the section's own text. Null outside section mode, and on live
+// nodes until the Run finishes.
+export interface NodeSection {
+	section_id: string;
+	heading: string | null;
+	level: number;
+	page_start: number | null;
+	page_end: number | null;
+	parent_section_id: string | null;
+	is_root: boolean;
+}
+
 export interface TreeNode {
 	node_id: string;
 	parent_id: string | null;
@@ -305,6 +320,7 @@ export interface TreeNode {
 	page_start: number | null;
 	page_end: number | null;
 	duration_seconds: number | null;
+	section: NodeSection | null;
 }
 
 export interface Tree {
@@ -366,6 +382,7 @@ export interface NodeDetail {
 	completed_at: string | null;
 	duration_seconds: number | null;
 	error: string | null;
+	section: NodeSection | null;
 }
 
 // --- Final summary -----------------------------------------------------------
@@ -405,6 +422,45 @@ export interface FinalSummary {
 	notices: Notice[];
 	verification_state: 'not_run' | 'in_progress' | 'completed' | 'failed';
 	publication: 'editorial' | 'verified_subset' | 'content_unit_fallback' | null;
+}
+
+// --- Section publications ------------------------------------------------------
+
+// GET /api/v1/runs/{id}/sections. status is null for a section with no text and
+// no summarized subsection. verified prose passed verification against this
+// section's source only; unverified is the written draft (verification off);
+// empty published nothing, and reason says why. Pages are the section's own
+// text; publication_page_* span its whole subtree.
+export type SectionStatus = 'verified' | 'unverified' | 'empty';
+
+export interface RunSection {
+	section_id: string;
+	heading: string | null;
+	level: number;
+	page_start: number | null;
+	page_end: number | null;
+	parent_section_id: string | null;
+	child_section_ids: string[];
+	folded_headings: string[];
+	node_id: string | null;
+	status: SectionStatus | null;
+	reason: string | null;
+	text: string | null;
+	sentences: SummarySentence[];
+	removed_sentences: RemovedSentence[];
+	citations: SummaryCitation[];
+	publication_page_start: number | null;
+	publication_page_end: number | null;
+	target_words: number | null;
+	word_count: number | null;
+}
+
+// available is false until the Run completes and when it was not summarized by
+// section; notices then says why when the toggle was on (no headings found).
+export interface RunSections {
+	available: boolean;
+	sections: RunSection[];
+	notices: Notice[];
 }
 
 // --- Server-sent events ------------------------------------------------------

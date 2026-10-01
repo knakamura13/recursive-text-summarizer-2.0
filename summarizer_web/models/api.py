@@ -88,6 +88,9 @@ class RunConfig(ApiModel):
     max_retries: int = Field(5, ge=1, le=20)
     strict_numbers: bool = False
     strict_names: bool = False
+    # Summarize by section when the document has headings: each section gets
+    # its own verified prose beside the final summary. Costs extra requests.
+    preserve_sections: bool = False
 
     @model_validator(mode="after")
     def _overlap_below_chunk(self) -> RunConfig:
@@ -118,6 +121,7 @@ class RunConfigPatch(ApiModel):
     max_retries: int | None = Field(None, ge=1, le=20)
     strict_numbers: bool | None = None
     strict_names: bool | None = None
+    preserve_sections: bool | None = None
     clear: list[Literal["context_window", "chunk_tokens", "max_merge_children"]] = Field(
         default_factory=list,
         description="Nullable fields to reset to null, since null means 'unchanged' here.",
@@ -375,6 +379,20 @@ NodeKind = Literal["leaf", "merge", "passthrough"]
 NodeState = Literal["pending", "active", "completed", "failed"]
 
 
+class NodeSection(ApiModel):
+    """The section a node belongs to in a section mode Run: the section whose
+    reduction built the node. `is_root` marks the node that summarizes the
+    section, the top of that reduction. Pages are the section's own text."""
+
+    section_id: str
+    heading: str | None = None
+    level: int
+    page_start: int | None = None
+    page_end: int | None = None
+    parent_section_id: str | None = None
+    is_root: bool = False
+
+
 class NodeTreeItem(ApiModel):
     node_id: str
     parent_id: str | None = None
@@ -387,6 +405,7 @@ class NodeTreeItem(ApiModel):
     page_start: int | None = None
     page_end: int | None = None
     duration_seconds: float | None = None
+    section: NodeSection | None = None
 
 
 class NodeTreeResponse(ApiModel):
@@ -455,6 +474,7 @@ class NodeDetailResponse(ApiModel):
     completed_at: str | None = None
     duration_seconds: float | None = None
     error: str | None = None
+    section: NodeSection | None = None
 
 
 # --- Final summary ------------------------------------------------------------
@@ -495,3 +515,47 @@ class FinalSummaryResponse(ApiModel):
     notices: list[Notice] = Field(default_factory=list)
     verification_state: Literal["not_run", "in_progress", "completed", "failed"] = "not_run"
     publication: Literal["editorial", "verified_subset", "content_unit_fallback"] | None = None
+
+
+# --- Section publications -----------------------------------------------------
+
+
+class RunSection(ApiModel):
+    """One section of a section mode Run, with the prose written for it.
+
+    `status` is null for a section with no text and no summarized subsection
+    (no node, no prose). `verified` prose passed verification against this
+    section's source only; `unverified` is the written draft with verification
+    off; `empty` published nothing, and `reason` says why. Pages of the
+    section are its own text; `publication_page_*` span its whole subtree,
+    which is what the prose is checked against.
+    """
+
+    section_id: str
+    heading: str | None = None
+    level: int
+    page_start: int | None = None
+    page_end: int | None = None
+    parent_section_id: str | None = None
+    child_section_ids: list[str] = Field(default_factory=list)
+    folded_headings: list[str] = Field(default_factory=list)
+    node_id: str | None = None
+    status: Literal["verified", "unverified", "empty"] | None = None
+    reason: str | None = None
+    text: str | None = None
+    sentences: list[SummarySentence] = Field(default_factory=list)
+    removed_sentences: list[RemovedSentence] = Field(default_factory=list)
+    citations: list[SummaryCitation] = Field(default_factory=list)
+    publication_page_start: int | None = None
+    publication_page_end: int | None = None
+    target_words: int | None = None
+    word_count: int | None = None
+
+
+class RunSectionsResponse(ApiModel):
+    """`available` is false until the Run has published and when it was not
+    summarized by section; `notices` then says why when the toggle was on."""
+
+    available: bool
+    sections: list[RunSection] = Field(default_factory=list)
+    notices: list[Notice] = Field(default_factory=list)

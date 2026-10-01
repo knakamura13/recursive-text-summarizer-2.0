@@ -22,8 +22,9 @@ from datetime import datetime
 
 from summarizer.hierarchy import TreeNode
 from summarizer.runtime.observers import ItemEvent, SegmentInfo
+from summarizer.sections import SectionTree
 from summarizer_web.db.connection import get_database
-from summarizer_web.models.api import NodeTreeItem
+from summarizer_web.models.api import NodeSection, NodeTreeItem
 
 TREE_KINDS = frozenset({"leaf", "merge", "passthrough"})
 
@@ -453,6 +454,40 @@ def reset_active_nodes(
         ).rowcount
     return changed
 
+def node_section_json(
+    node: TreeNode, sections: SectionTree | None, section_nodes: Mapping[str, str]
+) -> str | None:
+    """The `section_json` of a node: the section whose reduction built it, or None.
+
+    Sections are known only once the Run finishes, so a live node carries none
+    until the final tree is reconciled. Nodes that merge top-level sections
+    belong to no section.
+    """
+    if sections is None or node.section_id is None:
+        return None
+    section = sections.get(node.section_id)
+    return json.dumps(
+        {
+            "section_id": section.id,
+            "heading": section.heading,
+            "level": section.level,
+            "page_start": section.page_start,
+            "page_end": section.page_end,
+            "parent_section_id": section.parent_id,
+            "is_root": section_nodes.get(section.id) == node.node_id,
+        }
+    )
+
+
+def parse_node_section(section_json: str | None) -> NodeSection | None:
+    if not section_json:
+        return None
+    try:
+        return NodeSection.model_validate(json.loads(section_json))
+    except ValueError:
+        return None
+
+
 def reconcile_final_tree(
     connection: sqlite3.Connection,
     run_id: str,
@@ -461,11 +496,14 @@ def reconcile_final_tree(
     nodes: Sequence[TreeNode],
     labeler: NodeLabeler,
     now: str,
+    sections: SectionTree | None = None,
+    section_nodes: Mapping[str, str] | None = None,
 ) -> None:
     """Make the projection match the finished tree, cursor-stamping every changed row.
 
     Rows the tree does not contain are removed. Only rows whose values change
-    are re-stamped, so the final stream update stays small.
+    are re-stamped, so the final stream update stays small. In a section mode
+    Run every node also gets its section.
     """
     parent_of = {child: node.node_id for node in nodes for child in node.children}
     existing = {
@@ -498,6 +536,7 @@ def reconcile_final_tree(
             "child_ids_json": json.dumps(list(node.children)),
             "covered_segment_ids_json": json.dumps(list(node.covered_segments)),
             "error": None,
+            "section_json": node_section_json(node, sections, section_nodes or {}),
         }
         row = existing.pop(node.node_id, None)
         stage = "summarizing" if kind == "leaf" else "merging"
@@ -536,6 +575,11 @@ def reconcile_final_tree(
                     event_id,
                 ),
             )
+            if values["section_json"] is not None:
+                connection.execute(
+                    "UPDATE node_projections SET section_json = ? WHERE run_id = ? AND node_id = ?",
+                    (values["section_json"], run_id, node.node_id),
+                )
             continue
         changed = {key: value for key, value in values.items() if row[key] != value}
         if row["completed_at"] is None:
@@ -606,6 +650,7 @@ def tree_items(
     query = """
         SELECT n.node_id, n.parent_id, n.level, n.order_index, n.kind, n.label, n.state,
                n.child_ids_json, n.covered_segment_ids_json, n.started_at, n.completed_at,
+               n.section_json,
                CASE WHEN n.child_ids_json IS NULL THEN (
                    SELECT COUNT(*) FROM node_projections AS c
                    WHERE c.run_id = n.run_id AND c.parent_id = n.node_id
@@ -652,6 +697,7 @@ def tree_items(
                 page_start=page_range[0] if page_range else None,
                 page_end=page_range[1] if page_range else None,
                 duration_seconds=node_duration_seconds(row),
+                section=parse_node_section(row["section_json"]),
             )
         )
     return items

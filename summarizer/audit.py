@@ -45,6 +45,25 @@ JSON paths read by the web application (offsets are code points, i.e. Python
     `replacement_verdict` from a pass over the swapped draft (`unverified` when
     that pass could not run), and `action` (`replaced` only when supported and
     published, else `removed`).
+- `sections[]`, present only when the run summarized by section (the schema
+  version is unchanged: a run without section mode writes no `sections` key,
+  so its audit is byte-identical to before). One record per section of the
+  tree, in document order: `section_id` (`s1`, `s2`, ...), `heading` (as the
+  import stored it; null for the untitled opening section), `level`,
+  `page_start`/`page_end` (the section's own text; null without a page map),
+  `parent_id`, `child_ids`, `folded_headings` (headings of undersized sections
+  merged into it), `segment_ids` (the leaf segments of its own text),
+  `node_id` (the tree node summarizing it, null when it has no text and no
+  summarized subsection) and `publication`, absent without a node. A section
+  publication is extra output beside the root `publication`: `status`
+  (`verified`, `unverified` when verification was off, or `empty` with a
+  `reason`), `kind`, `sentences[]` and `removed_sentences[]` as above but
+  checked only against the section's subtree, `citations[]` (`segment_id`,
+  `order`, `page_start`, `page_end`), `segment_ids` (the subtree's segments,
+  the only evidence it could cite), `page_start`/`page_end` of the whole
+  subtree, `target_words` and `words`. Source prose never appears here: a
+  heading is the only source text, and sentence quotations are redacted as in
+  `publication`.
 - `warnings[]`: `verified_sentence_subset`, `verified_content_unit_fallback`,
   or, in a failure audit written without a publication,
   `verified_content_unit_fallback_failed`.
@@ -92,6 +111,7 @@ from pydantic import (
 from summarizer.hierarchy import TreeNode
 from summarizer.providers.base import GenerationResult
 from summarizer.safety import redact_text
+from summarizer.sections import SectionTree
 from summarizer.segmentation import SourceSegment
 from summarizer.verification import RETRIEVAL_METHODS, ClaimVerdict
 
@@ -118,6 +138,7 @@ _VERIFICATION_CLAIM_ID = re.compile(r"^V\d{2}C\d{6}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SEGMENT_ID = re.compile(r"^[DS]\d{6}$")
 _NODE_ID = re.compile(r"^L\d+N\d{4}$")
+_SECTION_ID = re.compile(r"^s[1-9][0-9]*$")
 _SAFE_IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_MODEL_IDENTITY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?::[A-Za-z0-9][A-Za-z0-9._-]{0,127})?$"
@@ -750,6 +771,191 @@ class AuditPublication(_AuditRecord):
         return data
 
 
+def _audit_section_id(value: str) -> str:
+    if _SECTION_ID.fullmatch(value):
+        return value
+    raise ValueError("audit section id must be a section identity")
+
+
+def _audit_section_ids(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(_audit_section_id(value) for value in values)
+
+
+def _audit_heading(value: str | None) -> str | None:
+    """Keep a heading as the import stored it, with credential-like text replaced."""
+    return None if value is None else redact_text(value)
+
+
+def _audit_page_range(start: int | None, end: int | None) -> None:
+    if (start is None) != (end is None) or (
+        start is not None and end is not None and not 1 <= start <= end
+    ):
+        raise ValueError("a page range must be an ordered pair of pages or absent")
+
+
+SectionStatus = Literal["verified", "unverified", "empty"]
+
+
+class AuditSectionCitation(_AuditRecord):
+    """A source segment a section's prose cites, with the pages it spans."""
+
+    segment_id: str
+    order: int = Field(ge=0)
+    page_start: int | None = None
+    page_end: int | None = None
+
+    _valid_segment_id = field_validator("segment_id")(_audit_segment_id)
+
+    @model_validator(mode="after")
+    def _pages_are_a_range(self) -> AuditSectionCitation:
+        _audit_page_range(self.page_start, self.page_end)
+        return self
+
+
+class AuditSectionPublication(_AuditRecord):
+    """One section's reader-facing prose, checked against that section's source only."""
+
+    status: SectionStatus
+    kind: PublicationKind | None = None
+    reason: str | None = None
+    sentences: tuple[AuditPublishedSentence, ...]
+    removed_sentences: tuple[AuditRemovedSentence, ...]
+    citations: tuple[AuditSectionCitation, ...]
+    segment_ids: tuple[str, ...]
+    page_start: int | None = None
+    page_end: int | None = None
+    target_words: int = Field(ge=1)
+    words: int = Field(ge=0)
+
+    _valid_segment_ids = field_validator("segment_ids")(_audit_segment_ids)
+    _valid_reason = field_validator("reason", mode="before")(
+        lambda value: None if value is None else _audit_prose(value)
+    )
+
+    @model_validator(mode="after")
+    def _status_matches_content(self) -> AuditSectionPublication:
+        _audit_page_range(self.page_start, self.page_end)
+        if self.status == "empty":
+            if self.sentences or self.citations or self.kind is not None or not self.reason:
+                raise ValueError("an empty section publication has a reason and no prose")
+        else:
+            if not self.sentences or self.reason is not None:
+                raise ValueError("a published section has sentences and no reason")
+            unchecked = {sentence.verdict == "unchecked" for sentence in self.sentences}
+            if unchecked != {self.status == "unverified"}:
+                raise ValueError("section sentence verdicts must match the status")
+            if (self.kind is None) != (self.status == "unverified") or (
+                self.status == "unverified" and self.removed_sentences
+            ):
+                raise ValueError("a section publication kind must match its status")
+        if tuple(sentence.index for sentence in self.sentences) != tuple(
+            range(len(self.sentences))
+        ):
+            raise ValueError("published sentences must be numbered in order")
+        if not {item.segment_id for item in self.citations} <= set(self.segment_ids):
+            raise ValueError("section citations must lie in the section's segments")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_kind_and_reason(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        data = handler(self)
+        for key in ("kind", "reason"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
+
+
+class AuditSection(_AuditRecord):
+    """One section of the tree a section mode run summarized by."""
+
+    section_id: str
+    heading: str | None
+    level: int = Field(ge=1)
+    page_start: int | None
+    page_end: int | None
+    parent_id: str | None
+    child_ids: tuple[str, ...]
+    folded_headings: tuple[str, ...]
+    segment_ids: tuple[str, ...]
+    node_id: str | None
+    publication: AuditSectionPublication | None = None
+
+    _valid_section_id = field_validator("section_id")(_audit_section_id)
+    _valid_parent = field_validator("parent_id")(
+        lambda value: None if value is None else _audit_section_id(value)
+    )
+    _valid_child_ids = field_validator("child_ids")(_audit_section_ids)
+    _valid_heading = field_validator("heading")(_audit_heading)
+    _valid_folded = field_validator("folded_headings")(
+        lambda values: tuple(redact_text(value) for value in values)
+    )
+    _valid_segment_ids = field_validator("segment_ids")(_audit_segment_ids)
+    _valid_node_id = field_validator("node_id")(
+        lambda value: None if value is None else _audit_node_id(value)
+    )
+
+    @model_validator(mode="after")
+    def _pages_and_publication_agree(self) -> AuditSection:
+        _audit_page_range(self.page_start, self.page_end)
+        if self.publication is not None and self.node_id is None:
+            raise ValueError("a section publication needs the node that summarizes it")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_publication(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        data = handler(self)
+        if data.get("publication") is None:
+            data.pop("publication", None)
+        return data
+
+
+def _sections_link_resolve(
+    sections: tuple[AuditSection, ...],
+    *,
+    verification: AuditVerification,
+    nodes: set[str],
+    segment_ids: set[str],
+) -> None:
+    """Tie the section records to each other, to the tree, and to the sources."""
+    ids = {section.section_id: section for section in sections}
+    if len(ids) != len(sections) or not sections:
+        raise ValueError("section identifiers must be unique and present")
+    for section in sections:
+        parent = ids.get(section.parent_id) if section.parent_id is not None else None
+        if section.parent_id is not None and (
+            parent is None or section.section_id not in parent.child_ids
+        ):
+            raise ValueError("a section's parent must list it as a child")
+        if any(
+            child not in ids or ids[child].parent_id != section.section_id
+            for child in section.child_ids
+        ):
+            raise ValueError("a section's children must name it as their parent")
+        if section.node_id is not None and section.node_id not in nodes:
+            raise ValueError("a section's node must resolve to a tree node")
+        if not set(section.segment_ids) <= segment_ids:
+            raise ValueError("section segments must resolve to source segments")
+        publication = section.publication
+        if publication is None:
+            continue
+        if not set(publication.segment_ids) <= segment_ids:
+            raise ValueError("section segments must resolve to source segments")
+        if publication.status != "unverified" and not verification.enabled:
+            raise ValueError("verified section prose requires verification")
+        if publication.status == "unverified" and verification.enabled:
+            raise ValueError("an unverified section requires verification to be off")
+        if any(
+            evidence.segment_id not in publication.segment_ids
+            for sentence in publication.sentences
+            for evidence in sentence.evidence
+        ):
+            raise ValueError("section evidence must lie in the section's segments")
+
+
 class _AuditArtifactBase(_AuditRecord):
     source_id: str
     strategy: Literal["auto", "direct", "hierarchical"]
@@ -764,14 +970,16 @@ class _AuditArtifactBase(_AuditRecord):
     failures: tuple[str, ...]
     verification: AuditVerification
     publication: AuditPublication | None = None
+    sections: tuple[AuditSection, ...] | None = None
 
     @model_serializer(mode="wrap")
     def _omit_absent_publication(
         self, handler: SerializerFunctionWrapHandler
     ) -> dict[str, Any]:
         data = handler(self)
-        if data.get("publication") is None:
-            data.pop("publication", None)
+        for key in ("publication", "sections"):
+            if data.get(key) is None:
+                data.pop(key, None)
         return data
 
     @field_validator("configuration", mode="before")
@@ -886,6 +1094,13 @@ class _AuditArtifactBase(_AuditRecord):
                 verification=self.verification,
                 warnings=self.warnings,
                 segment_ids=set(segments),
+            )
+        if self.sections is not None:
+            _sections_link_resolve(
+                self.sections,
+                verification=self.verification,
+                nodes=set(nodes),
+                segment_ids=set(segments) - passage_ids,
             )
         return self
 
@@ -1890,6 +2105,19 @@ def build_audit_artifact(
         reliability=reliability_obj,
         **common,
     )
+
+
+def with_sections(
+    artifact: AuditArtifactV2 | AuditArtifactV3 | AuditArtifactV4,
+    sections: Sequence[AuditSection],
+) -> AuditArtifactV2 | AuditArtifactV3 | AuditArtifactV4:
+    """The artifact with its section records, validated against the rest of the audit."""
+    data = artifact.model_dump(mode="json")
+    data["sections"] = [section.model_dump(mode="json") for section in sections]
+    try:
+        return AuditArtifact.model_validate(data)
+    except ValueError as error:
+        raise AuditError("audit section records failed validation") from error
 
 
 def serialize_audit(artifact: AuditArtifactV2 | AuditArtifactV3 | AuditArtifactV4) -> bytes:

@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 import traceback
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from summarizer.budget import BudgetError
@@ -50,6 +50,7 @@ from summarizer.runtime.observers import (
     StageEvent,
     StageName,
 )
+from summarizer.sections import SectionOutline
 from summarizer.segmentation import SegmentationConfig, SegmentationError
 from summarizer.verification import VerificationCapacityError, VerificationConfig
 from summarizer_web.config import load_paths
@@ -224,6 +225,67 @@ def classify_failure(
 
 
 # --- Recording observer callbacks ------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Heading:
+    """A stored outline entry as the section tree reads it."""
+
+    title: str
+    level: int
+    start: int
+
+
+@dataclass(frozen=True)
+class _Page:
+    """A stored page extent as the section tree reads it."""
+
+    page: int
+    start: int
+    end: int
+
+
+# Audit warning codes (see `run_views_service._NOTICE_TEXT`) for a Run that
+# asked to preserve sections on a Document with no usable outline: the
+# revision's outline is empty, or was never extracted (NULL, imported before
+# import/4), so importing the Document again may find headings.
+NO_OUTLINE_WARNING = "sections_no_outline"
+OUTLINE_NOT_EXTRACTED_WARNING = "sections_outline_not_extracted"
+
+
+def _json_list(value: str | None) -> list[object]:
+    try:
+        parsed = json.loads(value) if value else []
+    except ValueError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def section_outline(revision) -> SectionOutline | None:
+    """The revision's outline for section mode, or None when it has no headings.
+
+    Headings come from the stored `outline_json` entries as imported; page
+    extents come from `page_map_json`. Malformed entries are skipped.
+    """
+    headings = tuple(
+        _Heading(entry["title"], entry["level"], entry["start"])
+        for entry in _json_list(revision["outline_json"])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("title"), str)
+        and type(entry.get("level")) is int
+        and entry["level"] >= 1
+        and type(entry.get("start")) is int
+        and entry["start"] >= 0
+    )
+    if not headings:
+        return None
+    pages = tuple(
+        _Page(entry["page"], entry["start"], entry["end"])
+        for entry in _json_list(revision["page_map_json"])
+        if isinstance(entry, dict)
+        and all(type(entry.get(key)) is int for key in ("page", "start", "end"))
+    )
+    return SectionOutline(headings, pages or None)
 
 
 def _item_payload(event: ItemEvent, label: str) -> dict[str, object]:
@@ -405,6 +467,8 @@ class RunRecorder:
                         result.nodes,
                         self.labeler,
                         now_iso(),
+                        result.sections,
+                        result.section_nodes,
                     )
                 event_id = end_attempt(
                     connection,
@@ -464,12 +528,22 @@ def _execute(
     # Resume reuses the checkpoint of earlier Attempts; an Attempt that failed
     # before the pipeline opened its checkpoint leaves none to resume.
     resume = checkpoint_manifest_path(run_id).exists()
+    outline = section_outline(revision) if config.preserve_sections else None
+    audit_warnings: tuple[str, ...] = ()
+    if config.preserve_sections and outline is None:
+        audit_warnings = (
+            OUTLINE_NOT_EXTRACTED_WARNING
+            if revision["outline_json"] is None
+            else NO_OUTLINE_WARNING,
+        )
     pipeline_config = PipelineConfig(
         target_words=config.target_words,
         segmentation=segmentation_config(config),
         max_merge_children=config.max_merge_children,
         include_citations=config.citations,
         audit_path=run_dir / "audit.json",
+        sections=outline,
+        audit_warnings=audit_warnings,
         verification=VerificationConfig(
             enabled=config.verify,
             max_repair_passes=config.max_repair_passes,
