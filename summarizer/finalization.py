@@ -132,6 +132,10 @@ from summarizer.verification import (
 
 # Evidence passages are never split below this many tokens.
 _MIN_PASSAGE_TOKENS = 32
+# A model's trim pass often fails to shorten a section's prose or loses a
+# number once and succeeds on the next try, so one rejection does not show
+# that the prose cannot be shortened without dropping facts.
+SECTION_TRIM_REJECTED_PASS_LIMIT = 3
 _PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n(?:[ \t]*\n)*")
 # Work the finalization stage plans for itself: compression passes, the
 # editorial call and verification.
@@ -1767,10 +1771,12 @@ def _trim_prose(
     """Lightly trim a section's prose when it is above its target band.
 
     This is the pre-editorial compression loop (`compress_to_target`) run on the
-    prose itself: light passes repeat until the prose is within the band, and
-    a pass that no longer shortens it is discarded, so a fact is never dropped
-    to reach the band. Returns the shorter text, or None when the prose is in
-    or below the band or could not be shortened, with every request's result.
+    prose itself: light passes repeat until the prose is within the band. A
+    pass that does not shorten it, or loses a number, is discarded so a fact is
+    never dropped to reach the band, and the loop is retried until
+    `SECTION_TRIM_REJECTED_PASS_LIMIT` passes in a row are discarded.
+    Returns the shorter text, or None when the prose is in or below the band or
+    could not be shortened, with every request's result.
     The caller verifies a returned text before it publishes.
     """
     if not _above_ceiling(word_count(text), target_words):
@@ -1791,6 +1797,7 @@ def _trim_prose(
         limits=request_limits,
         reserve_work=reserve_work,
         work_prefix=section.trim_prefix,
+        rejected_pass_limit=SECTION_TRIM_REJECTED_PASS_LIMIT,
     )
     if compressed.passes == 0:
         return None, compressed.generations

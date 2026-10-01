@@ -232,24 +232,36 @@ LONG = " ".join(
 
 
 class TrimProvider(SectionProvider):
-    """Shortens a trim request by dropping its last sentence, unless told it cannot."""
+    """Shortens a trim request by dropping its last sentence, unless told it cannot.
 
-    def __init__(self, drafts: dict[str, str], *, shortens: bool = True, suffix: str = "") -> None:
+    `plan` says, for the first trim requests in turn, whether each shortens its
+    text; later requests follow `shortens`.
+    """
+
+    def __init__(
+        self,
+        drafts: dict[str, str],
+        *,
+        shortens: bool = True,
+        suffix: str = "",
+        plan: tuple[bool, ...] = (),
+    ) -> None:
         super().__init__(drafts)
         self.shortens = shortens
         self.suffix = suffix
+        self.plan = list(plan)
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         operation = request.operation_id or ""
         if "-TC" not in operation:
             return super().generate(request)
         self.requests.append(request)
+        shortens = self.plan.pop(0) if self.plan else self.shortens
         chunk = request.input_text.splitlines()[1]
         sentences = re.split(r"(?<=\.) ", chunk)
-        kept = sentences[: max(1, int(len(sentences) * 0.8))] if self.shortens else sentences
+        kept = sentences[: max(1, int(len(sentences) * 0.8))] if shortens else sentences
         text = " ".join(kept) + self.suffix
         return GenerationResult(json.dumps({"text": text}), "fake", request.model, 1, 1, "stop")
-
 
 
 def trim_requests(provider: SectionProvider) -> list[str]:
@@ -280,16 +292,41 @@ def test_prose_above_its_target_is_trimmed_until_within_the_band_and_verified_ag
     assert len(checks) == 2
 
 
-def test_prose_that_cannot_be_shortened_is_published_longer() -> None:
+def test_prose_that_cannot_be_shortened_is_published_longer_after_three_rejected_passes() -> None:
     provider = TrimProvider({**DRAFTS, "Gamma": LONG}, shortens=False)
     result, _ = run(provider=provider)
     gamma = result.section_publications[by_heading(result)["Gamma"]]
 
     assert gamma.text == LONG
     assert gamma.words > gamma.target_words * 1.1
-    # One pass that did not shorten is enough to stop: no loop on a fixed point.
-    assert len(trim_requests(provider)) == 1
+    # Three discarded passes in a row stop the loop, each under its own pass
+    # index, and the longer verified prose stands.
+    assert [item.split("-TC")[1] for item in trim_requests(provider)] == [
+        "01K000001",
+        "02K000001",
+        "03K000001",
+    ]
     assert gamma.removed_sentences == ()
+
+
+def test_a_rejected_trim_pass_is_retried_and_the_shorter_prose_is_verified_again() -> None:
+    provider = TrimProvider({**DRAFTS, "Gamma": LONG}, plan=(False, True))
+    result, _ = run(provider=provider)
+    gamma = result.section_publications[by_heading(result)["Gamma"]]
+
+    assert trim_requests(provider)[:2] == [
+        "compression:Qs4-TC01K000001",
+        "compression:Qs4-TC02K000001",
+    ]
+    assert gamma.status == "verified" and gamma.words <= gamma.target_words * 1.1
+    assert gamma.words < word_count(LONG) and LONG.startswith(gamma.text)
+    checked = [
+        r
+        for r in provider.requests
+        if (r.operation_id or "").startswith("verification-decompose")
+        and "The unicorn calmly did something." in r.input_text
+    ]
+    assert len(checked) == 2  # the written draft, then the trimmed prose
 
 
 def test_a_trimmed_sentence_verification_rejects_is_dropped_and_the_rest_published() -> None:

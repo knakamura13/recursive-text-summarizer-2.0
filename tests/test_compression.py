@@ -153,6 +153,72 @@ def test_passes_stop_and_keep_the_longer_text_when_a_pass_no_longer_shortens() -
     assert result.passes == 1
 
 
+def _answer(text: str) -> str:
+    return json.dumps({"text": text})
+
+
+def _rejected_pass_run(responses: list[str], **options: object):
+    provider = Provider([_answer(item) for item in responses])
+    reserved: list[tuple[str, ...]] = []
+    result = compress_to_target(
+        _sentences(3),
+        provider,
+        source_id="a" * 64,
+        model="m",
+        timeout_seconds=30,
+        target_words=8,
+        reserve_work=reserved.append,
+        **options,
+    )
+    return result, provider, reserved
+
+
+def test_one_rejected_pass_ends_compression_by_default() -> None:
+    short = "Sentence 0 has several plain words in it."
+    result, provider, _ = _rejected_pass_run([_sentences(3), short])
+
+    assert provider.calls == 1
+    assert result.text == _sentences(3) and result.passes == 0
+
+
+def test_a_rejected_pass_is_retried_under_the_next_pass_index() -> None:
+    short = "Sentence 0 has several plain words in it."
+    result, provider, reserved = _rejected_pass_run(
+        [_sentences(3), short], rejected_pass_limit=3
+    )
+
+    # The first pass is discarded and the second shortens the text into the
+    # band. `passes` counts accepted passes; both attempts' work was planned.
+    assert provider.calls == 2
+    assert result.text == short and result.passes == 1
+    assert [ids[0] for ids in reserved] == ["C01K000001", "C02K000001"]
+
+
+def test_the_rejection_count_resets_after_an_accepted_pass() -> None:
+    # Reject, accept (still above the band), reject, reject: the second run of
+    # rejections is a fresh count, so only then does the limit of two stop it.
+    half = "Sentence 0 has several plain words in it. Sentence 1 has several plain words in it."
+    result, provider, _ = _rejected_pass_run(
+        [_sentences(3), half, half], rejected_pass_limit=2
+    )
+
+    assert provider.calls == 4
+    assert result.text == half and result.passes == 1
+
+
+def test_consecutive_rejected_passes_stop_at_the_limit_and_keep_the_longer_text() -> None:
+    result, provider, reserved = _rejected_pass_run([_sentences(3)], rejected_pass_limit=3)
+
+    assert provider.calls == 3
+    assert result.text == _sentences(3) and result.passes == 0
+    assert len(reserved) == 3
+
+
+def test_a_rejected_pass_limit_below_one_is_refused() -> None:
+    with pytest.raises(ValueError, match="rejected_pass_limit"):
+        _rejected_pass_run([_sentences(3)], rejected_pass_limit=0)
+
+
 class Scheduled:
     """Drop a scheduled number of words in each pass over one sentence."""
 
