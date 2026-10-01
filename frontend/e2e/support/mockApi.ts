@@ -119,6 +119,7 @@ export function defaultRunConfig(overrides: Partial<RunConfig> = {}): RunConfig 
 		max_retries: 5,
 		strict_numbers: false,
 		strict_names: false,
+		preserve_sections: false,
 		...overrides
 	};
 }

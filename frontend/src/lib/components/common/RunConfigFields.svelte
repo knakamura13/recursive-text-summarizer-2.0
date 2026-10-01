@@ -162,6 +162,13 @@
 			<input type="checkbox" bind:checked={config.strict_names} {disabled} />
 			<span>Keep multi-word names exactly as written. Off, a summary may shorten them.</span>
 		</label>
+		<label class="checkbox-field span">
+			<input type="checkbox" bind:checked={config.preserve_sections} {disabled} />
+			<span>
+				Write verified prose for each section of a document with headings, beside the final
+				summary. This adds requests; a document with no headings runs as usual.
+			</span>
+		</label>
 	</div>
 
 	<details class="advanced" open={advancedInvalid || undefined}>

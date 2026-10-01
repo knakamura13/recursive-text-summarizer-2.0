@@ -22,7 +22,8 @@ function node(id: string, level: number, order: number, parent: string | null): 
 		child_count: 0,
 		page_start: null,
 		page_end: null,
-		duration_seconds: null
+		duration_seconds: null,
+		section: null
 	};
 }
 

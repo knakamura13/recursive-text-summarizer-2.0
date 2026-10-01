@@ -26,6 +26,7 @@ from summarizer.finalization import (
     FinalizationResult,
     SectionPublication,
     _finalize_summary,
+    attach_section_records,
     finalize_sections,
     publish_final_output,
 )
@@ -86,6 +87,9 @@ class PipelineConfig:
     # section boundary. A section mode run never takes the direct path, even
     # for a document that fits one request: every section needs its own node.
     sections: SectionOutline | None = None
+    # Closed warning codes the caller adds to the audit, for a decision made
+    # before the run (the web app notes that section mode found no outline).
+    audit_warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.target_words <= 0:
@@ -739,6 +743,7 @@ def _run_pipeline(
         },
         audit_path=config.audit_path,
         generations=completed_before_editorial,
+        warnings=config.audit_warnings,
         counter=counter,
         source_cores={
             segment.segment_id: document.text[segment.core_start : segment.core_end]
@@ -781,6 +786,20 @@ def _run_pipeline(
             verification_context_window_tokens=report.context_window_tokens,
             verification_coordinator=verification_coordinator,
             observer=observer,
+        )
+    if section_tree is not None:
+        session_publishes = (
+            config.audit_path is not None
+            and coordinator is not None
+            and coordinator.session is not None
+        )
+        final = attach_section_records(
+            final,
+            section_tree,
+            section_nodes,
+            section_publications,
+            segments,
+            rewrite_path=None if session_publishes else config.audit_path,
         )
     observer.raise_if_stopped("before publication")
     observer.emit(StageEvent(StageName.PUBLISHING, "active"))

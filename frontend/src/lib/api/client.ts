@@ -24,6 +24,7 @@ import type {
 	Preflight,
 	Run,
 	RunConfig,
+	RunSections,
 	SegmentRef,
 	Settings,
 	SettingsUpdate,
@@ -376,6 +377,8 @@ export const api = {
 	},
 	getSummary: (runId: string, signal?: AbortSignal): Promise<FinalSummary> =>
 		request<FinalSummary>(route('runs', runId, 'summary'), { signal }),
+	getSections: (runId: string, signal?: AbortSignal): Promise<RunSections> =>
+		request<RunSections>(route('runs', runId, 'sections'), { signal }),
 	exportUrl: (runId: string, format: ExportFormat): string =>
 		`${API_BASE}${route('runs', runId, 'export', format)}`,
 	/** The export's text, for previewing before a download. */

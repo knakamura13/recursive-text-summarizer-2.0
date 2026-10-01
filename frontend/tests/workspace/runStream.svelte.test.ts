@@ -70,6 +70,7 @@ function leaf(id: string, order: number, overrides: Partial<TreeNode> = {}): Tre
 		page_start: null,
 		page_end: null,
 		duration_seconds: null,
+		section: null,
 		...overrides
 	};
 }

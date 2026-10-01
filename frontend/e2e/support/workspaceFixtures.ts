@@ -22,6 +22,7 @@ export function treeNode(overrides: Partial<TreeNode> & Pick<TreeNode, 'node_id'
 		page_start: null,
 		page_end: null,
 		duration_seconds: 4,
+		section: null,
 		...overrides
 	};
 }
@@ -59,6 +60,7 @@ export function nodeDetail(node: TreeNode, overrides: Partial<NodeDetail> = {}):
 		completed_at: '2026-09-23T10:00:04Z',
 		duration_seconds: 4,
 		error: null,
+		section: null,
 		...overrides
 	};
 }

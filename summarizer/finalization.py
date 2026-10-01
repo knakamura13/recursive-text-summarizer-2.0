@@ -28,7 +28,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
-from typing import Literal
 
 from summarizer.audit import (
     _atomic_replace,
@@ -37,15 +36,20 @@ from summarizer.audit import (
     AuditPublication,
     AuditPublishedSentence,
     AuditRemovedSentence,
+    AuditSection,
+    AuditSectionCitation,
+    AuditSectionPublication,
     AuditSubstitution,
     AuditSentenceEvidence,
     Citation,
     PublicationKind,
+    SectionStatus,
     build_audit_artifact,
     citation_provenance_for_summary,
     render_citations,
     resolve_citations,
     serialize_audit,
+    with_sections,
     write_audit,
 )
 from summarizer.checkpoint import (
@@ -1662,9 +1666,6 @@ def _draft_and_verify(
     return _Drafted(root, editorial, compression_generations, final_text, passages, outcome)
 
 
-SectionStatus = Literal["verified", "unverified", "empty"]
-
-
 @dataclass(frozen=True)
 class SectionCitation:
     """A source segment a section's prose cites, with the pages it spans."""
@@ -1754,6 +1755,32 @@ def _section_citations(
             page_end=pages.at(max(segment.core_end - 1, segment.core_start)),
         )
         for segment in sorted((own[item] for item in ids), key=lambda item: item.order)
+    )
+
+
+def _leaf_evidence(
+    sentences: tuple[AuditPublishedSentence, ...], passages: _EvidencePassages | None
+) -> tuple[AuditPublishedSentence, ...]:
+    """Name each quotation's leaf segment, not the verification passage it was found in.
+
+    A section's passages are numbered after its own segments only, so their ids
+    can collide with other sections' segments; the quotation's offsets still
+    locate it in the document.
+    """
+    if passages is None or not passages.parents:
+        return sentences
+    return tuple(
+        sentence.model_copy(
+            update={
+                "evidence": tuple(
+                    item.model_copy(
+                        update={"segment_id": passages.parents.get(item.segment_id, item.segment_id)}
+                    )
+                    for item in sentence.evidence
+                )
+            }
+        )
+        for sentence in sentences
     )
 
 
@@ -1897,7 +1924,10 @@ def finalize_sections(
         publications[section.id] = SectionPublication(
             status="verified",
             text=text,
-            sentences=_published_sentences(text, outcome.result, passages=drafted.passages),
+            sentences=_leaf_evidence(
+                _published_sentences(text, outcome.result, passages=drafted.passages),
+                drafted.passages,
+            ),
             removed_sentences=outcome.removed,
             citations=_section_citations(
                 outcome.result,
@@ -1912,6 +1942,77 @@ def finalize_sections(
             **common,
         )
     return publications
+
+
+def _audit_section_publication(publication: SectionPublication) -> AuditSectionPublication:
+    return AuditSectionPublication(
+        status=publication.status,
+        kind=publication.kind,
+        reason=publication.reason,
+        sentences=publication.sentences,
+        removed_sentences=publication.removed_sentences,
+        citations=tuple(
+            AuditSectionCitation(
+                segment_id=item.segment_id,
+                order=item.order,
+                page_start=item.page_start,
+                page_end=item.page_end,
+            )
+            for item in publication.citations
+        ),
+        segment_ids=publication.segment_ids,
+        page_start=publication.page_start,
+        page_end=publication.page_end,
+        target_words=publication.target_words,
+        words=publication.words,
+    )
+
+
+def attach_section_records(
+    result: FinalizationResult,
+    tree: SectionTree,
+    section_nodes: Mapping[str, str],
+    publications: Mapping[str, SectionPublication],
+    segments: Sequence[SourceSegment],
+    *,
+    rewrite_path: Path | None = None,
+) -> FinalizationResult:
+    """Add one audit record per section to the run's audit; `rewrite_path` rewrites a written file.
+
+    Pass `rewrite_path` only when `_finalize_summary` already materialized the
+    audit; a published (checkpointed) audit is written once, with the records.
+    A run without an audit has nowhere to record sections and is returned as is.
+    """
+    if result.audit is None:
+        return result
+    records = tuple(
+        AuditSection(
+            section_id=section.id,
+            heading=section.heading,
+            level=section.level,
+            page_start=section.page_start,
+            page_end=section.page_end,
+            parent_id=section.parent_id,
+            child_ids=section.child_ids,
+            folded_headings=section.folded_headings,
+            segment_ids=tuple(
+                segment.segment_id
+                for segment in segments
+                if section.start <= segment.core_start < section.end
+            ),
+            node_id=section_nodes.get(section.id),
+            publication=(
+                _audit_section_publication(publications[section.id])
+                if section.id in publications
+                else None
+            ),
+        )
+        for section in tree.nodes
+    )
+    artifact = with_sections(result.audit, records)
+    if rewrite_path is not None:
+        write_audit(rewrite_path, artifact)
+    return replace(result, audit=artifact)
 
 
 def _finalize_summary(
