@@ -426,12 +426,15 @@ export interface FinalSummary {
 
 // --- Section publications ------------------------------------------------------
 
-// GET /api/v1/runs/{id}/sections. status is null for a section with no text and
-// no summarized subsection. verified prose passed verification against this
-// section's source only; unverified is the written draft (verification off);
-// empty published nothing, and reason says why. Pages are the section's own
-// text; publication_page_* span its whole subtree.
-export type SectionStatus = 'verified' | 'unverified' | 'empty';
+// GET /api/v1/runs/{id}/sections. status is null for a section with no prose
+// record. The prose is written from the section's own text only, not its
+// subsections. verified prose passed verification against this section's own
+// source only; unverified is the written draft (verification off); empty
+// published nothing, and reason says why; heading_only means the section has no
+// own text, or too little for one sentence of the target, so its heading stands
+// alone and no model was called. Pages are the section's own text, and
+// publication_page_* are the same span.
+export type SectionStatus = 'verified' | 'unverified' | 'empty' | 'heading_only';
 
 export interface RunSection {
 	section_id: string;

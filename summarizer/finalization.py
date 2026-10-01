@@ -1681,14 +1681,17 @@ class SectionPublication:
     """One section's reader-facing prose, checked against that section's source only.
 
     `status` is `verified` when verification kept the text, `unverified` when
-    verification is off (the text is the written draft), and `empty` when
-    nothing could be published; `reason` then says why. `segment_ids` are the
-    section's own subtree segments, the only evidence its prose could draw on,
-    and every citation is one of them. Pages are those of the whole subtree.
+    verification is off (the text is the written draft), `empty` when nothing
+    could be published, and `heading_only` when the section has no own text
+    worth a sentence, so no model was asked; `reason` then says why. The prose
+    is written from the section's own text, not its subsections:
+    `node_id` is the node it was written from (None without one), `segment_ids`
+    are the section's own segments, the only evidence its prose could draw on,
+    and every citation is one of them. Pages are those of the own text.
     """
 
     section_id: str
-    node_id: str
+    node_id: str | None
     heading: str | None
     status: SectionStatus
     text: str
@@ -1786,7 +1789,7 @@ def _leaf_evidence(
 
 def finalize_sections(
     tree: SectionTree,
-    section_nodes: Mapping[str, str],
+    own_text_nodes: Mapping[str, str],
     nodes: Sequence[TreeNode],
     provider: ModelProvider,
     *,
@@ -1805,31 +1808,74 @@ def finalize_sections(
     verification_coordinator: CacheCoordinator | None = None,
     observer: RuntimeObserver | None = None,
 ) -> dict[str, SectionPublication]:
-    """Write and verify each section's prose against that section's own source.
+    """Write and verify each section's prose from that section's own text.
 
-    A section's prose is written from its node's summary, which covers the
-    section's whole subtree (its own text and its subsections), and is verified
-    against the source cores of the node's covered segments only: a claim that
-    only another section's source supports is not supported here. Each
-    section takes the editorial, verification and repair path of the final
-    summary, under work ids of its own, with a target that is its share of
-    `target_words`. Sentences that pass are published and the rest dropped. A
-    section with no supported sentence publishes nothing and is reported with
-    status `empty`, not raised. Without verification the written prose is
-    published as is, marked `unverified`.
+    A section's prose is written from its own-text node (`own_text_nodes`,
+    resolved in `nodes`), which covers the section's own leaves and not its
+    subsections, and is verified against the source cores of the node's
+    covered segments only: a claim that only another section's source
+    supports is not supported here, and a subsection's text is no evidence for
+    its parent. Each section takes the editorial, verification and repair path
+    of the final summary, under work ids of its own, with a target that is its
+    own words' share of `target_words`. Sentences that pass are published and
+    the rest dropped. A section with no supported sentence publishes nothing
+    and is reported with status `empty`, not raised. Without verification the
+    written prose is published as is, marked `unverified`.
 
-    `observer` sees WRITING and VERIFYING for every section, each detailed
-    with the section's label, and is polled for Stop before every model call.
+    A section with no own text beyond its heading, or whose own share of the
+    target is under one sentence, publishes its heading only, with status
+    `heading_only`, and no model call.
+
+    `observer` sees WRITING and VERIFYING for every section written, each
+    detailed with the section's label, and is polled for Stop before every
+    model call.
     """
     runtime_observer = get_observer(observer)
     reserve_work = _append_work_planner(getattr(provider, "cache_coordinator", None))
     by_node = {node.node_id: node for node in nodes}
     lookup = PageLookup(pages)
-    ordered = [section for section in tree.nodes if section.id in section_nodes]
+    written = [
+        section
+        for section in tree.nodes
+        if section.id in own_text_nodes
+        and not tree.is_heading_only(section.id, target_words)
+    ]
     publications: dict[str, SectionPublication] = {}
-    for index, section in enumerate(ordered, start=1):
+    for section in tree.nodes:
         runtime_observer.raise_if_stopped("before a section's prose")
-        node = by_node[section_nodes[section.id]]
+        target = tree.target_words(section.id, target_words)
+        own_node_id = own_text_nodes.get(section.id)
+        common = dict(
+            section_id=section.id,
+            node_id=own_node_id,
+            heading=section.heading,
+            page_start=section.page_start,
+            page_end=section.page_end,
+            target_words=target,
+        )
+        if section not in written:
+            own_ids = tuple(
+                segment.segment_id
+                for segment in segments
+                if section.start <= segment.core_start < section.end
+            )
+            publications[section.id] = SectionPublication(
+                status="heading_only",
+                text="",
+                sentences=(),
+                removed_sentences=(),
+                citations=(),
+                segment_ids=own_ids,
+                words=0,
+                reason=(
+                    "the section has no text of its own beyond its heading"
+                    if tree.own_share_words(section.id, target_words) == 0
+                    else "the section's own text is under one sentence of the target"
+                ),
+                **common,
+            )
+            continue
+        node = by_node[own_node_id]
         covered = frozenset(node.covered_segments)
         own_segments = tuple(
             segment for segment in segments if segment.segment_id in covered
@@ -1841,8 +1887,7 @@ def finalize_sections(
             item for item in node.summary.provenance if item in covered
         ) or node.covered_segments
         root = node.summary.model_copy(update={"provenance": provenance})
-        target = tree.target_words(section.id, target_words)
-        label = _section_label(index, len(ordered), section.heading)
+        label = _section_label(written.index(section) + 1, len(written), section.heading)
         drafted = _draft_and_verify(
             root,
             provider,
@@ -1862,16 +1907,7 @@ def finalize_sections(
             reserve_work=reserve_work,
             section=_SectionStep(SectionScope(section.id, section.heading), label),
         )
-        subtree_pages = tree.subtree_pages(section.id)
-        common = dict(
-            section_id=section.id,
-            node_id=node.node_id,
-            heading=section.heading,
-            segment_ids=tuple(segment.segment_id for segment in own_segments),
-            page_start=subtree_pages[0] if subtree_pages else None,
-            page_end=subtree_pages[1] if subtree_pages else None,
-            target_words=target,
-        )
+        common["segment_ids"] = tuple(segment.segment_id for segment in own_segments)
 
         def empty(
             reason: str, removed: tuple[AuditRemovedSentence, ...] = ()

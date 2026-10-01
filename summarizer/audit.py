@@ -53,15 +53,20 @@ JSON paths read by the web application (offsets are code points, i.e. Python
   `page_start`/`page_end` (the section's own text; null without a page map),
   `parent_id`, `child_ids`, `folded_headings` (headings of undersized sections
   merged into it), `segment_ids` (the leaf segments of its own text),
-  `node_id` (the tree node summarizing it, null when it has no text and no
-  summarized subsection) and `publication`, absent without a node. A section
-  publication is extra output beside the root `publication`: `status`
-  (`verified`, `unverified` when verification was off, or `empty` with a
-  `reason`), `kind`, `sentences[]` and `removed_sentences[]` as above but
-  checked only against the section's subtree, `citations[]` (`segment_id`,
-  `order`, `page_start`, `page_end`), `segment_ids` (the subtree's segments,
-  the only evidence it could cite), `page_start`/`page_end` of the whole
-  subtree, `target_words` and `words`. Source prose never appears here: a
+  `node_id` (the tree node summarizing its whole subtree, null when it has no
+  text and no summarized subsection) and `publication`, absent without a node
+  unless the section is heading-only. A section publication is extra output
+  beside the root `publication`, written from the section's own text only:
+  `status` (`verified`, `unverified` when verification was off, `empty` with a
+  `reason`, or `heading_only` with a `reason` when the section has no own text
+  or under one sentence's share of the target, so its heading stands alone and
+  no model was called), `kind`, `sentences[]` and `removed_sentences[]` as
+  above but checked only against the section's own segments, `citations[]`
+  (`segment_id`, `order`, `page_start`, `page_end`), `segment_ids` (the
+  section's own segments, the only evidence it could cite), `page_start`/
+  `page_end` of the own text, `target_words` (the own share of the run target
+  by words, headings excluded, at least one sentence) and `words`. Source
+  prose never appears here: a
   heading is the only source text, and sentence quotations are redacted as in
   `publication`.
 - `warnings[]`: `verified_sentence_subset`, `verified_content_unit_fallback`,
@@ -131,7 +136,7 @@ class AuditError(ValueError):
 _CLOSED_CODE = re.compile(r"^[a-z][a-z0-9_]*$")
 _AUDIT_WORK_ID = re.compile(
     r"^(?:[DS]\d{6}|L\d+N\d{4}|M(?:\d{6}|\d+N\d{4})|V\d{2}(?:[CS]\d{6})?|"
-    r"editorial-final|segmentation)$"
+    r"editorial-final|segmentation|Qs[1-9][0-9]*-L\d+N\d{4})$"
 )
 _VERIFICATION_SPAN_ID = re.compile(r"^V\d{2}S\d{6}$")
 _VERIFICATION_CLAIM_ID = re.compile(r"^V\d{2}C\d{6}$")
@@ -793,7 +798,7 @@ def _audit_page_range(start: int | None, end: int | None) -> None:
         raise ValueError("a page range must be an ordered pair of pages or absent")
 
 
-SectionStatus = Literal["verified", "unverified", "empty"]
+SectionStatus = Literal["verified", "unverified", "empty", "heading_only"]
 
 
 class AuditSectionCitation(_AuditRecord):
@@ -835,7 +840,19 @@ class AuditSectionPublication(_AuditRecord):
     @model_validator(mode="after")
     def _status_matches_content(self) -> AuditSectionPublication:
         _audit_page_range(self.page_start, self.page_end)
-        if self.status == "empty":
+        if self.status == "heading_only":
+            if (
+                self.sentences
+                or self.citations
+                or self.removed_sentences
+                or self.kind is not None
+                or self.words
+                or not self.reason
+            ):
+                raise ValueError(
+                    "a heading-only section publication has a reason and no prose"
+                )
+        elif self.status == "empty":
             if self.sentences or self.citations or self.kind is not None or not self.reason:
                 raise ValueError("an empty section publication has a reason and no prose")
         else:
@@ -899,7 +916,11 @@ class AuditSection(_AuditRecord):
     @model_validator(mode="after")
     def _pages_and_publication_agree(self) -> AuditSection:
         _audit_page_range(self.page_start, self.page_end)
-        if self.publication is not None and self.node_id is None:
+        if (
+            self.publication is not None
+            and self.node_id is None
+            and self.publication.status != "heading_only"
+        ):
             raise ValueError("a section publication needs the node that summarizes it")
         return self
 
@@ -944,9 +965,11 @@ def _sections_link_resolve(
             continue
         if not set(publication.segment_ids) <= segment_ids:
             raise ValueError("section segments must resolve to source segments")
-        if publication.status != "unverified" and not verification.enabled:
+        if publication.status == "heading_only":
+            pass
+        elif publication.status != "unverified" and not verification.enabled:
             raise ValueError("verified section prose requires verification")
-        if publication.status == "unverified" and verification.enabled:
+        elif publication.status == "unverified" and verification.enabled:
             raise ValueError("an unverified section requires verification to be off")
         if any(
             evidence.segment_id not in publication.segment_ids
