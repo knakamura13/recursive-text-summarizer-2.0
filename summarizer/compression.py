@@ -319,10 +319,11 @@ def _compress_chunk(
     strict_names: bool,
     limits: RequestLimits | None,
     split: bool,
+    work_prefix: str = "",
 ) -> tuple[str, GenerationResult | None]:
     input_words = word_count(chunk)
     target_word_count = max(1, int(input_words * RETENTION_RATIO))
-    operation_id = f"compression:C{pass_index:02d}K{chunk_index:06d}"
+    operation_id = f"compression:{work_prefix}C{pass_index:02d}K{chunk_index:06d}"
     request = build_compression_request(
         chunk,
         source_id=source_id,
@@ -348,7 +349,7 @@ def _compress_chunk(
         )
         budget.require_request(measure_request_tokens(request, counter))
         request = replace(request, max_output_tokens=budget.output_allowance_tokens)
-    work_id = f"C{pass_index:02d}K{chunk_index:06d}"
+    work_id = f"{work_prefix}C{pass_index:02d}K{chunk_index:06d}"
 
     def decode(payload: object) -> str:
         return redact_text(CompressedDraft.model_validate(payload).text).strip()
@@ -429,6 +430,7 @@ def _compress_pass(
     strict_numbers: bool,
     strict_names: bool,
     limits: RequestLimits | None,
+    work_prefix: str = "",
 ) -> tuple[str, tuple[GenerationResult, ...]]:
     chunks = _compression_chunks(text)
     generations: list[GenerationResult] = []
@@ -447,6 +449,7 @@ def _compress_pass(
             strict_names=strict_names,
             limits=limits,
             split=split,
+            work_prefix=work_prefix,
         )
         output = f"{output}{separator}{compressed}" if output else compressed
         if generation is not None:
@@ -487,10 +490,15 @@ def _compression_chunks(text: str) -> list[tuple[str, str, bool]]:
     return chunks
 
 
-def compression_pass_work_ids(text: str, pass_index: int) -> tuple[str, ...]:
+def compression_pass_work_ids(
+    text: str, pass_index: int, work_prefix: str = ""
+) -> tuple[str, ...]:
     """Return the checkpoint work ids of one compression pass over `text`."""
     chunk_count = max(1, len(_compression_chunks(text.strip())))
-    return tuple(f"C{pass_index:02d}K{chunk_index:06d}" for chunk_index in range(1, chunk_count + 1))
+    return tuple(
+        f"{work_prefix}C{pass_index:02d}K{chunk_index:06d}"
+        for chunk_index in range(1, chunk_count + 1)
+    )
 
 
 def compress_to_target(
@@ -506,6 +514,7 @@ def compress_to_target(
     strict_names: bool = False,
     limits: RequestLimits | None = None,
     reserve_work: Callable[[tuple[str, ...]], None] | None = None,
+    work_prefix: str = "",
 ) -> CompressionResult:
     """Shorten `text` by repeated light passes until it is within the target band.
 
@@ -519,6 +528,8 @@ def compress_to_target(
 
     `reserve_work` is called with each pass's work ids before the pass runs.
     With `limits`, every chunk request is budgeted and carries its allowance.
+    `work_prefix` scopes the work ids of one section's compression apart from
+    the run's own and from other sections'.
     """
     if target_words <= 0:
         raise ValueError("target_words must be positive")
@@ -534,7 +545,7 @@ def compress_to_target(
         if not _above_ceiling(word_count(current), target_words):
             break
         if reserve_work is not None:
-            reserve_work(compression_pass_work_ids(current, pass_index))
+            reserve_work(compression_pass_work_ids(current, pass_index, work_prefix))
         previous = current
         current, gens = _compress_pass(
             current,
@@ -547,6 +558,7 @@ def compress_to_target(
             strict_numbers=strict_numbers,
             strict_names=strict_names,
             limits=limits,
+            work_prefix=work_prefix,
         )
         all_generations.extend(gens)
         if word_count(current) >= word_count(previous) or (

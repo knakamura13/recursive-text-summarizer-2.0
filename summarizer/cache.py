@@ -55,7 +55,7 @@ _COUNTER = re.compile(
     r"^(?:(?:tiktoken|estimate|test|gguf):[a-z0-9][a-z0-9._-]*|utf8-conservative)$"
 )
 _WORK_ID = re.compile(
-    r"^(?:[DSLVM][A-Za-z0-9:_-]*|editorial-final|segmentation|C\d{2}K\d{6})$"
+    r"^(?:[DSLVMQ][A-Za-z0-9:_-]*|editorial-final|segmentation|C\d{2}K\d{6})$"
 )
 _STRATEGIES = frozenset({"auto", "direct", "hierarchical"})
 _BOOLEAN_FIELDS = frozenset(

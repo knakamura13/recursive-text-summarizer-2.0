@@ -28,6 +28,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
+from typing import Literal
 
 from summarizer.audit import (
     _atomic_replace,
@@ -62,7 +63,13 @@ from summarizer.compression import (
     _in_band,
     _under_floor,
 )
-from summarizer.editorial import EDITORIAL_WORK_ID, write_editorial
+from summarizer.editorial import (
+    EDITORIAL_WORK_ID,
+    EditorialResult,
+    SectionScope,
+    section_work_id,
+    write_editorial,
+)
 from summarizer.grounding import SourcePassage, serialize_source_passage
 from summarizer.hierarchy import TreeNode
 from summarizer.ingestion import SourceDocument
@@ -75,6 +82,7 @@ from summarizer.runtime.observers import (
     get_observer,
 )
 from summarizer.safety import redact_text
+from summarizer.sections import PageExtent, PageLookup, SectionTree
 from summarizer.segmentation import (
     BoundaryKind,
     CacheCoordinator,
@@ -698,6 +706,7 @@ def _prepare_root_for_editorial(
     strict_names: bool = False,
     limits: RequestLimits | None = None,
     reserve_work: Callable[[tuple[str, ...]], None] | None = None,
+    work_prefix: str = "",
 ) -> tuple[SummaryNode, tuple[GenerationResult, ...]]:
     source_text = _compression_source_text(
         root,
@@ -722,6 +731,7 @@ def _prepare_root_for_editorial(
         strict_names=strict_names,
         limits=limits,
         reserve_work=reserve_work,
+        work_prefix=work_prefix,
     )
     return root.model_copy(update={"summary": compressed.text}), compressed.generations
 
@@ -1374,6 +1384,7 @@ def _verify_publication(
     source_cores: Mapping[str, str] | None = None,
     segments: Sequence[SourceSegment] = (),
     unfinished: str | None = None,
+    work_id: str = "V01",
 ) -> _VerifiedPublication:
     """Verify the editorial draft once, else publish its passing sentences.
 
@@ -1392,6 +1403,7 @@ def _verify_publication(
         config=config,
         coordinator=coordinator,
         progress=progress,
+        work_id=work_id,
     )
     ledger.record(result)
     kind: PublicationKind = "editorial"
@@ -1488,6 +1500,420 @@ def _finalization_work_planner(
 
 
 
+@dataclass(frozen=True)
+class _SectionStep:
+    """What scopes one editorial-and-verification step to a section."""
+
+    scope: SectionScope
+    label: str
+
+    @property
+    def verification_work_id(self) -> str:
+        return section_work_id(self.scope.section_id, "V01")
+
+    @property
+    def compression_prefix(self) -> str:
+        return section_work_id(self.scope.section_id, "")
+
+
+@dataclass(frozen=True)
+class _Drafted:
+    """A written editorial and, with verification on, its checked publication.
+
+    `text` is None when the draft was one unfinished sentence, so nothing is
+    left to verify. `root` is the record the editorial was written from,
+    after any compression.
+    """
+
+    root: SummaryNode
+    editorial: EditorialResult
+    compression_generations: tuple[GenerationResult, ...]
+    text: str | None
+    passages: _EvidencePassages | None
+    outcome: _VerifiedPublication | None
+
+
+def _draft_and_verify(
+    root: SummaryNode,
+    provider: ModelProvider,
+    *,
+    source_id: str,
+    model: str,
+    timeout_seconds: float,
+    target_words: int,
+    segments: Sequence[SourceSegment],
+    source_cores: Mapping[str, str] | None,
+    request_limits: RequestLimits | None,
+    counter: TokenCounter | None,
+    verification: VerificationConfig,
+    verification_runtime: VerificationRuntime | None,
+    verification_context_window_tokens: int | None,
+    verification_coordinator: CacheCoordinator | None,
+    observer: RuntimeObserver,
+    reserve_work: Callable[[tuple[str, ...]], None] | None,
+    section: _SectionStep | None = None,
+) -> _Drafted:
+    """Prepare `root`, write its editorial, and verify the draft against its sources.
+
+    The root's final summary and each section's prose take this one path. It
+    plans the work, compresses toward the target, writes, takes the model's
+    cut-off ending out and restores sentences that lost a literal. With
+    verification on, it then builds the evidence from `root.provenance`
+    inside `source_cores` only, so the caller bounds the evidence by what it
+    passes, and verifies and repairs the draft. A `section` gives the work its
+    own ids and its progress its label. The caller decides what a failed
+    verification means.
+    """
+    scope = section.scope if section is not None else None
+    detail = section.label if section is not None else None
+    compression_generations: tuple[GenerationResult, ...] = ()
+    if source_cores is not None:
+        root, compression_generations = _prepare_root_for_editorial(
+            root,
+            provider,
+            source_id=source_id,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            target_words=target_words,
+            source_cores=source_cores,
+            segments=segments,
+            strict_numbers=verification.strict_numbers,
+            strict_names=verification.strict_names,
+            limits=request_limits,
+            reserve_work=reserve_work,
+            work_prefix=section.compression_prefix if section is not None else "",
+        )
+    if reserve_work is not None:
+        reserve_work(
+            (
+                EDITORIAL_WORK_ID if section is None else section_work_id(scope.section_id, "editorial"),
+                *(
+                    (("V01",) if section is None else (section.verification_work_id,))
+                    if verification.enabled
+                    else ()
+                ),
+            )
+        )
+    observer.emit(StageEvent(StageName.WRITING, "active", detail=detail))
+    editorial = write_editorial(
+        root,
+        provider,
+        source_id=source_id,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        target_words=target_words,
+        limits=request_limits,
+        observer=observer,
+        section=scope,
+    )
+    observer.emit(StageEvent(StageName.WRITING, "completed", detail=detail))
+    # The cut-off ending is taken from the model's own draft, before literal
+    # restoration appends source sentences that could hide where it stopped.
+    editorial_text, unfinished = (
+        split_unfinished_ending(editorial.text)
+        if verification.enabled
+        else (editorial.text, None)
+    )
+    if not editorial_text:
+        return _Drafted(root, editorial, compression_generations, None, None, None)
+    final_text = retain_sentences_with_missing_literals(
+        root.summary,
+        editorial_text,
+        strict_numbers=verification.strict_numbers,
+        strict_names=verification.strict_names,
+    )
+    if not verification.enabled:
+        return _Drafted(root, editorial, compression_generations, final_text, None, None)
+    if source_cores is None:
+        raise ValueError("enabled verification requires root-provenance source cores")
+    runtime = _verification_runtime(
+        provider=provider,
+        counter=counter,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        context_window_tokens=verification_context_window_tokens,
+        injected=verification_runtime,
+    )
+    observer.raise_if_stopped("before verification")
+    passages = _evidence_passages(
+        root=root,
+        segments=segments,
+        source_cores=source_cores,
+        counter=runtime.counter,
+        config=verification,
+    )
+    outcome = _verify_publication(
+        final_text,
+        root,
+        source_id=source_id,
+        source_index=build_source_lexical_index(
+            provenance_ids=passages.ids, source=passages.texts
+        ),
+        runtime=runtime,
+        config=verification,
+        coordinator=verification_coordinator,
+        target_words=target_words,
+        progress=VerificationProgress(observer, scope=detail),
+        source_cores=source_cores,
+        segments=segments,
+        unfinished=unfinished,
+        work_id="V01" if section is None else section.verification_work_id,
+    )
+    return _Drafted(root, editorial, compression_generations, final_text, passages, outcome)
+
+
+SectionStatus = Literal["verified", "unverified", "empty"]
+
+
+@dataclass(frozen=True)
+class SectionCitation:
+    """A source segment a section's prose cites, with the pages it spans."""
+
+    segment_id: str
+    order: int
+    page_start: int | None
+    page_end: int | None
+
+
+@dataclass(frozen=True)
+class SectionPublication:
+    """One section's reader-facing prose, checked against that section's source only.
+
+    `status` is `verified` when verification kept the text, `unverified` when
+    verification is off (the text is the written draft), and `empty` when
+    nothing could be published; `reason` then says why. `segment_ids` are the
+    section's own subtree segments, the only evidence its prose could draw on,
+    and every citation is one of them. Pages are those of the whole subtree.
+    """
+
+    section_id: str
+    node_id: str
+    heading: str | None
+    status: SectionStatus
+    text: str
+    sentences: tuple[AuditPublishedSentence, ...]
+    removed_sentences: tuple[AuditRemovedSentence, ...]
+    citations: tuple[SectionCitation, ...]
+    segment_ids: tuple[str, ...]
+    page_start: int | None
+    page_end: int | None
+    target_words: int
+    words: int
+    kind: PublicationKind | None = None
+    reason: str | None = None
+
+
+def _append_work_planner(
+    coordinator: object,
+) -> Callable[[tuple[str, ...]], None] | None:
+    """Return a callback that appends not yet planned work ids to the run's plan."""
+    session = getattr(coordinator, "session", None)
+    if session is None:
+        return None
+
+    def reserve(work_ids: tuple[str, ...]) -> None:
+        current = session.manifest.work_ids
+        fresh = tuple(item for item in dict.fromkeys(work_ids) if item not in current)
+        if fresh:
+            session.ensure_work_prefix((*current, *fresh))
+
+    return reserve
+
+
+def _section_label(index: int, total: int, heading: str | None) -> str:
+    label = f"Section {index} of {total}"
+    return label if heading is None else f"{label}, {_shorten(heading, 40)}"
+
+
+def _section_citations(
+    verification: VerificationResult | None,
+    root: SummaryNode,
+    *,
+    source_id: str,
+    segments: Sequence[SourceSegment],
+    passages: _EvidencePassages | None,
+    pages: PageLookup,
+) -> tuple[SectionCitation, ...]:
+    """Cite the section's own segments, a split passage by the segment it came from."""
+    evidence_segments = (*segments, *(passages.segments if passages is not None else ()))
+    cited = resolve_citations(
+        citation_provenance_for_summary(
+            root.provenance, verification, verification_enabled=verification is not None
+        ),
+        source_id=source_id,
+        segments=evidence_segments,
+    )
+    parents = passages.parents if passages is not None else {}
+    own = {segment.segment_id: segment for segment in segments}
+    ids = dict.fromkeys(parents.get(item.segment_id, item.segment_id) for item in cited)
+    return tuple(
+        SectionCitation(
+            segment_id=segment.segment_id,
+            order=segment.order,
+            page_start=pages.at(segment.core_start),
+            page_end=pages.at(max(segment.core_end - 1, segment.core_start)),
+        )
+        for segment in sorted((own[item] for item in ids), key=lambda item: item.order)
+    )
+
+
+def finalize_sections(
+    tree: SectionTree,
+    section_nodes: Mapping[str, str],
+    nodes: Sequence[TreeNode],
+    provider: ModelProvider,
+    *,
+    source_id: str,
+    model: str,
+    timeout_seconds: float,
+    target_words: int,
+    segments: Sequence[SourceSegment],
+    source_cores: Mapping[str, str],
+    pages: Sequence[PageExtent] | None = None,
+    request_limits: RequestLimits | None = None,
+    counter: TokenCounter | None = None,
+    verification: VerificationConfig = _DEFAULT_VERIFICATION_CONFIG,
+    verification_runtime: VerificationRuntime | None = None,
+    verification_context_window_tokens: int | None = None,
+    verification_coordinator: CacheCoordinator | None = None,
+    observer: RuntimeObserver | None = None,
+) -> dict[str, SectionPublication]:
+    """Write and verify each section's prose against that section's own source.
+
+    A section's prose is written from its node's summary, which covers the
+    section's whole subtree (its own text and its subsections), and is verified
+    against the source cores of the node's covered segments only: a claim that
+    only another section's source supports is not supported here. Each
+    section takes the editorial, verification and repair path of the final
+    summary, under work ids of its own, with a target that is its share of
+    `target_words`. Sentences that pass are published and the rest dropped. A
+    section with no supported sentence publishes nothing and is reported with
+    status `empty`, not raised. Without verification the written prose is
+    published as is, marked `unverified`.
+
+    `observer` sees WRITING and VERIFYING for every section, each detailed
+    with the section's label, and is polled for Stop before every model call.
+    """
+    runtime_observer = get_observer(observer)
+    reserve_work = _append_work_planner(getattr(provider, "cache_coordinator", None))
+    by_node = {node.node_id: node for node in nodes}
+    lookup = PageLookup(pages)
+    ordered = [section for section in tree.nodes if section.id in section_nodes]
+    publications: dict[str, SectionPublication] = {}
+    for index, section in enumerate(ordered, start=1):
+        runtime_observer.raise_if_stopped("before a section's prose")
+        node = by_node[section_nodes[section.id]]
+        covered = frozenset(node.covered_segments)
+        own_segments = tuple(
+            segment for segment in segments if segment.segment_id in covered
+        )
+        cores = {item: source_cores[item] for item in node.covered_segments}
+        # The evidence is the node's provenance inside the section, so nothing
+        # outside it can ever support a claim.
+        provenance = tuple(
+            item for item in node.summary.provenance if item in covered
+        ) or node.covered_segments
+        root = node.summary.model_copy(update={"provenance": provenance})
+        target = tree.target_words(section.id, target_words)
+        label = _section_label(index, len(ordered), section.heading)
+        drafted = _draft_and_verify(
+            root,
+            provider,
+            source_id=source_id,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            target_words=target,
+            segments=own_segments,
+            source_cores=cores,
+            request_limits=request_limits,
+            counter=counter,
+            verification=verification,
+            verification_runtime=verification_runtime,
+            verification_context_window_tokens=verification_context_window_tokens,
+            verification_coordinator=verification_coordinator,
+            observer=runtime_observer,
+            reserve_work=reserve_work,
+            section=_SectionStep(SectionScope(section.id, section.heading), label),
+        )
+        subtree_pages = tree.subtree_pages(section.id)
+        common = dict(
+            section_id=section.id,
+            node_id=node.node_id,
+            heading=section.heading,
+            segment_ids=tuple(segment.segment_id for segment in own_segments),
+            page_start=subtree_pages[0] if subtree_pages else None,
+            page_end=subtree_pages[1] if subtree_pages else None,
+            target_words=target,
+        )
+
+        def empty(
+            reason: str, removed: tuple[AuditRemovedSentence, ...] = ()
+        ) -> SectionPublication:
+            return SectionPublication(
+                status="empty",
+                text="",
+                sentences=(),
+                removed_sentences=removed,
+                citations=(),
+                words=0,
+                reason=reason,
+                **common,
+            )
+
+        if drafted.text is None:
+            publications[section.id] = empty("the draft was one unfinished sentence")
+            continue
+        outcome = drafted.outcome
+        if outcome is None:
+            publications[section.id] = SectionPublication(
+                status="unverified",
+                text=drafted.text,
+                sentences=_published_sentences(drafted.text, None, passages=None),
+                removed_sentences=(),
+                citations=_section_citations(
+                    None,
+                    drafted.root,
+                    source_id=source_id,
+                    segments=own_segments,
+                    passages=None,
+                    pages=lookup,
+                ),
+                words=word_count(drafted.text),
+                **common,
+            )
+            continue
+        if outcome.result.failed or not outcome.result.text.strip():
+            runtime_observer.emit(
+                StageEvent(StageName.VERIFYING, "completed", detail=f"{label}: nothing supported")
+            )
+            publications[section.id] = empty(
+                "no sentence was supported by the section's source", outcome.removed
+            )
+            continue
+        runtime_observer.emit(
+            StageEvent(StageName.VERIFYING, "completed", detail=f"{label}: {outcome.detail}")
+        )
+        text = outcome.result.text
+        publications[section.id] = SectionPublication(
+            status="verified",
+            text=text,
+            sentences=_published_sentences(text, outcome.result, passages=drafted.passages),
+            removed_sentences=outcome.removed,
+            citations=_section_citations(
+                outcome.result,
+                drafted.root,
+                source_id=source_id,
+                segments=own_segments,
+                passages=drafted.passages,
+                pages=lookup,
+            ),
+            words=word_count(text),
+            kind=outcome.kind,
+            **common,
+        )
+    return publications
+
+
 def _finalize_summary(
     root: SummaryNode,
     provider: ModelProvider,
@@ -1528,44 +1954,28 @@ def _finalize_summary(
     """
     runtime_observer = get_observer(observer)
     reserve_work = _finalization_work_planner(getattr(provider, "cache_coordinator", None))
-    compression_generations: tuple[GenerationResult, ...] = ()
-    if source_cores is not None:
-        root, compression_generations = _prepare_root_for_editorial(
-            root,
-            provider,
-            source_id=source_id,
-            model=model,
-            timeout_seconds=timeout_seconds,
-            target_words=target_words,
-            source_cores=source_cores,
-            segments=segments,
-            strict_numbers=verification.strict_numbers,
-            strict_names=verification.strict_names,
-            limits=request_limits,
-            reserve_work=reserve_work,
-        )
-    if reserve_work is not None:
-        reserve_work((EDITORIAL_WORK_ID, *(("V01",) if verification.enabled else ())))
-    runtime_observer.emit(StageEvent(StageName.WRITING, "active"))
-    editorial = write_editorial(
+    drafted = _draft_and_verify(
         root,
         provider,
         source_id=source_id,
         model=model,
         timeout_seconds=timeout_seconds,
         target_words=target_words,
-        limits=request_limits,
+        segments=segments,
+        source_cores=source_cores,
+        request_limits=request_limits,
+        counter=counter,
+        verification=verification,
+        verification_runtime=verification_runtime,
+        verification_context_window_tokens=verification_context_window_tokens,
+        verification_coordinator=verification_coordinator,
         observer=runtime_observer,
+        reserve_work=reserve_work,
     )
-    runtime_observer.emit(StageEvent(StageName.WRITING, "completed"))
-    # The cut-off ending is taken from the model's own draft, before literal
-    # restoration appends source sentences that could hide where it stopped.
-    editorial_text, unfinished = (
-        split_unfinished_ending(editorial.text)
-        if verification.enabled
-        else (editorial.text, None)
-    )
-    if not editorial_text:
+    root = drafted.root
+    editorial = drafted.editorial
+    compression_generations = drafted.compression_generations
+    if drafted.text is None:
         _build_audit(
             audit_path=audit_path,
             source_id=source_id,
@@ -1590,54 +2000,14 @@ def _finalize_summary(
         raise FinalizationVerificationError(
             "the editorial draft is one unfinished sentence, so nothing is left to verify"
         )
-    final_text = retain_sentences_with_missing_literals(
-        root.summary,
-        editorial_text,
-        strict_numbers=verification.strict_numbers,
-        strict_names=verification.strict_names,
-    )
+    final_text = drafted.text
     audit_warnings = tuple(warnings)
     audit_segments = tuple(segments)
-    passages: _EvidencePassages | None = None
-    outcome: _VerifiedPublication | None = None
-    if verification.enabled:
-        if source_cores is None:
-            raise ValueError(
-                "enabled verification requires root-provenance source cores"
-            )
-        runtime = _verification_runtime(
-            provider=provider,
-            counter=counter,
-            model=model,
-            timeout_seconds=timeout_seconds,
-            context_window_tokens=verification_context_window_tokens,
-            injected=verification_runtime,
-        )
-        runtime_observer.raise_if_stopped("before verification")
-        passages = _evidence_passages(
-            root=root,
-            segments=segments,
-            source_cores=source_cores,
-            counter=runtime.counter,
-            config=verification,
-        )
+    passages = drafted.passages
+    outcome = drafted.outcome
+    if outcome is not None:
+        assert passages is not None
         audit_segments = (*segments, *passages.segments)
-        outcome = _verify_publication(
-            final_text,
-            root,
-            source_id=source_id,
-            source_index=build_source_lexical_index(
-                provenance_ids=passages.ids, source=passages.texts
-            ),
-            runtime=runtime,
-            config=verification,
-            coordinator=verification_coordinator,
-            target_words=target_words,
-            progress=VerificationProgress(runtime_observer),
-            source_cores=source_cores,
-            segments=segments,
-            unfinished=unfinished,
-        )
         if outcome.result.failed:
             _build_audit(
                 audit_path=audit_path,

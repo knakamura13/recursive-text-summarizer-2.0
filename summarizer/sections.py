@@ -101,6 +101,54 @@ class SectionTree:
     def roots(self) -> tuple[SectionNode, ...]:
         return tuple(node for node in self.nodes if node.parent_id is None)
 
+    def subtree(self, section_id: str) -> tuple[SectionNode, ...]:
+        """The section and all its descendants, in document order."""
+        ids = {section_id}
+        members: list[SectionNode] = []
+        for node in self.nodes:
+            if node.id in ids or node.parent_id in ids:
+                ids.add(node.id)
+                members.append(node)
+        if not members:
+            raise KeyError(section_id)
+        return tuple(members)
+
+    def subtree_pages(self, section_id: str) -> tuple[int, int] | None:
+        """First and last page of the section's whole subtree, or None without a page map."""
+        pages = [
+            page
+            for node in self.subtree(section_id)
+            for page in (node.page_start, node.page_end)
+            if page is not None
+        ]
+        return (min(pages), max(pages)) if pages else None
+
+    def target_words(self, section_id: str, total_words: int) -> int:
+        """The section's share of `total_words`, by subtree characters, at least one sentence.
+
+        A section's prose covers its subtree, so its share is the subtree's
+        characters over all characters, the same share folding measures.
+        """
+        total = sum(node.end - node.start for node in self.nodes)
+        own = sum(node.end - node.start for node in self.subtree(section_id))
+        share = round(total_words * own / total) if total else total_words
+        return max(SENTENCE_WORDS, share)
+
+
+class PageLookup:
+    """The page holding an offset, from the pages' extents."""
+
+    def __init__(self, pages: Sequence[PageExtent] | None) -> None:
+        self._spans = sorted(
+            (span for span in pages or () if span.end > span.start), key=lambda s: s.start
+        )
+        self._starts = [span.start for span in self._spans]
+
+    def at(self, offset: int) -> int | None:
+        if not self._spans:
+            return None
+        return self._spans[max(bisect.bisect_right(self._starts, offset) - 1, 0)].page
+
 
 class _Draft:
     """A mutable node while the tree is built and folded."""
@@ -270,13 +318,7 @@ def _fold(roots: list[_Draft], total: int, target_words: int) -> None:
 
 
 def _freeze(roots: list[_Draft], pages: Sequence[PageExtent] | None) -> SectionTree:
-    spans = sorted((span for span in pages or () if span.end > span.start), key=lambda s: s.start)
-    page_starts = [span.start for span in spans]
-
-    def page_at(offset: int) -> int | None:
-        if not spans:
-            return None
-        return spans[max(bisect.bisect_right(page_starts, offset) - 1, 0)].page
+    page_at = PageLookup(pages).at
 
     ordered: list[_Draft] = []
 

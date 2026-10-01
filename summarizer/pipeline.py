@@ -24,10 +24,12 @@ from summarizer.config import AppConfig, CacheConfig, ReliabilityConfig, Strateg
 from summarizer.direct import DIRECT_NODE_ID, summarize_direct, whole_document_segment
 from summarizer.finalization import (
     FinalizationResult,
+    SectionPublication,
     _finalize_summary,
+    finalize_sections,
     publish_final_output,
 )
-from summarizer.editorial import plan_editorial_request
+from summarizer.editorial import SectionScope, plan_editorial_request
 from summarizer.hierarchy import (
     TreeNode,
     build_hierarchy,
@@ -104,8 +106,14 @@ class PipelineResult:
     # `TreeNode.section_id` gives the reverse mapping.
     sections: SectionTree | None = None
     section_nodes: Mapping[str, str] = field(default_factory=dict)
+    # Section mode only: the prose written and verified for each section that
+    # has a node, by section id, checked against that section's own source.
+    # It is extra output: `final` stays the root editorial and its verification.
+    section_publications: Mapping[str, SectionPublication] = field(default_factory=dict)
 
 
+# Bump when section prose changes in a way a resumed run must not reuse.
+SECTION_PROSE_VERSION = 1
 _DEFAULT_PIPELINE_CONFIG = PipelineConfig()
 _DEFAULT_SEGMENT_CAPACITY_DIVISOR = 4
 
@@ -261,6 +269,26 @@ def plan_run_requests(
     return limits
 
 
+def plan_section_requests(
+    limits: RequestLimits,
+    *,
+    source_id: str,
+    tree: SectionTree,
+    target_words: int,
+) -> None:
+    """Refuse an infeasible section editorial before any model call.
+
+    Each section's editorial is budgeted at its own target, as the root's is.
+    """
+    for section in tree.nodes:
+        plan_editorial_request(
+            limits,
+            source_id=source_id,
+            target_words=tree.target_words(section.id, target_words),
+            section=SectionScope(section.id, section.heading),
+        )
+
+
 def _provider_schema_reserve(app: AppConfig) -> int:
     return MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES if app.provider == "ollama" else 0
 
@@ -307,6 +335,13 @@ def run_pipeline(
     )
     runtime_observer.raise_if_stopped("before pipeline execution")
     section_tree = section_tree_for(document, config)
+    if section_tree is not None:
+        plan_section_requests(
+            limits,
+            source_id=document.source_id,
+            tree=section_tree,
+            target_words=config.target_words,
+        )
     if not config.cache.enabled:
         return _run_pipeline(
             document,
@@ -377,6 +412,7 @@ def run_pipeline(
             [node.id, node.heading, node.level, node.start, node.end, node.parent_id]
             for node in section_tree.nodes
         ]
+        descriptor_fields["section_prose"] = SECTION_PROSE_VERSION
     descriptor = hashlib.sha256(
         json.dumps(
             descriptor_fields,
@@ -720,6 +756,32 @@ def _run_pipeline(
             and coordinator.session is not None
         ),
     )
+    section_publications: Mapping[str, SectionPublication] = {}
+    if section_tree is not None and section_nodes:
+        observer.raise_if_stopped("before section prose")
+        section_publications = finalize_sections(
+            section_tree,
+            section_nodes,
+            nodes,
+            recording,
+            source_id=document.source_id,
+            model=app.model,
+            timeout_seconds=app.timeout_seconds,
+            target_words=config.target_words,
+            segments=segments,
+            source_cores={
+                segment.segment_id: document.text[segment.core_start : segment.core_end]
+                for segment in segments
+            },
+            pages=config.sections.pages if config.sections is not None else None,
+            request_limits=limits,
+            counter=counter,
+            verification=config.verification,
+            verification_runtime=verifier_runtime,
+            verification_context_window_tokens=report.context_window_tokens,
+            verification_coordinator=verification_coordinator,
+            observer=observer,
+        )
     observer.raise_if_stopped("before publication")
     observer.emit(StageEvent(StageName.PUBLISHING, "active"))
     if (
@@ -741,4 +803,5 @@ def _run_pipeline(
         nodes=nodes,
         sections=section_tree,
         section_nodes=section_nodes,
+        section_publications=section_publications,
     )
