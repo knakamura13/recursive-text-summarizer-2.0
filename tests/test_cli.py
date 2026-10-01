@@ -416,7 +416,9 @@ def test_preserve_sections_summarizes_markdown_by_heading(
     assert result.sections is not None
     assert [node.heading for node in result.sections.nodes] == ["Alpha", "Beta"]
     assert set(result.section_nodes) == {node.id for node in result.sections.nodes}
-    assert (tmp_path / "output.txt").read_text(encoding="utf-8") == "Concise summary."
+    assert (tmp_path / "output.txt").read_text(encoding="utf-8") == (
+        "# Alpha\n\nConcise summary.\n\n# Beta\n\nConcise summary."
+    )
 
 
 def test_preserve_sections_without_headings_prints_notice_and_matches_mode_off(

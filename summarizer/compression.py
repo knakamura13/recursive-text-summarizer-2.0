@@ -515,6 +515,7 @@ def compress_to_target(
     limits: RequestLimits | None = None,
     reserve_work: Callable[[tuple[str, ...]], None] | None = None,
     work_prefix: str = "",
+    rejected_pass_limit: int = 1,
 ) -> CompressionResult:
     """Shorten `text` by repeated light passes until it is within the target band.
 
@@ -526,6 +527,10 @@ def compress_to_target(
     often followed by a large drop, so one slow pass alone does not stop it.
     `MAX_PASSES` is the work-id format's limit.
 
+    `rejected_pass_limit` is how many passes in a row may be discarded before
+    the loop stops; each retry runs under the next pass index. An accepted
+    pass resets the count. `CompressionResult.passes` counts accepted passes.
+
     `reserve_work` is called with each pass's work ids before the pass runs.
     With `limits`, every chunk request is budgeted and carries its allowance.
     `work_prefix` scopes the work ids of one section's compression apart from
@@ -533,13 +538,16 @@ def compress_to_target(
     """
     if target_words <= 0:
         raise ValueError("target_words must be positive")
+    if rejected_pass_limit < 1:
+        raise ValueError("rejected_pass_limit must be at least 1")
     stripped = text.strip()
     if not stripped:
         raise ValueError("text must not be empty")
 
     current = stripped
     all_generations: list[GenerationResult] = []
-    passes_run = 0
+    accepted = 0
+    rejected = 0
     slow_passes = 0
     for pass_index in range(1, MAX_PASSES + 1):
         if not _above_ceiling(word_count(current), target_words):
@@ -564,9 +572,15 @@ def compress_to_target(
         if word_count(current) >= word_count(previous) or (
             strict_numbers and _omits_a_number(previous, current)
         ):
+            # Discarded: the next attempt starts from the same text under the
+            # next pass index, so it is a new request, not a cache hit.
             current = previous
-            break
-        passes_run = pass_index
+            rejected += 1
+            if rejected >= rejected_pass_limit:
+                break
+            continue
+        accepted += 1
+        rejected = 0
         shortened = 1 - word_count(current) / word_count(previous)
         slow_passes = slow_passes + 1 if shortened < SLOW_PASS_FRACTION else 0
         if slow_passes >= SLOW_PASS_LIMIT:
@@ -575,5 +589,5 @@ def compress_to_target(
     return CompressionResult(
         text=current.strip(),
         generations=tuple(all_generations),
-        passes=passes_run,
+        passes=accepted,
     )

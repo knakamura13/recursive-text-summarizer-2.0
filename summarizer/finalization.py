@@ -15,10 +15,18 @@ When nothing passes, a failure audit is written and
 `FinalizationVerificationError` is raised. The audit's `publication` records
 the kind, each published sentence with its supporting quotations, every
 removed sentence with its verdict, and every proposed source-sentence swap.
+
+In section mode no root editorial is written. `finalize_sections` verifies each
+section's prose against that section's own source, lightly trims prose more
+than 10% above its target (verifying the trimmed text again), and
+`assemble_sections` joins the prose in source order under Markdown headings.
+The audit's `publication` then also records each heading line and each
+section's requested and published words.
 """
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import re
 import threading
@@ -32,13 +40,16 @@ from pathlib import Path
 from summarizer.audit import (
     _atomic_replace,
     PUBLICATION_WARNINGS,
+    MAX_HEADING_LEVEL,
     AuditArtifact,
+    AuditHeading,
     AuditPublication,
     AuditPublishedSentence,
     AuditRemovedSentence,
     AuditSection,
     AuditSectionCitation,
     AuditSectionPublication,
+    AuditSectionWords,
     AuditSubstitution,
     AuditSentenceEvidence,
     Citation,
@@ -86,7 +97,7 @@ from summarizer.runtime.observers import (
     get_observer,
 )
 from summarizer.safety import redact_text
-from summarizer.sections import PageExtent, PageLookup, SectionTree
+from summarizer.sections import HeadingLike, PageExtent, PageLookup, SectionTree
 from summarizer.segmentation import (
     BoundaryKind,
     CacheCoordinator,
@@ -121,6 +132,10 @@ from summarizer.verification import (
 
 # Evidence passages are never split below this many tokens.
 _MIN_PASSAGE_TOKENS = 32
+# A model's trim pass often fails to shorten a section's prose or loses a
+# number once and succeeds on the next try, so one rejection does not show
+# that the prose cannot be shortened without dropping facts.
+SECTION_TRIM_REJECTED_PASS_LIMIT = 3
 _PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n(?:[ \t]*\n)*")
 # Work the finalization stage plans for itself: compression passes, the
 # editorial call and verification.
@@ -1516,8 +1531,17 @@ class _SectionStep:
         return section_work_id(self.scope.section_id, "V01")
 
     @property
+    def trim_verification_work_id(self) -> str:
+        return section_work_id(self.scope.section_id, "V02")
+
+    @property
     def compression_prefix(self) -> str:
         return section_work_id(self.scope.section_id, "")
+
+    @property
+    def trim_prefix(self) -> str:
+        """Scopes the post-verification trim passes apart from the pre-editorial ones."""
+        return section_work_id(self.scope.section_id, "T")
 
 
 @dataclass(frozen=True)
@@ -1627,6 +1651,21 @@ def _draft_and_verify(
         strict_names=verification.strict_names,
     )
     if not verification.enabled:
+        if section is not None:
+            trimmed, trim_generations = _trim_prose(
+                final_text,
+                provider,
+                source_id=source_id,
+                model=model,
+                timeout_seconds=timeout_seconds,
+                target_words=target_words,
+                verification=verification,
+                request_limits=request_limits,
+                reserve_work=reserve_work,
+                section=section,
+            )
+            compression_generations = (*compression_generations, *trim_generations)
+            final_text = trimmed if trimmed is not None else final_text
         return _Drafted(root, editorial, compression_generations, final_text, None, None)
     if source_cores is None:
         raise ValueError("enabled verification requires root-provenance source cores")
@@ -1646,24 +1685,124 @@ def _draft_and_verify(
         counter=runtime.counter,
         config=verification,
     )
+    source_index = build_source_lexical_index(
+        provenance_ids=passages.ids, source=passages.texts
+    )
+    progress = VerificationProgress(observer, scope=detail)
     outcome = _verify_publication(
         final_text,
         root,
         source_id=source_id,
-        source_index=build_source_lexical_index(
-            provenance_ids=passages.ids, source=passages.texts
-        ),
+        source_index=source_index,
         runtime=runtime,
         config=verification,
         coordinator=verification_coordinator,
         target_words=target_words,
-        progress=VerificationProgress(observer, scope=detail),
+        progress=progress,
         source_cores=source_cores,
         segments=segments,
         unfinished=unfinished,
         work_id="V01" if section is None else section.verification_work_id,
     )
+    if section is not None and not outcome.result.failed and outcome.result.text.strip():
+        trimmed, trim_generations = _trim_prose(
+            outcome.result.text,
+            provider,
+            source_id=source_id,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            target_words=target_words,
+            verification=verification,
+            request_limits=request_limits,
+            reserve_work=reserve_work,
+            section=section,
+        )
+        compression_generations = (*compression_generations, *trim_generations)
+        if trimmed is not None:
+            if reserve_work is not None:
+                reserve_work((section.trim_verification_work_id,))
+            retried = _verify_publication(
+                trimmed,
+                root,
+                source_id=source_id,
+                source_index=source_index,
+                runtime=runtime,
+                config=verification,
+                coordinator=verification_coordinator,
+                target_words=target_words,
+                progress=progress,
+                source_cores=source_cores,
+                segments=segments,
+                work_id=section.trim_verification_work_id,
+            )
+            # The trimmed prose replaces the verified prose only when every one
+            # of its sentences passes and it is shorter. A trim that lost a
+            # sentence to verification rewrote a supported fact into an
+            # unsupported one, so the longer verified prose stands unchanged and
+            # the rejected rewrite stays out of the published record.
+            if (
+                not retried.result.failed
+                and retried.result.text.strip()
+                and not retried.removed
+                and retried.kind == "editorial"
+                and word_count(retried.result.text) < word_count(outcome.result.text)
+            ):
+                outcome = replace(
+                    retried,
+                    kind=outcome.kind,
+                    removed=outcome.removed,
+                    substitutions=outcome.substitutions,
+                )
     return _Drafted(root, editorial, compression_generations, final_text, passages, outcome)
+
+
+def _trim_prose(
+    text: str,
+    provider: ModelProvider,
+    *,
+    source_id: str,
+    model: str,
+    timeout_seconds: float,
+    target_words: int,
+    verification: VerificationConfig,
+    request_limits: RequestLimits | None,
+    reserve_work: Callable[[tuple[str, ...]], None] | None,
+    section: _SectionStep,
+) -> tuple[str | None, tuple[GenerationResult, ...]]:
+    """Lightly trim a section's prose when it is above its target band.
+
+    This is the pre-editorial compression loop (`compress_to_target`) run on the
+    prose itself: light passes repeat until the prose is within the band. A
+    pass that does not shorten it, or loses a number, is discarded so a fact is
+    never dropped to reach the band, and the loop is retried until
+    `SECTION_TRIM_REJECTED_PASS_LIMIT` passes in a row are discarded.
+    Returns the shorter text, or None when the prose is in or below the band or
+    could not be shortened, with every request's result.
+    The caller verifies a returned text before it publishes.
+    """
+    if not _above_ceiling(word_count(text), target_words):
+        return None, ()
+    coordinator = getattr(provider, "cache_coordinator", None)
+    if coordinator is not None and not isinstance(coordinator, CacheCoordinator):
+        raise TypeError("cache_coordinator must be a CacheCoordinator")
+    compressed = compress_to_target(
+        text,
+        provider,
+        source_id=source_id,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        target_words=target_words,
+        coordinator=coordinator,
+        strict_numbers=verification.strict_numbers,
+        strict_names=verification.strict_names,
+        limits=request_limits,
+        reserve_work=reserve_work,
+        work_prefix=section.trim_prefix,
+        rejected_pass_limit=SECTION_TRIM_REJECTED_PASS_LIMIT,
+    )
+    if compressed.passes == 0:
+        return None, compressed.generations
+    return compressed.text, compressed.generations
 
 
 @dataclass(frozen=True)
@@ -1705,6 +1844,8 @@ class SectionPublication:
     words: int
     kind: PublicationKind | None = None
     reason: str | None = None
+    # The compression, trim and editorial requests that wrote this prose.
+    generations: tuple[GenerationResult, ...] = ()
 
 
 def _append_work_planner(
@@ -1822,6 +1963,12 @@ def finalize_sections(
     and is reported with status `empty`, not raised. Without verification the
     written prose is published as is, marked `unverified`.
 
+    Prose more than 10% above its section's target is then lightly trimmed
+    (`_trim_prose`) and, with verification on, verified again. The trimmed
+    prose replaces the verified prose only when every sentence of it passes;
+    prose that cannot be shortened, or whose trim loses a sentence to
+    verification, is published at its longer length, unchanged.
+
     A section with no own text beyond its heading, or whose own share of the
     target is under one sentence, publishes its heading only, with status
     `heading_only`, and no model call.
@@ -1908,6 +2055,10 @@ def finalize_sections(
             section=_SectionStep(SectionScope(section.id, section.heading), label),
         )
         common["segment_ids"] = tuple(segment.segment_id for segment in own_segments)
+        common["generations"] = (
+            *drafted.compression_generations,
+            drafted.editorial.generation,
+        )
 
         def empty(
             reason: str, removed: tuple[AuditRemovedSentence, ...] = ()
@@ -2049,6 +2200,244 @@ def attach_section_records(
     if rewrite_path is not None:
         write_audit(rewrite_path, artifact)
     return replace(result, audit=artifact)
+
+
+class HeadingRefusedError(ValueError):
+    """A heading line was refused because its text is not an outline heading."""
+
+
+@dataclass(frozen=True)
+class AssembledSummary:
+    """The final summary of a section mode run: section prose under source headings.
+
+    Every offset indexes `text`. `sentences` are the sections' published
+    sentences, renumbered in reading order, and `headings` place each heading
+    line. Heading words count toward no section's words.
+    """
+
+    text: str
+    headings: tuple[AuditHeading, ...]
+    sentences: tuple[AuditPublishedSentence, ...]
+    section_words: tuple[AuditSectionWords, ...]
+
+
+def heading_line(level: int, heading: str, outline: Collection[str]) -> str:
+    """The Markdown ATX line for `heading`, or `HeadingRefusedError` when it is not in `outline`.
+
+    `outline` holds the outline's heading texts as the section tree keeps them
+    (whitespace collapsed). The text is written verbatim after one `#` per
+    level, at most `MAX_HEADING_LEVEL`.
+    """
+    if heading not in outline:
+        raise HeadingRefusedError(f"heading {heading!r} is not a heading of the outline")
+    return f"{'#' * min(max(level, 1), MAX_HEADING_LEVEL)} {heading}"
+
+
+def assemble_sections(
+    tree: SectionTree,
+    publications: Mapping[str, SectionPublication],
+    outline: Sequence[HeadingLike],
+) -> AssembledSummary:
+    """Join the sections' prose in source order, each titled section under its heading.
+
+    A titled section opens with its heading line, then its prose; the untitled
+    opening section's prose comes first with no heading. A `heading_only`
+    section, an `empty` one (the reason stays in its audit record) and a
+    section with no publication emit the heading alone, and its subsections
+    follow in order. A heading that is not an outline heading is refused with
+    `HeadingRefusedError`, so no line can enter the summary that the source
+    does not hold.
+
+    A section folded into another gets no heading line of its own: its text is
+    part of the survivor's prose span, and its heading is listed in the
+    survivor's `folded_headings` in the audit.
+
+    Blocks are separated by a blank line, so each heading and each section
+    starts a paragraph.
+    """
+    titles = frozenset(" ".join(item.title.split()) for item in outline)
+    pieces: list[str] = []
+    length = 0
+    headings: list[AuditHeading] = []
+    placed: list[tuple[int, AuditPublishedSentence]] = []
+    words: list[AuditSectionWords] = []
+
+    def add(block: str) -> int:
+        nonlocal length
+        if pieces:
+            pieces.append("\n\n")
+            length += 2
+        start = length
+        pieces.append(block)
+        length += len(block)
+        return start
+
+    for section in tree.nodes:
+        publication = publications.get(section.id)
+        if section.heading is not None:
+            line = heading_line(section.level, section.heading, titles)
+            start = add(line)
+            headings.append(
+                AuditHeading(
+                    section_id=section.id,
+                    level=min(section.level, MAX_HEADING_LEVEL),
+                    text=section.heading,
+                    start=start,
+                    end=start + len(line),
+                )
+            )
+        if publication is None:
+            continue
+        words.append(
+            AuditSectionWords(
+                section_id=section.id,
+                requested=publication.target_words,
+                published=publication.words,
+            )
+        )
+        if publication.status in ("heading_only", "empty") or not publication.text.strip():
+            continue
+        prose = publication.text.strip()
+        base = add(prose) - (len(publication.text) - len(publication.text.lstrip()))
+        placed.extend((base, sentence) for sentence in publication.sentences)
+
+    text = "".join(pieces)
+    break_ends = [match.end() for match in _PARAGRAPH_BREAK.finditer(text)]
+    sentences = tuple(
+        sentence.model_copy(
+            update={
+                "index": index,
+                "paragraph": bisect.bisect_right(break_ends, base + sentence.start),
+                "start": base + sentence.start,
+                "end": base + sentence.end,
+            }
+        )
+        for index, (base, sentence) in enumerate(placed)
+    )
+    return AssembledSummary(text, tuple(headings), sentences, tuple(words))
+
+
+def _assembled_kind(
+    publications: Mapping[str, SectionPublication], *, verification_enabled: bool
+) -> PublicationKind:
+    """The publication kind of an assembled summary, from what verification did to its sections."""
+    if not verification_enabled:
+        return "editorial"
+    items = tuple(publications.values())
+    if any(item.kind == "content_unit_fallback" for item in items):
+        return "content_unit_fallback"
+    if any(
+        item.kind == "verified_subset"
+        or item.removed_sentences
+        or item.status == "empty"
+        for item in items
+    ):
+        return "verified_subset"
+    return "editorial"
+
+
+def finalize_assembled_summary(
+    tree: SectionTree,
+    publications: Mapping[str, SectionPublication],
+    outline: Sequence[HeadingLike],
+    *,
+    source_id: str,
+    model: str,
+    strategy: str,
+    segments: Sequence[SourceSegment],
+    nodes: Sequence[TreeNode],
+    root_node_id: str,
+    include_citations: bool = False,
+    audit_configuration: Mapping[str, object] | None = None,
+    audit_path: Path | None = None,
+    generations: Sequence[GenerationResult] = (),
+    warnings: Sequence[str] = (),
+    failures: Sequence[str] = (),
+    verification_enabled: bool,
+    reliability_resume: Mapping[str, object] | None = None,
+    reliability_tracker: ReliabilityTracker | None = None,
+    materialize_audit: bool,
+) -> FinalizationResult:
+    """Build the final summary of a section mode run from its sections' published prose.
+
+    No root editorial is written and nothing is verified here: each section's
+    prose was verified against its own source by `finalize_sections`. The
+    publication keeps each section's removed sentences, so the audit records
+    every sentence verification dropped. Citations are the source segments the
+    sections cite. When no section has prose to publish, a failure audit is
+    written and `FinalizationVerificationError` is raised, as for a root
+    summary that verification cannot support.
+    """
+    assembled = assemble_sections(tree, publications, outline)
+    ordered = tuple(publications[node.id] for node in tree.nodes if node.id in publications)
+    section_generations = tuple(item for pub in ordered for item in pub.generations)
+    if not assembled.sentences:
+        _build_audit(
+            audit_path=audit_path,
+            source_id=source_id,
+            strategy=strategy,
+            model=model,
+            audit_configuration=audit_configuration,
+            segments=segments,
+            segment_parents={},
+            nodes=nodes,
+            root_node_id=root_node_id,
+            citations=(),
+            generations=(*generations, *section_generations),
+            warnings=tuple(warnings),
+            failures=(*failures, "section_prose_empty"),
+            verification=None,
+            verification_enabled=verification_enabled,
+            publication=None,
+            reliability_resume=reliability_resume,
+            reliability_tracker=reliability_tracker,
+            materialize=True,
+        )
+        raise FinalizationVerificationError("no section has prose that can be published")
+    kind = _assembled_kind(publications, verification_enabled=verification_enabled)
+    audit_warnings = (
+        (*warnings, PUBLICATION_WARNINGS[kind]) if kind in PUBLICATION_WARNINGS else tuple(warnings)
+    )
+    citations = resolve_citations(
+        tuple(item.segment_id for pub in ordered for item in pub.citations),
+        source_id=source_id,
+        segments=segments,
+    )
+    text = render_citations(assembled.text, citations) if include_citations else assembled.text
+    artifact = _build_audit(
+        audit_path=audit_path,
+        source_id=source_id,
+        strategy=strategy,
+        model=model,
+        audit_configuration=audit_configuration,
+        segments=segments,
+        segment_parents={},
+        nodes=nodes,
+        root_node_id=root_node_id,
+        citations=citations,
+        generations=(*generations, *section_generations),
+        warnings=audit_warnings,
+        failures=failures,
+        verification=None,
+        verification_enabled=verification_enabled,
+        publication=(
+            AuditPublication(
+                kind=kind,
+                sentences=assembled.sentences,
+                removed_sentences=tuple(
+                    removed for pub in ordered for removed in pub.removed_sentences
+                ),
+                headings=assembled.headings,
+                section_words=assembled.section_words,
+            )
+            if audit_path is not None
+            else None
+        ),
+        reliability_resume=reliability_resume,
+        reliability_tracker=reliability_tracker,
+        materialize=materialize_audit,
+    )
+    return FinalizationResult(text=text, citations=citations, audit=artifact)
 
 
 def _finalize_summary(

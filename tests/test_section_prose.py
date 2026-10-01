@@ -291,13 +291,14 @@ def test_a_section_with_no_supported_sentence_publishes_nothing_and_is_reported(
     assert result.final.text
 
 
-def test_the_runs_final_summary_stays_the_root_editorial() -> None:
+def test_section_mode_writes_no_root_editorial_and_mode_off_still_does() -> None:
     result, provider = run()
-    off, _ = run(sections=False)
+    off, off_provider = run(sections=False)
 
-    assert result.final.text == "The zebra met the otter near a heron."
-    assert result.final.text == off.final.text
-    assert sum(r.operation_id == "editorial-final" for r in provider.requests) == 1
+    assert result.final.text != off.final.text
+    assert not [r for r in provider.requests if r.operation_id == "editorial-final"]
+    assert off.final.text == "The zebra met the otter near a heron."
+    assert sum(r.operation_id == "editorial-final" for r in off_provider.requests) == 1
 
 
 def test_targets_split_the_target_by_own_word_share_without_heading_words() -> None:
@@ -435,8 +436,7 @@ def test_work_ids_are_stable_collision_free_and_resume_reuses_section_work(tmp_p
     for section_id in first.section_publications:
         assert f"Q{section_id}-editorial" in sections
         assert f"Q{section_id}-V01" in sections
-    assert work_ids.count("editorial-final") == 1 and work_ids.count("V01") == 1
-    assert work_ids.index("V01") < work_ids.index(sections[0])
+    assert "editorial-final" not in work_ids and "V01" not in work_ids
 
     resumed_provider = SectionProvider(DRAFTS)
     resumed, _ = go(resumed_provider, "resume")
@@ -507,8 +507,8 @@ def test_progress_reports_each_section_as_writing_and_verifying() -> None:
     sections = list(result.section_publications)
 
     writing = [e.detail for e in stages if e.stage is StageName.WRITING and e.state == "active"]
-    assert writing[0] is None  # the root's own editorial
-    assert [d.split(",")[0] for d in writing[1:]] == [
+    assert len(writing) == len(sections)
+    assert [d.split(",")[0] for d in writing] == [
         f"Section {i} of {len(sections)}" for i in range(1, len(sections) + 1)
     ]
     verifying = [e for e in stages if e.stage is StageName.VERIFYING and e.detail]

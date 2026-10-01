@@ -54,7 +54,7 @@ def test_section_mode_audit_records_each_section_with_its_publication(tmp_path: 
     assert {item["segment_id"] for item in beta["citations"]} <= set(beta["segment_ids"])
     empty = records["Gamma"]["publication"]
     assert empty["status"] == "empty" and empty["reason"] and empty["sentences"] == []
-    # The run's own publication stays the root editorial.
+    # The run's own publication is the assembled text.
     assert audit["publication"]["sentences"]
 
 
