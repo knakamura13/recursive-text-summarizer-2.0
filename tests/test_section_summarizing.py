@@ -36,7 +36,7 @@ class FakeProvider:
     def generate(self, request: GenerationRequest) -> GenerationResult:
         self.requests.append(request)
         operation = request.operation_id or ""
-        if operation == "editorial-final":
+        if operation == "editorial-final" or operation.endswith("-editorial"):
             payload: dict[str, object] = {"text": "A concise, coherent final summary."}
         elif operation.startswith("compression:"):
             payload = compression_generation_payload(request)

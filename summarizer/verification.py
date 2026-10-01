@@ -1996,12 +1996,20 @@ class VerificationProgress:
     every report is a no-op.
     """
 
-    def __init__(self, observer: RuntimeObserver | None = None) -> None:
+    def __init__(
+        self, observer: RuntimeObserver | None = None, *, scope: str | None = None
+    ) -> None:
         self._observer = get_observer(observer)
         self._detail: str | None = None
+        self._scope = scope
 
     def phase(self, detail: str) -> None:
-        """Mark the VERIFYING stage active with a new phase description."""
+        """Mark the VERIFYING stage active with a new phase description.
+
+        A `scope`, such as a section's label, prefixes every phase.
+        """
+        if self._scope is not None:
+            detail = f"{self._scope}: {detail}"
         if detail == self._detail:
             return
         self._detail = detail
@@ -2779,8 +2787,11 @@ def verify_and_repair(
     config: VerificationConfig,
     coordinator: CacheCoordinator | None = None,
     progress: VerificationProgress | None = None,
+    work_id: str = "V01",
 ) -> VerificationResult:
     """Reuse only a fully successful terminal verification result.
+
+    `work_id` names the cached work; a section's verification passes its own.
 
     `progress` reports claims and repair passes and is polled for Stop before
     every model call; it never affects the result or its cache identity.
@@ -2797,7 +2808,7 @@ def verify_and_repair(
     adapter = TypeAdapter(VerificationResult)
     return coordinator.resolve(
         stage="verification",
-        work_id="V01",
+        work_id=work_id,
         prompt_version="verification/9",
         schema_version="verification/1",
         input_value={
