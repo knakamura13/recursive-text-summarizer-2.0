@@ -518,7 +518,9 @@ def _without_runs(
             if (
                 between is not None
                 and (line.size, line.bold) == (pline.size, pline.bold)
-                and not any(b.size == body and not b.bold for b in between)
+                and not any(
+                    not b.bold and body / _MIN_SIZE_RATIO <= b.size < body * _MIN_SIZE_RATIO for b in between
+                )
             ):
                 continue
         if end - start >= _MIN_BYLINE_RUN:
