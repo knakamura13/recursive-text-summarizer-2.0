@@ -329,14 +329,29 @@ def test_a_rejected_trim_pass_is_retried_and_the_shorter_prose_is_verified_again
     assert len(checked) == 2  # the written draft, then the trimmed prose
 
 
-def test_a_trimmed_sentence_verification_rejects_is_dropped_and_the_rest_published() -> None:
+def test_a_trim_that_loses_a_sentence_to_verification_leaves_the_verified_prose_unchanged() -> None:
     provider = TrimProvider({**DRAFTS, "Gamma": LONG}, suffix=" The zebra did something odd.")
     result, _ = run(provider=provider)
     gamma = result.section_publications[by_heading(result)["Gamma"]]
 
-    assert "zebra" not in gamma.text
-    assert any("zebra" in item.text for item in gamma.removed_sentences)
-    assert gamma.kind == "verified_subset" and gamma.status == "verified"
+    assert trim_requests(provider)
+    assert gamma.text == LONG and "zebra" not in result.final.text.split("# Gamma")[1]
+    assert gamma.status == "verified" and gamma.kind == "editorial"
+    assert gamma.removed_sentences == ()
+
+
+def test_the_rejected_trim_stays_out_of_the_removed_sentences_the_first_check_recorded() -> None:
+    draft = "The zebra did something. " + LONG
+    baseline = TrimProvider({**DRAFTS, "Gamma": draft}, shortens=False)
+    kept, _ = run(provider=baseline)
+    provider = TrimProvider({**DRAFTS, "Gamma": draft}, suffix=" The zebra did something odd.")
+    result, _ = run(provider=provider)
+    gamma = result.section_publications[by_heading(result)["Gamma"]]
+    first = kept.section_publications[by_heading(kept)["Gamma"]]
+
+    assert [item.text for item in gamma.removed_sentences] == ["The zebra did something."]
+    assert gamma.removed_sentences == first.removed_sentences
+    assert gamma.text == first.text == LONG and gamma.kind == first.kind == "verified_subset"
 
 
 def test_unverified_prose_above_its_target_is_trimmed_too() -> None:

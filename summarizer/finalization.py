@@ -1735,22 +1735,23 @@ def _draft_and_verify(
                 segments=segments,
                 work_id=section.trim_verification_work_id,
             )
-            # The trimmed prose publishes only when something of it passes and
-            # it is shorter than what it replaces; otherwise the longer verified
-            # prose stands, as a trim never drops a fact to reach the band.
+            # The trimmed prose replaces the verified prose only when every one
+            # of its sentences passes and it is shorter. A trim that lost a
+            # sentence to verification rewrote a supported fact into an
+            # unsupported one, so the longer verified prose stands unchanged and
+            # the rejected rewrite stays out of the published record.
             if (
                 not retried.result.failed
                 and retried.result.text.strip()
+                and not retried.removed
+                and retried.kind == "editorial"
                 and word_count(retried.result.text) < word_count(outcome.result.text)
             ):
                 outcome = replace(
                     retried,
-                    kind=(
-                        "verified_subset"
-                        if "verified_subset" in (outcome.kind, retried.kind)
-                        else retried.kind
-                    ),
-                    removed=(*outcome.removed, *retried.removed),
+                    kind=outcome.kind,
+                    removed=outcome.removed,
+                    substitutions=outcome.substitutions,
                 )
     return _Drafted(root, editorial, compression_generations, final_text, passages, outcome)
 
@@ -1963,9 +1964,10 @@ def finalize_sections(
     written prose is published as is, marked `unverified`.
 
     Prose more than 10% above its section's target is then lightly trimmed
-    (`_trim_prose`) and, with verification on, verified again, dropping only
-    the sentences that fail. Prose that cannot be shortened, or whose trim
-    yields nothing supported, is published at its longer length.
+    (`_trim_prose`) and, with verification on, verified again. The trimmed
+    prose replaces the verified prose only when every sentence of it passes;
+    prose that cannot be shortened, or whose trim loses a sentence to
+    verification, is published at its longer length, unchanged.
 
     A section with no own text beyond its heading, or whose own share of the
     target is under one sentence, publishes its heading only, with status
