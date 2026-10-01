@@ -352,8 +352,18 @@ def _reconcile_titles(hints: list[OutlineHint], texts: dict[int, str]) -> list[O
     return result
 
 
-def _repeat_key(text: str) -> str:
-    return " ".join("".join(ch for ch in text.lower() if not ch.isdigit()).split())
+def _repeat_key(text: str, page: int) -> str:
+    """Text for comparing lines across pages; a leading or trailing page number becomes its offset.
+
+    A page number is the one number on a running header that moves in step with the page, so
+    "Title 12" on page 5 and "Title 13" on page 6 share a key, while "Chapter 1" on page 10
+    and "Chapter 2" on page 40 do not.
+    """
+    tokens = text.lower().split()
+    for index in {0, len(tokens) - 1} if tokens else ():
+        if tokens[index].isdigit():
+            tokens[index] = f"<off:{int(tokens[index]) - page}>"
+    return " ".join(tokens)
 
 
 def _looks_like_heading_text(text: str, words_limit: int, formula_free: bool = False) -> bool:
@@ -403,14 +413,14 @@ def _headings_from_lines(pages: dict[int, list[_Line]]) -> list[OutlineHint]:
     for number, lines in pages.items():
         for line in lines:
             chars[line.size] = chars.get(line.size, 0) + len(line.text)
-            placed.setdefault(_repeat_key(line.text), []).append((number, line.y))
+            placed.setdefault(_repeat_key(line.text, number), []).append((number, line.y))
     if not chars:
         return []
     body = max(chars.items(), key=lambda item: item[1])[0]
 
     def is_running(line: _Line) -> bool:
         """The same text (page numbers aside) at the same place on several pages: a header or footer."""
-        near = {n for n, y in placed[_repeat_key(line.text)] if abs(y - line.y) <= _POSITION_TOLERANCE}
+        near = {n for n, y in placed[_repeat_key(line.text, line.page)] if abs(y - line.y) <= _POSITION_TOLERANCE}
         return len(near) >= _REPEAT_MIN_PAGES
 
     # A running header does not count against a heading that repeats its text on the page.

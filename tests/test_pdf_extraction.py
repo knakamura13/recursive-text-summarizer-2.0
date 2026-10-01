@@ -330,3 +330,18 @@ def test_layout_title_is_respelled_from_the_page_text_and_placed(tmp_path: Path)
     assert [h.title for h in extraction.outline_hints] == ["Alpha-Beta"]
     assert [(e.title, e.level) for e in assemble(extraction).outline] == [("Alpha-Beta", 1)]
     assert [h.title for h in detect_layout_headings(PdfReader(path))] == ["Alpha-Beta"]
+
+
+def test_numbered_headings_at_one_height_are_not_a_running_header(tmp_path: Path):
+    # Chapters start on pages 1, 4 and 7: their printed numbers do not move in step with the page.
+    pages = [[*_body(700)] for _ in range(8)]
+    for n, index in ((1, 0), (2, 3), (3, 6)):
+        pages[index].insert(0, (f"Chapter {n}", 16, 740))
+    path, writer = _layout_pdf(tmp_path, pages)
+    assert _hints(_save(path, writer)) == [("Chapter 1", 1, 1), ("Chapter 2", 1, 4), ("Chapter 3", 1, 7)]
+
+
+def test_running_header_with_a_moving_page_number_is_excluded(tmp_path: Path):
+    pages = [[(f"Some Title {n}", 16, 740), *_body(700)] for n in (12, 13, 14)]
+    path, writer = _layout_pdf(tmp_path, pages)
+    assert _hints(_save(path, writer)) == []
