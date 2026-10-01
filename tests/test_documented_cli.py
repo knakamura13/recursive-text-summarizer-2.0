@@ -37,6 +37,7 @@ def test_help_lists_every_documented_flag() -> None:
         "--resume",
         "--max-concurrency",
         "--dry-run",
+        "--preserve-sections",
         "--strategy",
         "--context-window",
         "--max-output-tokens",
@@ -112,5 +113,6 @@ def test_readme_documents_current_cli_and_credentials() -> None:
     assert "does not require an API key" in readme
     assert "python main.py --input source.txt --output summary.txt" in readme
     assert "python main.py --dry-run" in readme
+    assert "--preserve-sections" in readme
     assert "gpt-4o-mini" in readme
     assert "nonzero" in readme

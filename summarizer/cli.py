@@ -26,7 +26,8 @@ from summarizer.providers.openai import OpenAIProvider
 from summarizer.providers.ollama import OllamaProvider
 from summarizer.providers.retrying import RetryingProvider
 from summarizer.runtime.observers import ItemFailedError
-from summarizer.segmentation import SegmentationConfig
+from summarizer.sections import SectionOutline, build_section_tree
+from summarizer.segmentation import SegmentationConfig, detect_markdown_headings
 from summarizer.tokenization import TokenCounter, resolve_token_counter
 from summarizer.verification import VerificationConfig
 
@@ -38,6 +39,13 @@ class ParsedConfig:
     strategy: StrategyConfig
     pipeline: PipelineConfig
     dry_run: bool = False
+    preserve_sections: bool = False
+
+
+NO_HEADINGS_NOTICE = (
+    "This document has no headings, so it was summarized without preserving sections."
+)
+
 
 def build_provider(
     config: AppConfig,
@@ -69,6 +77,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--preserve-sections", action="store_true")
     parser.add_argument("--target-words", type=int, default=300)
     parser.add_argument(
         "--chunk-tokens",
@@ -234,6 +243,7 @@ def parse_args(argv: list[str] | None = None) -> ParsedConfig:
             strategy=strategy,
             pipeline=pipeline,
             dry_run=args.dry_run,
+            preserve_sections=args.preserve_sections,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -257,6 +267,15 @@ def main(
     try:
         document = read_source(config.app.input_path)
         counter = counter_factory(config.app)
+        pipeline_config = config.pipeline
+        outline: SectionOutline | None = None
+        if config.preserve_sections:
+            headings = tuple(detect_markdown_headings(document.text))
+            if headings:
+                outline = SectionOutline(headings=headings)
+                pipeline_config = replace(pipeline_config, sections=outline)
+            else:
+                print(NO_HEADINGS_NOTICE, file=sys.stderr)
         if config.dry_run:
             report = select_strategy(
                 document,
@@ -266,6 +285,13 @@ def main(
                 config=config.strategy,
             )
             _report_dry_run(report)
+            if outline is not None:
+                tree = build_section_tree(
+                    document.text,
+                    outline.headings,
+                    target_words=config.pipeline.target_words,
+                )
+                print(f"Sections: {len(tree.nodes)}")
             return 0
         raw_provider = provider_factory(config.app)
         strategy = config.strategy
@@ -284,7 +310,7 @@ def main(
             counter,
             app=config.app,
             strategy=strategy,
-            config=config.pipeline,
+            config=pipeline_config,
         )
         # Reliable mode publishes the summary and audit together inside the
         # pipeline. The ordinary audit remains an independent atomic file.

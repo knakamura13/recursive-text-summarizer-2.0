@@ -121,7 +121,10 @@ Run `python main.py --help` for parser-generated help. The complete options are:
 | `--run-id ID`                           | unset                    | Stable identifier required when cache is enabled.                                                                                      |
 | `--resume`                              | off                      | Resume the manifest named by `--run-id`; requires `--cache-dir` and `--run-id`.                                                        |
 | `--max-concurrency N`                   | `1`                      | Maximum in-flight leaf/merge calls; values above `1` require `--cache-dir`; output order remains deterministic.                        |
+| `--preserve-sections`                   | off                      | Summarize Markdown by heading, one section at a time. Without headings, runs as without the flag and prints a notice.                  |
 | `--dry-run`                             | off                      | Report budget/strategy without provider construction or final-output writes.                                                           |
+
+`--preserve-sections` takes the outline from the Markdown headings in the source (`#` through `######`) and summarizes each section from its own text; the final summary is still one text. If the source has no headings, the run is identical to one without the flag and stderr says `This document has no headings, so it was summarized without preserving sections.` With `--dry-run`, the report adds a `Sections: N` line giving the section count at the requested `--target-words`.
 
 `--chunk-size` and `--max-chunks` are removed. They are not aliases: the pipeline no longer exposes the old character-chunk and prefix-truncation controls.
 
