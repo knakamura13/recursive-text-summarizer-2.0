@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from threading import Lock
@@ -28,9 +28,14 @@ from summarizer.finalization import (
     publish_final_output,
 )
 from summarizer.editorial import plan_editorial_request
-from summarizer.hierarchy import TreeNode, build_hierarchy, plan_merge_request
+from summarizer.hierarchy import (
+    TreeNode,
+    build_hierarchy,
+    build_section_hierarchy,
+    plan_merge_request,
+)
 from summarizer.ingestion import SourceDocument
-from summarizer.leaf import summarize_segments
+from summarizer.leaf import measure_heading_overhead, summarize_segments
 from summarizer.providers.base import (
     GenerationRequest,
     GenerationResult,
@@ -39,6 +44,12 @@ from summarizer.providers.base import (
     ProviderRetriesExhaustedError,
 )
 from summarizer.reliability import ReliabilityTracker
+from summarizer.sections import (
+    SectionOutline,
+    SectionTree,
+    build_section_tree,
+    own_text_spans,
+)
 from summarizer.segmentation import (
     CacheCoordinator,
     SegmentationConfig,
@@ -68,6 +79,11 @@ class PipelineConfig:
     verification_runtime: VerificationRuntime | None = None
     cache: CacheConfig = field(default_factory=CacheConfig)
     reliability: ReliabilityConfig = field(default_factory=ReliabilityConfig)
+    # The outline for section mode; None leaves the mode off. With it, each
+    # section is segmented and reduced on its own and no merge crosses a
+    # section boundary. A section mode run never takes the direct path, even
+    # for a document that fits one request: every section needs its own node.
+    sections: SectionOutline | None = None
 
     def __post_init__(self) -> None:
         if self.target_words <= 0:
@@ -82,6 +98,12 @@ class PipelineResult:
     strategy: BudgetReport
     root: TreeNode
     nodes: tuple[TreeNode, ...]
+    # Section mode only. `sections` is the tree the run summarized by, and
+    # `section_nodes` maps a section id to the id of the node that summarizes
+    # it. A section with no text and no summarized child has no entry.
+    # `TreeNode.section_id` gives the reverse mapping.
+    sections: SectionTree | None = None
+    section_nodes: Mapping[str, str] = field(default_factory=dict)
 
 
 _DEFAULT_PIPELINE_CONFIG = PipelineConfig()
@@ -284,6 +306,7 @@ def run_pipeline(
         StageEvent(StageName.PREPARING, "completed", detail=report.strategy)
     )
     runtime_observer.raise_if_stopped("before pipeline execution")
+    section_tree = section_tree_for(document, config)
     if not config.cache.enabled:
         return _run_pipeline(
             document,
@@ -296,10 +319,15 @@ def run_pipeline(
             limits=limits,
             coordinator=None,
             observer=runtime_observer,
+            section_tree=section_tree,
         )
     if not config.reliability.run_id:
         raise ValueError("enabled cache requires a reliability run_id")
-    seed = ("D000001",) if report.strategy == "direct" else ("segmentation",)
+    seed = (
+        ("D000001",)
+        if report.strategy == "direct" and section_tree is None
+        else ("segmentation",)
+    )
     effective_segmentation = config.segmentation or SegmentationConfig(
         max_tokens=report.usable_input_capacity
     )
@@ -324,27 +352,34 @@ def run_pipeline(
                 "context_window_tokens": runtime.context_window_tokens,
                 "timeout_seconds": runtime.timeout_seconds,
             }
+    descriptor_fields: dict[str, object] = {
+        "app": {
+            "provider": app.provider,
+            "model": app.model,
+            "timeout_seconds": app.timeout_seconds,
+        },
+        "counter": {"identity": counter.identity, "exact": counter.exact},
+        "strategy": asdict(strategy),
+        "budget": asdict(report),
+        "segmentation": asdict(effective_segmentation),
+        "pipeline": {
+            "target_words": config.target_words,
+            "max_merge_children": config.max_merge_children,
+            "include_citations": config.include_citations,
+            "verification": asdict(config.verification),
+            "max_in_flight": config.reliability.max_in_flight,
+        },
+        "verification_runtime": verification_runtime_descriptor,
+    }
+    if section_tree is not None:
+        # Absent when the mode is off, so a run without sections keeps its key.
+        descriptor_fields["sections"] = [
+            [node.id, node.heading, node.level, node.start, node.end, node.parent_id]
+            for node in section_tree.nodes
+        ]
     descriptor = hashlib.sha256(
         json.dumps(
-            {
-                "app": {
-                    "provider": app.provider,
-                    "model": app.model,
-                    "timeout_seconds": app.timeout_seconds,
-                },
-                "counter": {"identity": counter.identity, "exact": counter.exact},
-                "strategy": asdict(strategy),
-                "budget": asdict(report),
-                "segmentation": asdict(effective_segmentation),
-                "pipeline": {
-                    "target_words": config.target_words,
-                    "max_merge_children": config.max_merge_children,
-                    "include_citations": config.include_citations,
-                    "verification": asdict(config.verification),
-                    "max_in_flight": config.reliability.max_in_flight,
-                },
-                "verification_runtime": verification_runtime_descriptor,
-            },
+            descriptor_fields,
             default=str,
             sort_keys=True,
             separators=(",", ":"),
@@ -403,7 +438,22 @@ def run_pipeline(
             limits=limits,
             coordinator=coordinator,
             observer=runtime_observer,
+            section_tree=section_tree,
         )
+
+
+def section_tree_for(
+    document: SourceDocument, config: PipelineConfig
+) -> SectionTree | None:
+    """Return the section tree section mode summarizes by, or None when it is off."""
+    if config.sections is None:
+        return None
+    return build_section_tree(
+        document.text,
+        config.sections.headings,
+        target_words=config.target_words,
+        pages=config.sections.pages,
+    )
 
 
 def _run_pipeline(
@@ -418,13 +468,24 @@ def _run_pipeline(
     limits: RequestLimits,
     coordinator: CacheCoordinator | None,
     observer: RuntimeObserver,
+    section_tree: SectionTree | None = None,
 ) -> PipelineResult:
-    """Execute direct or hierarchical stages, then final editorial writing."""
+    """Execute direct or hierarchical stages, then final editorial writing.
+
+    With a `section_tree` every section is summarized through the hierarchical
+    path, whatever the strategy report says, so the strategy recorded for the
+    run is hierarchical. The final editorial and verification then run over the
+    root as they do without sections.
+    """
     reliability_tracker = (
         coordinator.reliability_tracker if coordinator is not None else None
     )
     recording = _RecordingProvider(provider, coordinator, reliability_tracker)
-    if report.strategy == "direct":
+    section_nodes: Mapping[str, str] = {}
+    strategy_name = (
+        "hierarchical" if section_tree is not None else report.strategy
+    )
+    if strategy_name == "direct":
         observer.emit(StageEvent(StageName.SEGMENTING, "skipped"))
         segment = whole_document_segment(document, counter)
         observer.emit_segments(_segment_infos((segment,)))
@@ -460,15 +521,45 @@ def _run_pipeline(
             strategy=strategy,
             requested=config.segmentation,
         )
+        spans = None
+        leaf_headings: dict[str, str] = {}
+        if section_tree is not None:
+            own = own_text_spans(document.text, section_tree)
+            spans = tuple((start, end) for _, start, end in own)
+            if any(
+                section_tree.get(section_id).heading is not None
+                for section_id, _, _ in own
+            ) and segmentation.max_tokens + measure_heading_overhead(
+                counter
+            ) > _hierarchical_capacity(report, counter, app, strategy, segmentation):
+                raise BudgetError(
+                    "segmentation max_tokens leaves no room for a section heading "
+                    "in a leaf request"
+                )
         segments = tuple(
             cached_segment_document(
-                document, counter, segmentation, coordinator=coordinator
+                document, counter, segmentation, coordinator=coordinator, spans=spans
             )
         )
+        leaf_sections: list[str] = []
+        if section_tree is not None:
+            for segment in segments:
+                section_id = next(
+                    id_
+                    for id_, start, end in own
+                    if start <= segment.core_start < end
+                )
+                leaf_sections.append(section_id)
+                heading = section_tree.get(section_id).heading
+                if heading is not None:
+                    leaf_headings[segment.segment_id] = heading
         if len(segments) > 1:
             # Refuse a merge budget with no input room before any leaf call.
             plan_merge_request(
-                limits, level=1, provider_schema_reserve=_provider_schema_reserve(app)
+                limits,
+                level=1,
+                provider_schema_reserve=_provider_schema_reserve(app),
+                section_headings=section_tree is not None,
             )
         observer.emit_segments(_segment_infos(segments))
         observer.emit(
@@ -495,6 +586,7 @@ def _run_pipeline(
             max_output_tokens=strategy.max_output_tokens,
             coordinator=coordinator,
             observer=observer,
+            section_headings=leaf_headings or None,
         )
         observer.emit(
             StageEvent(
@@ -509,10 +601,7 @@ def _run_pipeline(
             observer.emit(StageEvent(StageName.MERGING, "active"))
         else:
             observer.emit(StageEvent(StageName.MERGING, "skipped"))
-        root, nodes, _ = build_hierarchy(
-            leaves,
-            recording,
-            counter,
+        hierarchy_arguments = dict(
             source_id=document.source_id,
             covered=[(segment.segment_id,) for segment in segments],
             attributable={
@@ -527,6 +616,21 @@ def _run_pipeline(
             provider_schema_reserve=_provider_schema_reserve(app),
             observer=observer,
         )
+        if section_tree is None:
+            root, nodes, _ = build_hierarchy(
+                leaves, recording, counter, **hierarchy_arguments
+            )
+        else:
+            by_section = build_section_hierarchy(
+                leaves,
+                recording,
+                counter,
+                tree=section_tree,
+                leaf_sections=leaf_sections,
+                **hierarchy_arguments,
+            )
+            root, nodes = by_section.root, by_section.nodes
+            section_nodes = by_section.section_nodes
         if len(leaves) > 1:
             merged = sum(1 for node in nodes if node.level > 0)
             observer.emit(
@@ -580,7 +684,7 @@ def _run_pipeline(
         model=app.model,
         timeout_seconds=app.timeout_seconds,
         target_words=config.target_words,
-        strategy=report.strategy,
+        strategy=strategy_name,
         segments=segments,
         nodes=nodes,
         root_node_id=root.node_id,
@@ -630,4 +734,11 @@ def _run_pipeline(
             session=coordinator.session,
         )
     observer.emit(StageEvent(StageName.PUBLISHING, "completed"))
-    return PipelineResult(final=final, strategy=report, root=root, nodes=nodes)
+    return PipelineResult(
+        final=final,
+        strategy=report,
+        root=root,
+        nodes=nodes,
+        sections=section_tree,
+        section_nodes=section_nodes,
+    )

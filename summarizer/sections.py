@@ -54,6 +54,14 @@ class PageExtent(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class SectionOutline:
+    """What a run needs to summarize by section: the outline, and page extents if known."""
+
+    headings: tuple[HeadingLike, ...]
+    pages: tuple[PageExtent, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SectionNode:
     """One section. `text[start:end]` is its own text, excluding its children.
 
@@ -177,6 +185,45 @@ def build_section_tree(
 
     _fold(roots, total, target_words)
     return _freeze(roots, pages)
+
+
+def _letters(value: str) -> str:
+    return "".join(char for char in value.casefold() if char.isalnum())
+
+
+def _has_body(text: str, node: SectionNode) -> bool:
+    """Whether a section's own span holds anything besides its heading lines.
+
+    Compared on letters and digits only, so heading markup (`#`, underlines,
+    numbering punctuation) does not count as text.
+    """
+    remaining = _letters(text[node.start : node.end])
+    headings = ([node.heading] if node.heading else []) + list(node.folded_headings)
+    for heading in headings:
+        remaining = remaining.replace(_letters(heading), "", 1)
+    return bool(remaining)
+
+
+def own_text_spans(text: str, tree: SectionTree) -> tuple[tuple[str, int, int], ...]:
+    """Return `(section id, start, end)` for each section with text of its own.
+
+    A section whose own span is only its heading (a parent that goes straight
+    to its subsections) has nothing to segment or summarize. If no section has
+    any text beyond headings, every non-blank own span counts, so the run still
+    has something to summarize.
+    """
+    spans = tuple(
+        (node.id, node.start, node.end)
+        for node in tree.nodes
+        if _has_body(text, node)
+    )
+    if spans:
+        return spans
+    return tuple(
+        (node.id, node.start, node.end)
+        for node in tree.nodes
+        if text[node.start : node.end].strip()
+    )
 
 
 def _siblings(draft: _Draft, roots: list[_Draft]) -> list[_Draft]:
