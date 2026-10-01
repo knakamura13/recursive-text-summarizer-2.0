@@ -503,10 +503,30 @@ class RemovedSentence(ApiModel):
     reason: str | None = None
 
 
+class SummaryHeading(ApiModel):
+    """One heading line of a section mode summary, in reading order.
+
+    `level` is the Markdown level of the line (1-6) and `text` the outline
+    heading after its marks. `before_sentence` is the position in `sentences`
+    of the first sentence after the line, or the sentence count when none
+    follows, so a heading with no prose under it keeps its place.
+    """
+
+    section_id: str
+    level: int
+    text: str
+    before_sentence: int
+
+
 class FinalSummaryResponse(ApiModel):
+    """The published summary. `text` is the published text as written, heading
+    lines included. `headings` is empty for a summary written whole, and
+    `word_count` leaves heading lines out."""
+
     available: bool
     text: str | None = None
     sentences: list[SummarySentence] = Field(default_factory=list)
+    headings: list[SummaryHeading] = Field(default_factory=list)
     removed_sentences: list[RemovedSentence] = Field(default_factory=list)
     citations: list[SummaryCitation] = Field(default_factory=list)
     word_count: int | None = None

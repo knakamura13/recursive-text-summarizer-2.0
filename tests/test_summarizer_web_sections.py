@@ -1,4 +1,4 @@
-"""Section mode through the web worker: toggle, section nodes, audit records, notices (#170)."""
+"""Section mode through the web worker: toggle, section nodes, audit records, notices (#170), summary headings (#179)."""
 
 from __future__ import annotations
 
@@ -118,8 +118,27 @@ def test_a_document_with_headings_yields_section_nodes_publications_and_audit_re
     assert (beta["publication_page_start"], beta["publication_page_end"]) == (3, 4)
     assert published["Gamma"]["status"] == "empty" and published["Gamma"]["reason"]
     assert published["Alpha"]["child_section_ids"] == [published["Alpha one"]["section_id"]]
-    # The run's final summary is unchanged by the mode.
-    assert client.get(f"/api/v1/runs/{run_id}/summary").json()["available"] is True
+    # The final summary is the sections' prose under their headings, in reading order.
+    summary = client.get(f"/api/v1/runs/{run_id}/summary").json()
+    assert summary["text"] == (
+        "# Alpha\n\nThe zebra did something.\n\n## Alpha one\n\nThe otter did something.\n\n"
+        "# Beta\n\nThe heron did something.\n\n# Gamma"
+    )
+    assert [(item["level"], item["text"], item["before_sentence"]) for item in summary["headings"]] == [
+        (1, "Alpha", 0),
+        (2, "Alpha one", 1),
+        (1, "Beta", 2),
+        (1, "Gamma", 3),
+    ]
+    assert [item["section_id"] for item in summary["headings"]] == [
+        records[heading]["section_id"] for heading in ("Alpha", "Alpha one", "Beta", "Gamma")
+    ]
+    assert [item["text"] for item in summary["sentences"]] == [
+        "The zebra did something.",
+        "The otter did something.",
+        "The heron did something.",
+    ]
+    assert summary["word_count"] == 12
 
 
 def test_the_audit_holds_headings_and_prose_it_wrote_but_never_source_prose(
@@ -167,6 +186,8 @@ def test_mode_off_leaves_the_audit_and_notices_as_before(client: TestClient) -> 
     nodes = client.get(f"/api/v1/runs/{run_id}/tree").json()["nodes"]
     assert all(node["section"] is None for node in nodes)
     assert client.get(f"/api/v1/runs/{run_id}/sections").json()["available"] is False
+    summary = client.get(f"/api/v1/runs/{run_id}/summary").json()
+    assert summary["headings"] == [] and summary["word_count"] == len(summary["text"].split())
     assert RunConfig().preserve_sections is False
 
 

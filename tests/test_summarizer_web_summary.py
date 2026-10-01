@@ -1,4 +1,4 @@
-"""GET /runs/{id}/summary: sentences, evidence, removed sentences, notices, and legacy Runs."""
+"""GET /runs/{id}/summary: sentences, headings, evidence, removed sentences, notices, and legacy Runs."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from tests.support.web_views import (
     SeededDocument,
     audit_segment,
     paged_text,
+    sectioned_publication,
     seed_document,
     seed_run,
     seed_segments,
@@ -27,6 +28,12 @@ PAGES = (
     "Cracks appeared in the north pier. Repairs began in 2001 and finished in 2003.",
 )
 PUBLISHED = "The deck spans 200 feet. Engineers inspected it in 1998.\n\nRepairs finished in 2003."
+# Piers has no own text, so its heading stands alone above its subsection's,
+# and Costs published nothing, so its heading ends the text.
+SECTIONED = (
+    "# Deck and roadway\n\nThe deck spans 200 feet. Engineers inspected it in 1998.\n\n"
+    "# Piers\n\n## North pier\n\nRepairs finished in 2003.\n\n# Costs and funding"
+)
 
 
 @pytest.fixture()
@@ -179,6 +186,7 @@ def test_verified_subset_summary_maps_sentences_to_evidence_and_explains_removal
         ("2", "S000002", 2),
     ]
     assert summary["word_count"] == 14
+    assert summary["headings"] == []
     assert (summary["target_words"], summary["short_of_target"]) == (40, True)
     codes = [notice["code"] for notice in summary["notices"]]
     assert codes == [
@@ -194,6 +202,34 @@ def test_verified_subset_summary_maps_sentences_to_evidence_and_explains_removal
     assert notices["verified_sentence_subset"]["severity"] == "warning"
     for notice in summary["notices"]:
         assert notice["message"].strip() and notice["message"] != notice["code"]
+
+
+def test_a_summary_assembled_by_section_places_each_heading_above_its_sentences(
+    client: TestClient, document: SeededDocument
+) -> None:
+    publication = sectioned_publication(_subset_publication(document), SECTIONED)
+    audit = _direct_audit(document, publication=publication, warnings=["verified_sentence_subset"])
+    seed_run(
+        document,
+        config=RunConfig(model="llama3.2:3b", target_words=25),
+        summary=SECTIONED + "\n\nSources: S000001, S000002",
+        audit=audit,
+    )
+
+    summary = client.get("/api/v1/runs/run-1/summary").json()
+
+    assert summary["text"] == SECTIONED
+    assert summary["headings"] == [
+        {"section_id": "s1", "level": 1, "text": "Deck and roadway", "before_sentence": 0},
+        {"section_id": "s2", "level": 1, "text": "Piers", "before_sentence": 2},
+        {"section_id": "s3", "level": 2, "text": "North pier", "before_sentence": 2},
+        {"section_id": "s4", "level": 1, "text": "Costs and funding", "before_sentence": 3},
+    ]
+    assert [(item["index"], item["paragraph"]) for item in summary["sentences"]] == [(0, 1), (1, 1), (2, 4)]
+    # The text has 27 words, 13 of them in heading lines, which count toward no target.
+    assert (summary["word_count"], summary["short_of_target"]) == (14, True)
+    [short] = [notice for notice in summary["notices"] if notice["code"] == "short_of_target"]
+    assert "14" in short["message"] and "25" in short["message"]
 
 
 def test_content_unit_fallback_is_named_with_its_shortfall(
@@ -339,6 +375,7 @@ def test_legacy_audit_rebuilds_sentences_from_the_last_verification_pass(
         ("S000001", False, 1),
     ]
     assert (last[0]["start"], last[0]["end"]) == _page_body(document, 2)
+    assert summary["headings"] == []
 
 
 def test_runs_without_an_audit_still_show_their_text_and_sources(

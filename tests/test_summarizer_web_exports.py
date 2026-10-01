@@ -14,6 +14,7 @@ from tests.support.web_views import (
     SeededDocument,
     audit_segment,
     paged_text,
+    sectioned_publication,
     seed_document,
     seed_run,
     web_client,
@@ -134,6 +135,31 @@ def test_md_export_without_sentence_evidence_lists_the_sources(client: TestClien
 
     assert "[^" not in text
     assert text.rstrip().endswith("Sources:\n\n- p. 1\n- p. 2")
+
+
+def test_md_export_keeps_the_headings_of_a_summary_assembled_by_section(client: TestClient) -> None:
+    document = _document()
+    audit = _audit(document)
+    text = (
+        "# Deck\n\nThe deck spans 200 feet. It was inspected in 1998.\n\n"
+        "# Piers\n\n## North pier\n\nThe pier cracked.\n\n###### Pier caps"
+    )
+    sectioned_publication(audit["publication"], text)
+    seed_run(document, summary=text + "\n\nSources: S000001, S000002", audit=audit)
+
+    markdown = client.get("/api/v1/runs/run-1/export/md").text
+
+    # Each heading moves one level under the export's title, up to Markdown's six.
+    assert markdown.startswith(
+        "# Bridge Report\n\n"
+        "## Deck\n\n"
+        "The deck spans 200 feet.[^1] It was inspected in 1998.[^1][^2]\n\n"
+        "## Piers\n\n"
+        "### North pier\n\n"
+        "The pier cracked.[^3]\n\n"
+        "###### Pier caps\n\n"
+        "[^1]: p. 1"
+    )
 
 
 def test_json_export_is_the_audit(client: TestClient) -> None:

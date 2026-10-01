@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -287,3 +288,25 @@ def audit_segment(segment_id: str, order: int, start: int, end: int, source_id: 
         "trailing_overlap_tokens": 0,
         "boundary_kind": "paragraph",
     }
+
+
+def sectioned_publication(publication: dict, text: str) -> dict:
+    """`publication` assembled by section into `text`, placed as finalization places it.
+
+    Each sentence takes its offsets and paragraph in `text`, and each `#` line
+    becomes the heading line of section s1, s2, ... in order.
+    """
+    for sentence in publication["sentences"]:
+        start = text.index(sentence["text"])
+        sentence.update(start=start, end=start + len(sentence["text"]), paragraph=text.count("\n\n", 0, start))
+    publication["headings"] = [
+        {
+            "section_id": f"s{number}",
+            "level": len(line.group(1)),
+            "text": line.group(2),
+            "start": line.start(),
+            "end": line.end(),
+        }
+        for number, line in enumerate(re.finditer(r"^(#+) (.+)$", text, re.M), start=1)
+    ]
+    return publication

@@ -2,7 +2,7 @@
 	import EmptyState from '$lib/components/common/EmptyState.svelte';
 	import ErrorBanner from '$lib/components/common/ErrorBanner.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
-	import type { FinalSummary, Run, SummarySentence } from '$lib/api/types';
+	import type { FinalSummary, Run, SummaryHeading, SummarySentence } from '$lib/api/types';
 	import { formatCount } from '$lib/format';
 	import type { TextRange } from '$lib/source/sourceModel';
 	import { toasts } from '$lib/stores/toasts.svelte';
@@ -35,17 +35,36 @@
 	let selected = $state<number | null>(null);
 	let exportOpen = $state(false);
 
-	const paragraphs = $derived.by(() => {
-		const groups: SummarySentence[][] = [];
-		let current = -1;
-		for (const sentence of summary?.sentences ?? []) {
-			if (sentence.paragraph !== current || groups.length === 0) {
-				groups.push([]);
-				current = sentence.paragraph;
+	type Block =
+		| { kind: 'heading'; heading: SummaryHeading; tag: string }
+		| { kind: 'paragraph'; sentences: SummarySentence[] };
+
+	// The summary in reading order: heading lines between paragraphs of sentences.
+	// The view's own sections ("Sources") are h3, so the summary's top heading
+	// level renders as h3 and deeper levels nest under it, down to h6.
+	const blocks = $derived.by(() => {
+		const sentences = summary?.sentences ?? [];
+		const headings = summary?.headings ?? [];
+		const top = Math.min(...headings.map((heading) => heading.level));
+		const result: Block[] = [];
+		let next = 0;
+		const placeHeadings = (position: number) => {
+			while (next < headings.length && headings[next].before_sentence <= position) {
+				const heading = headings[next++];
+				result.push({ kind: 'heading', heading, tag: `h${Math.min(6, 3 + heading.level - top)}` });
 			}
-			groups[groups.length - 1].push(sentence);
-		}
-		return groups;
+		};
+		sentences.forEach((sentence, position) => {
+			placeHeadings(position);
+			const last = result[result.length - 1];
+			if (last?.kind === 'paragraph' && last.sentences[last.sentences.length - 1].paragraph === sentence.paragraph) {
+				last.sentences.push(sentence);
+			} else {
+				result.push({ kind: 'paragraph', sentences: [sentence] });
+			}
+		});
+		placeHeadings(Infinity);
+		return result;
 	});
 	const selectedSentence = $derived(summary?.sentences.find((sentence) => sentence.index === selected) ?? null);
 	const plainText = $derived(summary?.text ?? summary?.sentences.map((sentence) => sentence.text).join(' ') ?? '');
@@ -119,30 +138,34 @@
 		{/if}
 
 		<div class="text">
-			{#each paragraphs as paragraph, p (p)}
-				<p>
-					{#each paragraph as sentence (sentence.index)}
-						<span
-							class="sentence verdict-{sentence.verdict}"
-							class:selected={selected === sentence.index}
-							role="button"
-							tabindex="0"
-							aria-pressed={selected === sentence.index}
-							title={VERDICT[sentence.verdict]}
-							onclick={() => select(sentence)}
-							onkeydown={(event) => onSentenceKey(event, sentence)}>{sentence.text}</span
-						>{' '}
-					{/each}
-				</p>
-				{#if selectedSentence && paragraph.includes(selectedSentence)}
-					<div class="evidence-panel" aria-live="polite">
-						<p class="verdict">{VERDICT[selectedSentence.verdict]}</p>
-						{#if selectedSentence.evidence.length > 0}
-							<EvidenceList evidence={selectedSentence.evidence} {onshow} />
-						{:else}
-							<p class="muted">No evidence is recorded for this sentence.</p>
-						{/if}
-					</div>
+			{#each blocks as block, b (b)}
+				{#if block.kind === 'heading'}
+					<svelte:element this={block.tag} class="heading">{block.heading.text}</svelte:element>
+				{:else}
+					<p>
+						{#each block.sentences as sentence (sentence.index)}
+							<span
+								class="sentence verdict-{sentence.verdict}"
+								class:selected={selected === sentence.index}
+								role="button"
+								tabindex="0"
+								aria-pressed={selected === sentence.index}
+								title={VERDICT[sentence.verdict]}
+								onclick={() => select(sentence)}
+								onkeydown={(event) => onSentenceKey(event, sentence)}>{sentence.text}</span
+							>{' '}
+						{/each}
+					</p>
+					{#if selectedSentence && block.sentences.includes(selectedSentence)}
+						<div class="evidence-panel" aria-live="polite">
+							<p class="verdict">{VERDICT[selectedSentence.verdict]}</p>
+							{#if selectedSentence.evidence.length > 0}
+								<EvidenceList evidence={selectedSentence.evidence} {onshow} />
+							{:else}
+								<p class="muted">No evidence is recorded for this sentence.</p>
+							{/if}
+						</div>
+					{/if}
 				{/if}
 			{/each}
 		</div>
@@ -265,6 +288,36 @@
 		font-size: 1.1875rem;
 		line-height: 1.7;
 		color: var(--color-text);
+	}
+
+	.text .heading {
+		margin: var(--space-6) 0 var(--space-3);
+		font-family: var(--font-serif);
+		font-weight: 600;
+		line-height: 1.3;
+		letter-spacing: -0.005em;
+		color: var(--color-text);
+	}
+
+	.text .heading:first-child {
+		margin-top: 0;
+	}
+
+	.text h3.heading {
+		font-size: 1.5rem;
+	}
+
+	.text h4.heading {
+		font-size: 1.3125rem;
+	}
+
+	.text h5.heading {
+		font-size: 1.1875rem;
+	}
+
+	.text h6.heading {
+		font-size: 1.0625rem;
+		color: var(--color-text-muted);
 	}
 
 	.sentence {

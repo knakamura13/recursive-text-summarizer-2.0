@@ -84,6 +84,7 @@ export function availableSummary(overrides: Partial<FinalSummary> = {}): FinalSu
 		available: true,
 		text: 'The commission reviewed the dredging budget. A vote is expected in March.',
 		sentences: [],
+		headings: [],
 		removed_sentences: [],
 		citations: [],
 		word_count: 12,

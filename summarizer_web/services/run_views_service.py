@@ -18,9 +18,12 @@ resolved absolute range, with the rule the tree labels use.
 audit.json ``publication`` (written by summarizer/finalization.py):
 ``{kind, sentences: [{index, paragraph, start, end, text, verdict,
 evidence: [{segment_id, quote, start, end}]}], removed_sentences: [{text,
-verdict, reason}]}``. Legacy audits lack it: sentences are rebuilt from the
-text with the verifier's own splitter, and verdicts plus evidence segments
-come from the last verification pass when its spans match the published text.
+verdict, reason}]}``. A summary assembled by section adds ``headings:
+[{section_id, level, text, start, end}]``: each heading line, whose offsets
+index the published text as sentence offsets do. Legacy audits lack
+``publication``: sentences are rebuilt from the text with the verifier's own
+splitter, and verdicts plus evidence segments come from the last verification
+pass when its spans match the published text.
 """
 
 from __future__ import annotations
@@ -29,11 +32,13 @@ import hashlib
 import json
 import re
 import sqlite3
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
+from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
 from typing import Any, Literal
 
+from summarizer.audit import MAX_HEADING_LEVEL
 from summarizer.verification import split_draft_spans
 from summarizer_web.config import load_paths
 from summarizer_web.db.connection import get_database
@@ -53,6 +58,7 @@ from summarizer_web.models.api import (
     SegmentListResponse,
     SegmentRef,
     SummaryCitation,
+    SummaryHeading,
     SummarySentence,
 )
 from summarizer_web.services.documents_service import attachment_disposition, canonical_text
@@ -643,8 +649,10 @@ def _final_summary(context: _RunContext) -> FinalSummaryResponse:
     text = _SOURCES_TRAILER.sub("", raw).rstrip()
     publication = audit.get("publication") if audit else None
     publication = publication if isinstance(publication, dict) else None
+    lines = _heading_lines(publication)
     if publication is not None:
         sentences = _published_sentences(context, publication)
+        headings = _summary_headings(publication, lines)
         removed = [
             RemovedSentence(
                 text=item["text"],
@@ -656,6 +664,7 @@ def _final_summary(context: _RunContext) -> FinalSummaryResponse:
         ]
     else:
         sentences = _legacy_sentences(context, text, verification)
+        headings = []
         removed = []
 
     warnings = [code for code in (audit or {}).get("warnings") or () if isinstance(code, str)]
@@ -673,7 +682,10 @@ def _final_summary(context: _RunContext) -> FinalSummaryResponse:
     else:
         verified = _legacy_verification_state(context) == "completed"
 
-    word_count = len(text.split())
+    # Heading words count toward no target (#137), so the heading lines are left out.
+    word_count = len(text.split()) - sum(
+        len(text[line["start"] : line["end"]].split()) for line in lines
+    )
     short = target is not None and word_count < target
     notices = _audit_notices(audit)
     if short:
@@ -697,6 +709,7 @@ def _final_summary(context: _RunContext) -> FinalSummaryResponse:
         available=True,
         text=text,
         sentences=sentences,
+        headings=headings,
         removed_sentences=removed,
         citations=_citations(context, raw),
         word_count=word_count,
@@ -734,6 +747,43 @@ def _published_sentences(context: _RunContext, publication: dict[str, Any]) -> l
             )
         )
     return sentences
+
+
+def _heading_lines(publication: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The heading line records of a summary assembled by section; none for one written whole."""
+    return [
+        item
+        for item in _dicts((publication or {}).get("headings"))
+        if isinstance(item.get("section_id"), str)
+        and type(item.get("level")) is int
+        and isinstance(item.get("text"), str)
+        and type(item.get("start")) is int
+        and type(item.get("end")) is int
+    ]
+
+
+def _summary_headings(
+    publication: dict[str, Any], lines: list[dict[str, Any]]
+) -> list[SummaryHeading]:
+    """Each heading line, placed before the first published sentence after it.
+
+    Sentences are ordered and never overlap a heading line, so the sentences
+    that start before a line are exactly those above it.
+    """
+    starts = [
+        item["start"]
+        for item in _dicts(publication.get("sentences"))
+        if isinstance(item.get("text"), str) and type(item.get("start")) is int
+    ]
+    return [
+        SummaryHeading(
+            section_id=line["section_id"],
+            level=line["level"],
+            text=line["text"],
+            before_sentence=bisect_left(starts, line["start"]),
+        )
+        for line in lines
+    ]
 
 
 def _legacy_sentences(
@@ -874,21 +924,23 @@ def _legacy_verification_state(context: _RunContext) -> str:
 
 def _markdown(title: str, summary: FinalSummaryResponse) -> str:
     footnotes: dict[tuple[object, ...], tuple[int, str]] = {}
-    paragraphs: dict[int, list[str]] = {}
-    for sentence in summary.sentences:
-        markers = []
-        for evidence in sentence.evidence:
-            key = (evidence.segment_id, evidence.start, evidence.end, evidence.quote)
-            if key not in footnotes:
-                footnotes[key] = (len(footnotes) + 1, _footnote_text(evidence))
-            markers.append(f"[^{footnotes[key][0]}]")
-        text = " ".join(sentence.text.split())
-        paragraphs.setdefault(sentence.paragraph, []).append(text + "".join(markers))
-    body = (
-        "\n\n".join(" ".join(parts) for _, parts in sorted(paragraphs.items()))
-        if paragraphs
-        else summary.text or ""
-    )
+    blocks: list[str] = []
+    for block in _reading_order(summary):
+        if isinstance(block, SummaryHeading):
+            # One level under the export's own title line.
+            blocks.append(f"{'#' * min(block.level + 1, MAX_HEADING_LEVEL)} {block.text}")
+            continue
+        parts = []
+        for sentence in block:
+            markers = []
+            for evidence in sentence.evidence:
+                key = (evidence.segment_id, evidence.start, evidence.end, evidence.quote)
+                if key not in footnotes:
+                    footnotes[key] = (len(footnotes) + 1, _footnote_text(evidence))
+                markers.append(f"[^{footnotes[key][0]}]")
+            parts.append(" ".join(sentence.text.split()) + "".join(markers))
+        blocks.append(" ".join(parts))
+    body = "\n\n".join(blocks) if blocks else summary.text or ""
     lines = [f"# {title.strip()}", "", body]
     if footnotes:
         lines.append("")
@@ -900,6 +952,29 @@ def _markdown(title: str, summary: FinalSummaryResponse) -> str:
             for citation in summary.citations
         )
     return "\n".join(lines) + "\n"
+
+
+def _reading_order(
+    summary: FinalSummaryResponse,
+) -> Iterator[SummaryHeading | list[SummarySentence]]:
+    """The summary as it is read: each heading line, and each paragraph's sentences."""
+    headings = iter(summary.headings)
+    heading = next(headings, None)
+    paragraph: list[SummarySentence] = []
+    for position, sentence in enumerate(summary.sentences):
+        due = heading is not None and heading.before_sentence <= position
+        if paragraph and (due or sentence.paragraph != paragraph[-1].paragraph):
+            yield paragraph
+            paragraph = []
+        while heading is not None and heading.before_sentence <= position:
+            yield heading
+            heading = next(headings, None)
+        paragraph.append(sentence)
+    if paragraph:
+        yield paragraph
+    if heading is not None:
+        yield heading
+        yield from headings
 
 
 def _footnote_text(evidence: EvidenceRef) -> str:
