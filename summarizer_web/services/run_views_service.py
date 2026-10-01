@@ -569,7 +569,7 @@ def _run_section(context: _RunContext, record: dict[str, Any]) -> RunSection:
         child_section_ids=strings(record.get("child_ids")),
         folded_headings=strings(record.get("folded_headings")),
         node_id=record["node_id"] if isinstance(record.get("node_id"), str) else None,
-        status=status if status in ("verified", "unverified", "empty") else None,
+        status=status if status in ("verified", "unverified", "empty", "heading_only") else None,
         reason=publication["reason"] if isinstance(publication.get("reason"), str) else None,
         text="\n\n".join(" ".join(parts) for _, parts in sorted(paragraphs.items()))
         if paragraphs

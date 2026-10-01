@@ -523,12 +523,15 @@ class FinalSummaryResponse(ApiModel):
 class RunSection(ApiModel):
     """One section of a section mode Run, with the prose written for it.
 
-    `status` is null for a section with no text and no summarized subsection
-    (no node, no prose). `verified` prose passed verification against this
-    section's source only; `unverified` is the written draft with verification
-    off; `empty` published nothing, and `reason` says why. Pages of the
-    section are its own text; `publication_page_*` span its whole subtree,
-    which is what the prose is checked against.
+    `status` is null for a section with no prose record. The prose is written
+    from the section's own text only, not its subsections. `verified` prose
+    passed verification against this section's own source only; `unverified`
+    is the written draft with verification off; `empty` published nothing, and
+    `reason` says why; `heading_only` means the section has no own text, or too
+    little for one sentence of the target, so its heading stands alone and no
+    model was called (`reason` says so). Pages of the section are its own text,
+    and `publication_page_*` are the same span, the one the prose is checked
+    against.
     """
 
     section_id: str
@@ -540,7 +543,7 @@ class RunSection(ApiModel):
     child_section_ids: list[str] = Field(default_factory=list)
     folded_headings: list[str] = Field(default_factory=list)
     node_id: str | None = None
-    status: Literal["verified", "unverified", "empty"] | None = None
+    status: Literal["verified", "unverified", "empty", "heading_only"] | None = None
     reason: str | None = None
     text: str | None = None
     sentences: list[SummarySentence] = Field(default_factory=list)

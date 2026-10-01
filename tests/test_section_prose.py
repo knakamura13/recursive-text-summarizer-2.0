@@ -228,18 +228,29 @@ def test_a_claim_only_another_sections_source_supports_is_not_supported() -> Non
         assert shown and shown <= set(publication.segment_ids)
 
 
-def test_a_parent_section_is_verified_against_its_whole_subtree() -> None:
-    result, _ = run()
+def test_a_parent_and_its_child_get_disjoint_prose_from_their_own_text() -> None:
+    result, provider = run()
     ids = by_heading(result)
     alpha = result.section_publications[ids["Alpha"]]
     child = result.section_publications[ids["Alpha one"]]
 
-    assert set(child.segment_ids) < set(alpha.segment_ids)
-    # The parent keeps the otter sentence its subsection's source supports and
-    # drops the heron sentence, which only Beta's source supports.
-    assert alpha.text == "The zebra did something. The otter did something."
-    assert [r.text for r in alpha.removed_sentences] == ["The heron did something."]
+    assert alpha.segment_ids and child.segment_ids
+    assert not set(alpha.segment_ids) & set(child.segment_ids)
+    # The parent's evidence holds none of its subsection's segments, so the
+    # otter sentence its subsection's source supports is not supported here,
+    # and nor is the heron sentence that only Beta's source supports.
+    assert provider.evidence[f"Q{ids['Alpha']}-editorial"] <= set(alpha.segment_ids)
+    assert alpha.text == "The zebra did something."
+    assert [r.text for r in alpha.removed_sentences] == [
+        "The otter did something.",
+        "The heron did something.",
+    ]
     assert child.text == "The otter did something."
+    assert {c.segment_id for c in alpha.citations} <= set(alpha.segment_ids)
+    assert {c.segment_id for c in child.citations} <= set(child.segment_ids)
+    # Pages are the own span's: the parent ends before its child begins.
+    assert alpha.page_end <= child.page_start
+    assert alpha.page_start < child.page_end
 
 
 def test_citations_stay_in_the_sections_segments_and_pages() -> None:
@@ -289,23 +300,64 @@ def test_the_runs_final_summary_stays_the_root_editorial() -> None:
     assert sum(r.operation_id == "editorial-final" for r in provider.requests) == 1
 
 
-def test_targets_split_the_target_by_subtree_share_with_a_floor() -> None:
-    text = "# A\n\n" + "a" * 750 + "\n\n# B\n\n" + "b" * 240 + "\n\n"
+def test_targets_split_the_target_by_own_word_share_without_heading_words() -> None:
+    text = "# A long heading of seven words here\n\n" + "a " * 74 + "\n\n# B\n\n" + "b " * 24 + "\n\n"
     document = ingest_text(text)
     tree = build_section_tree(document.text, detect_markdown_headings(document.text), target_words=10_000)
     a, b = tree.nodes
 
-    big, small = tree.target_words(a.id, 60), tree.target_words(b.id, 60)
-    assert big == round(60 * (a.end - a.start) / len(document.text))
-    assert small == SENTENCE_WORDS  # the share is under a sentence
-    assert tree.target_words(a.id, 1000) + tree.target_words(b.id, 1000) == 1000
+    assert (a.own_words, b.own_words) == (74, 24)
+    assert tree.target_words(a.id, 98) == 74
+    assert tree.target_words(b.id, 98) == 24
+    assert tree.target_words(a.id, 49) == 37
+    assert tree.target_words(b.id, 49) == SENTENCE_WORDS  # the share, 12, is under a sentence
+    assert tree.is_heading_only(b.id, 49) and not tree.is_heading_only(a.id, 49)
 
-    parent_tree = build_section_tree(
-        TEXT, detect_markdown_headings(TEXT), target_words=10_000
-    )
-    alpha = parent_tree.nodes[0]
-    subtree_chars = sum(n.end - n.start for n in parent_tree.subtree(alpha.id))
-    assert parent_tree.target_words(alpha.id, 400) == round(400 * subtree_chars / len(TEXT))
+    nested = build_section_tree(TEXT, detect_markdown_headings(TEXT), target_words=10_000)
+    alpha, child = nested.nodes[0], nested.nodes[1]
+    # The parent's share is its own text, not its subtree's.
+    assert alpha.own_words == child.own_words == 8 * 6
+    assert nested.target_words(alpha.id, 192) == 48
+    assert nested.target_words(child.id, 96) == 24
+
+
+def test_a_parent_with_no_text_of_its_own_publishes_its_heading_without_a_model_call() -> None:
+    text = "# Parent\n\n## Child\n\n" + body("zebra", 8) + "# Other\n\n" + body("heron", 8)
+    result, provider = run(text, drafts={"Child": "The zebra did something.", "Other": "The heron did something."})
+    ids = by_heading(result)
+    parent = result.section_publications[ids["Parent"]]
+
+    assert parent.status == "heading_only"
+    assert parent.text == "" and parent.sentences == () and parent.citations == ()
+    assert parent.words == 0 and parent.reason
+    assert not any((r.operation_id or "").startswith(f"Q{ids['Parent']}-") for r in provider.requests)
+    assert result.section_publications[ids["Child"]].status == "verified"
+
+
+def test_a_section_under_one_sentence_of_the_target_publishes_its_heading_only() -> None:
+    text = "# Big\n\n" + body("zebra", 8) + "# Tiny\n\n" + "A heron " + "w" * 300 + ".\n\n"
+    result, provider = run(text, target_words=50)
+    ids = by_heading(result)
+    tiny = result.section_publications[ids["Tiny"]]
+
+    assert tiny.status == "heading_only"
+    assert not any((r.operation_id or "").startswith(f"Q{ids['Tiny']}-") for r in provider.requests)
+    assert result.section_publications[ids["Big"]].status == "verified"
+
+
+def test_verification_requests_do_not_grow_with_depth() -> None:
+    def chain(depth: int) -> str:
+        words = ("zebra", "otter", "heron", "unicorn")
+        return "".join(f"{'#' * (n + 1)} H{n}\n\n" + body(words[n], 8) for n in range(depth))
+
+    def verification_requests(depth: int) -> int:
+        _, provider = run(chain(depth), drafts={}, target_words=400)
+        return sum((r.operation_id or "").startswith("verification-") for r in provider.requests)
+
+    counts = [verification_requests(depth) for depth in (2, 3, 4)]
+    # Each section is verified once against its own text; a deeper outline
+    # adds one section's worth of requests per level, not a subtree's worth.
+    assert counts[1] - counts[0] == counts[2] - counts[1]
 
 
 def test_each_section_is_written_to_its_own_target() -> None:
@@ -410,6 +462,43 @@ def test_work_ids_are_stable_collision_free_and_resume_reuses_section_work(tmp_p
     other = json.loads((tmp_path / "other-cache" / "runs" / "section-prose.json").read_text())
     assert other["work_ids"] == work_ids
     assert first_provider.requests
+
+
+def test_own_text_reductions_have_section_scoped_ids_and_resume_reuses_them(tmp_path) -> None:
+    # Alpha's own text spans several leaves and it has a subsection, so its
+    # prose needs a reduction of its own leaves apart from the subtree's.
+    text = (
+        "# Alpha\n\n" + body("zebra", 24) + "## Alpha one\n\n" + body("otter", 8)
+        + "# Beta\n\n" + body("heron", 8)
+    )
+    cache = CacheConfig(enabled=True, root=tmp_path / "cache")
+
+    def go(provider: SectionProvider, mode: str):
+        return run(
+            text,
+            provider=provider,
+            cache=cache,
+            reliability=ReliabilityConfig(run_id="own-text", run_mode=mode),
+        )
+
+    first, _ = go(SectionProvider(DRAFTS), "new")
+    ids = by_heading(first)
+    manifest = tmp_path / "cache" / "runs" / "own-text.json"
+    work_ids = json.loads(manifest.read_text())["work_ids"]
+    own = [i for i in work_ids if re.fullmatch(rf"Q{ids['Alpha']}-L\d+N\d{{4}}", i)]
+    assert own and len(set(work_ids)) == len(work_ids)
+    # Only Alpha has both several own leaves and a subsection.
+    assert [i for i in work_ids if re.fullmatch(r"Qs\d+-L\d+N\d{4}", i)] == own
+    alpha = first.section_publications[ids["Alpha"]]
+    assert alpha.node_id == own[-1]
+    assert not {i for i in own} & {node.node_id for node in first.nodes}
+    assert alpha.node_id != first.section_nodes[ids["Alpha"]]
+
+    resumed_provider = SectionProvider(DRAFTS)
+    resumed, _ = go(resumed_provider, "resume")
+    assert not [r for r in resumed_provider.requests if (r.operation_id or "").startswith(("S", "merge"))]
+    assert json.loads(manifest.read_text())["work_ids"] == work_ids
+    assert resumed.section_publications[ids["Alpha"]].text == alpha.text
 
 
 def test_progress_reports_each_section_as_writing_and_verifying() -> None:

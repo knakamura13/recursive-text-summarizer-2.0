@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from threading import Lock
@@ -12,6 +13,7 @@ from summarizer.budget import (
     measure_request_tokens,
 )
 from summarizer.cache import CacheDescriptor
+from summarizer.editorial import section_work_id
 from summarizer.grounding import (
     GroundingPolicy,
     GroundingSelection,
@@ -39,6 +41,10 @@ from summarizer.sections import SectionTree
 from summarizer.segmentation import CacheCoordinator
 from summarizer.summaries import LEAF_SCHEMA_VERSION, SummaryNode
 from summarizer.tokenization import TokenCounter
+
+
+# An own-text reduction's node and work id: `section_work_id(section, node id)`.
+_OWN_TEXT_WORK_ID = re.compile(r"Qs[1-9][0-9]*-L\d+N\d{4}")
 
 
 class HierarchyError(ValueError):
@@ -372,8 +378,12 @@ class _Reducer:
         # Heading data for a node that finishes a section, by node id.
         self.headings: dict[str, str] = {}
         self.all_nodes: list[TreeNode] = []
+        # Nodes of own-text reductions: kept apart from the tree, which is the
+        # subtree nodes only, so a leaf never has two parents in it.
+        self.own_nodes: list[TreeNode] = []
         self.levels: list[LevelReport] = []
-        self._next_order: dict[int, int] = {}
+        # The next order per (own-text section or None, level).
+        self._next_order: dict[tuple[str | None, int], int] = {}
         self._planned_merge_ids: list[str] = []
         if coordinator is not None and coordinator.session is not None:
             plan = coordinator.session.manifest.work_ids
@@ -381,7 +391,7 @@ class _Reducer:
                 (
                     index
                     for index, work_id in enumerate(plan)
-                    if work_id.startswith("L")
+                    if work_id.startswith("L") or _OWN_TEXT_WORK_ID.fullmatch(work_id)
                 ),
                 len(plan),
             )
@@ -390,7 +400,11 @@ class _Reducer:
             self._merge_prefix = ()
 
     def reduce(
-        self, current: list[TreeNode], *, section_id: str | None = None
+        self,
+        current: list[TreeNode],
+        *,
+        section_id: str | None = None,
+        own_text: bool = False,
     ) -> TreeNode:
         """Merge `current`, in order, until one node remains, and return it.
 
@@ -398,8 +412,26 @@ class _Reducer:
         numbered by level across the run: `order` continues from the last node
         built at that level, so reductions of different sections never collide
         and a flat run keeps `L{level}N0001` onwards.
+
+        An `own_text` reduction (needs `section_id`) summarizes a section's own
+        leaves alone. Its nodes are numbered by level within the section and
+        named `Q{section}-L{level}N{order}`, so they cannot collide with the
+        tree's `L{level}N{order}`; they go to `own_nodes`, not the tree, and
+        report no progress, as no tree row exists for them.
         """
-        runtime = self.runtime
+        if own_text and section_id is None:
+            raise ValueError("an own-text reduction needs its section")
+        scope = section_id if own_text else None
+
+        def name(level: int, order: int) -> str:
+            node_id = tree_node_id(level, order)
+            return section_work_id(section_id, node_id) if own_text else node_id
+
+        runtime = (
+            replace(self.runtime, on_item=None, on_stage=None)
+            if own_text
+            else self.runtime
+        )
         counter = self.counter
         coordinator = self.coordinator
         adaptive_grounding = self.adaptive_grounding
@@ -416,7 +448,7 @@ class _Reducer:
             )
             pool = [_aligned(node, level - 1) for node in current]
             headings = [self.headings.get(node.node_id) for node in current]
-            base = self._next_order.get(level, 0)
+            base = self._next_order.get((scope, level), 0)
             # An adaptive default has no fixed source reserve, so a fanout sized
             # purely from children can leave no room for a group's mandatory
             # source evidence. Retry with a narrower fanout when that happens;
@@ -442,7 +474,7 @@ class _Reducer:
                             # still falls because other groups merged.
                             only = members[0]
                             passthrough[position] = TreeNode(
-                                node_id=tree_node_id(level, base + position),
+                                node_id=name(level, base + position),
                                 level=level,
                                 order=base + position,
                                 # Restamped: the merged path asserts that a
@@ -464,6 +496,7 @@ class _Reducer:
                                 attributable=self.attributable,
                                 level=level,
                                 order=base + position,
+                                node_id=name(level, base + position),
                                 source_id=self.source_id,
                                 model=self.model,
                                 timeout_seconds=self.timeout_seconds,
@@ -497,7 +530,7 @@ class _Reducer:
             level_items = {
                 position: ObservedItem(
                     kind="passthrough" if position in passthrough else "merge",
-                    work_id=tree_node_id(level, base + position),
+                    work_id=name(level, base + position),
                     stage=StageName.MERGING,
                     level=level,
                     order=base + position,
@@ -600,17 +633,18 @@ class _Reducer:
                     f"produced {len(produced)} with a fanout of {fanout}"
                 )
 
-            self.levels.append(
-                LevelReport(
-                    level=level,
-                    nodes_in=len(current),
-                    nodes_out=len(produced),
-                    fanout=fanout,
-                    reason=reason,
+            if not own_text:
+                self.levels.append(
+                    LevelReport(
+                        level=level,
+                        nodes_in=len(current),
+                        nodes_out=len(produced),
+                        fanout=fanout,
+                        reason=reason,
+                    )
                 )
-            )
-            self._next_order[level] = base + len(groups)
-            self.all_nodes.extend(produced)
+            self._next_order[(scope, level)] = base + len(groups)
+            (self.own_nodes if own_text else self.all_nodes).extend(produced)
             current = produced
         return current[0]
 
@@ -698,12 +732,22 @@ class SectionHierarchy:
     only input was a single node is summarized by that node itself. Each
     `TreeNode.section_id` names the section whose reduction built the node;
     the nodes that merge top-level sections belong to none.
+
+    `own_text_nodes` maps each section id to the id of the node that
+    summarizes the section's own leaves alone, without its subsections. It is
+    the section's single own leaf, the section's node when the section has no
+    subsection to leave out, or the last node of a separate reduction of the
+    own leaves; a section with no own leaf has no entry. `own_text_reductions`
+    holds the nodes of those separate reductions, which are not in `nodes`
+    (the tree) so the tree keeps one parent per node.
     """
 
     root: TreeNode
     nodes: tuple[TreeNode, ...]
     report: HierarchyReport
     section_nodes: Mapping[str, str]
+    own_text_nodes: Mapping[str, str] = field(default_factory=dict)
+    own_text_reductions: tuple[TreeNode, ...] = ()
 
 
 def build_section_hierarchy(
@@ -733,6 +777,12 @@ def build_section_hierarchy(
     budgets and grounding as `build_hierarchy`, so a section with many inputs
     takes several levels inside the section. A section with a single input
     adds no node. The document root reduces the top-level sections' nodes.
+
+    A section's prose is written from its own text only, so a section with
+    own leaves also gets `own_text_nodes`: a lone own leaf stands for itself, a
+    section whose only inputs are its own leaves reuses its node, and
+    otherwise the own leaves are reduced on their own, under section-scoped
+    ids (`Q{section}-L{level}N{order}`). Those extra nodes stay out of the tree.
 
     `leaf_sections` gives each leaf's section id, in the order of `leaves`.
     """
@@ -769,6 +819,7 @@ def build_section_hierarchy(
         own_leaves.setdefault(node.section_id, []).append(node)
 
     section_nodes: dict[str, str] = {}
+    own_text_nodes: dict[str, str] = {}
 
     def summarize(section_id: str) -> TreeNode | None:
         section = known[section_id]
@@ -781,6 +832,15 @@ def build_section_hierarchy(
             return None
         node = reducer.reduce(inputs, section_id=section_id)
         section_nodes[section_id] = node.node_id
+        own = own_leaves.get(section_id, [])
+        if len(own) == 1:
+            own_text_nodes[section_id] = own[0].node_id
+        elif own and len(inputs) == len(own):
+            own_text_nodes[section_id] = node.node_id
+        elif own:
+            own_text_nodes[section_id] = reducer.reduce(
+                list(own), section_id=section_id, own_text=True
+            ).node_id
         # The finished section's own heading names its node from here on, even
         # when the node is the child's, which the section adopted unchanged.
         if section.heading is not None:
@@ -802,6 +862,8 @@ def build_section_hierarchy(
         nodes=tuple(reducer.all_nodes),
         report=report,
         section_nodes=section_nodes,
+        own_text_nodes=own_text_nodes,
+        own_text_reductions=tuple(reducer.own_nodes),
     )
 
 
@@ -836,6 +898,7 @@ def _prepare_merge(
     attributable: Mapping[str, str],
     level: int,
     order: int,
+    node_id: str,
     source_id: str,
     model: str,
     timeout_seconds: float,
@@ -851,7 +914,6 @@ def _prepare_merge(
     section_headings: bool = False,
     section_id: str | None = None,
 ) -> _PreparedMerge:
-    node_id = tree_node_id(level, order)
     # A union in document order: deduplicated, first occurrence wins. Three
     # documents call this a union, and a caller supplying overlapping coverage
     # would otherwise store duplicates for issue #8 to narrow.

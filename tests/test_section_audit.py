@@ -11,7 +11,7 @@ import pytest
 from summarizer.audit import AuditArtifact, AuditError, with_sections
 from summarizer.sections import SectionOutline
 from summarizer.verification import VerificationConfig
-from tests.test_section_prose import pages_of, run
+from tests.test_section_prose import body, pages_of, run
 
 
 @dataclass(frozen=True)
@@ -37,9 +37,14 @@ def test_section_mode_audit_records_each_section_with_its_publication(tmp_path: 
     assert (child["level"], child["parent_id"], child["page_start"], child["page_end"]) == (2, "s1", 1, 2)
     node_ids = {node["node_id"] for node in audit["tree_nodes"]}
     assert {record["node_id"] for record in audit["sections"]} <= node_ids
-    # A parent's own segments exclude its subsection's; its prose covers both.
+    # A parent's own segments exclude its subsection's, and so does its prose.
     assert set(child["segment_ids"]).isdisjoint(alpha["segment_ids"])
-    assert set(alpha["publication"]["segment_ids"]) == set(alpha["segment_ids"]) | set(child["segment_ids"])
+    assert alpha["publication"]["segment_ids"] == alpha["segment_ids"]
+    assert child["publication"]["segment_ids"] == child["segment_ids"]
+    assert (alpha["publication"]["page_start"], alpha["publication"]["page_end"]) == (
+        alpha["page_start"],
+        alpha["page_end"],
+    )
     beta = records["Beta"]["publication"]
     assert beta["status"] == "verified" and beta["words"] == 4
     assert [(item["text"], item["verdict"]) for item in beta["removed_sentences"]] == [
@@ -51,6 +56,17 @@ def test_section_mode_audit_records_each_section_with_its_publication(tmp_path: 
     assert empty["status"] == "empty" and empty["reason"] and empty["sentences"] == []
     # The run's own publication stays the root editorial.
     assert audit["publication"]["sentences"]
+
+
+def test_a_heading_only_section_is_recorded_with_its_status_and_reason(tmp_path: Path) -> None:
+    text = "# Parent\n\n## Child\n\n" + body("zebra", 8) + "# Other\n\n" + body("heron", 8)
+    audit = audit_of(tmp_path, text=text, drafts={})
+    parent = next(record for record in audit["sections"] if record["heading"] == "Parent")
+
+    publication = parent["publication"]
+    assert publication["status"] == "heading_only" and publication["reason"]
+    assert publication["sentences"] == [] and publication["words"] == 0
+    AuditArtifact.model_validate(audit)
 
 
 def test_section_prose_without_verification_is_recorded_unverified(tmp_path: Path) -> None:

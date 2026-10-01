@@ -68,6 +68,8 @@ class SectionNode:
     `heading` is None for the untitled opening section. Pages are 1-based and
     inclusive, and None without a page map. `folded_headings` lists the
     headings of undersized sections merged into this one, in document order.
+    `own_words` counts the words of the own text, leaving out the heading
+    lines (this section's and any folded into it).
     """
 
     id: str
@@ -80,6 +82,7 @@ class SectionNode:
     parent_id: str | None
     child_ids: tuple[str, ...]
     folded_headings: tuple[str, ...] = ()
+    own_words: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,16 +126,27 @@ class SectionTree:
         ]
         return (min(pages), max(pages)) if pages else None
 
-    def target_words(self, section_id: str, total_words: int) -> int:
-        """The section's share of `total_words`, by subtree characters, at least one sentence.
+    def own_share_words(self, section_id: str, total_words: int) -> int:
+        """The section's own text as a share of `total_words`, by words, before any minimum.
 
-        A section's prose covers its subtree, so its share is the subtree's
-        characters over all characters, the same share folding measures.
+        A section's prose covers its own text only, so the share is its own
+        words over the whole source's own words, heading lines excluded on
+        both sides. A source with no words beyond headings gives every section 0.
         """
-        total = sum(node.end - node.start for node in self.nodes)
-        own = sum(node.end - node.start for node in self.subtree(section_id))
-        share = round(total_words * own / total) if total else total_words
-        return max(SENTENCE_WORDS, share)
+        total = sum(node.own_words for node in self.nodes)
+        return round(total_words * self.get(section_id).own_words / total) if total else 0
+
+    def target_words(self, section_id: str, total_words: int) -> int:
+        """The section's share of `total_words`, by own words, at least one sentence."""
+        return max(SENTENCE_WORDS, self.own_share_words(section_id, total_words))
+
+    def is_heading_only(self, section_id: str, total_words: int) -> bool:
+        """Whether the section has no own text worth a sentence: its prose is its heading alone.
+
+        True for a section whose own text is only its heading, and for one whose
+        share of `total_words` is under `SENTENCE_WORDS`.
+        """
+        return self.own_share_words(section_id, total_words) < SENTENCE_WORDS
 
 
 class PageLookup:
@@ -232,7 +246,31 @@ def build_section_tree(
         open_drafts.append(draft)
 
     _fold(roots, total, target_words)
-    return _freeze(roots, pages)
+    return _freeze(roots, pages, text)
+
+
+def _body_words(text: str, draft: _Draft) -> int:
+    """Words of the draft's own text, leaving out its heading lines.
+
+    The heading is the first non-blank line, because a section starts at the
+    line holding its heading. A folded heading is a later line whose letters
+    and digits equal the heading's, dropped once per folded heading.
+    """
+    folded = [_letters(title) for title in draft.folded]
+    words = 0
+    heading_pending = draft.heading is not None
+    for line in text[draft.start : draft.end].splitlines():
+        if not line.strip():
+            continue
+        if heading_pending:
+            heading_pending = False
+            continue
+        key = _letters(line)
+        if key in folded:
+            folded.remove(key)
+            continue
+        words += len(line.split())
+    return words
 
 
 def _letters(value: str) -> str:
@@ -317,7 +355,9 @@ def _fold(roots: list[_Draft], total: int, target_words: int) -> None:
         pass
 
 
-def _freeze(roots: list[_Draft], pages: Sequence[PageExtent] | None) -> SectionTree:
+def _freeze(
+    roots: list[_Draft], pages: Sequence[PageExtent] | None, text: str
+) -> SectionTree:
     page_at = PageLookup(pages).at
 
     ordered: list[_Draft] = []
@@ -341,6 +381,7 @@ def _freeze(roots: list[_Draft], pages: Sequence[PageExtent] | None) -> SectionT
             parent_id=ids[id(node.parent)] if node.parent is not None else None,
             child_ids=tuple(ids[id(child)] for child in node.children),
             folded_headings=tuple(node.folded),
+            own_words=_body_words(text, node),
         )
         for node in ordered
     )

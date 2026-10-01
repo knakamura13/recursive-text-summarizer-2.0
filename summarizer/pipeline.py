@@ -117,7 +117,7 @@ class PipelineResult:
 
 
 # Bump when section prose changes in a way a resumed run must not reuse.
-SECTION_PROSE_VERSION = 1
+SECTION_PROSE_VERSION = 2
 _DEFAULT_PIPELINE_CONFIG = PipelineConfig()
 _DEFAULT_SEGMENT_CAPACITY_DIVISOR = 4
 
@@ -283,8 +283,11 @@ def plan_section_requests(
     """Refuse an infeasible section editorial before any model call.
 
     Each section's editorial is budgeted at its own target, as the root's is.
+    A heading-only section asks for no editorial and is skipped.
     """
     for section in tree.nodes:
+        if tree.is_heading_only(section.id, target_words):
+            continue
         plan_editorial_request(
             limits,
             source_id=source_id,
@@ -522,6 +525,8 @@ def _run_pipeline(
     )
     recording = _RecordingProvider(provider, coordinator, reliability_tracker)
     section_nodes: Mapping[str, str] = {}
+    own_text_nodes: Mapping[str, str] = {}
+    own_text_reductions: tuple[TreeNode, ...] = ()
     strategy_name = (
         "hierarchical" if section_tree is not None else report.strategy
     )
@@ -671,6 +676,8 @@ def _run_pipeline(
             )
             root, nodes = by_section.root, by_section.nodes
             section_nodes = by_section.section_nodes
+            own_text_nodes = by_section.own_text_nodes
+            own_text_reductions = by_section.own_text_reductions
         if len(leaves) > 1:
             merged = sum(1 for node in nodes if node.level > 0)
             observer.emit(
@@ -766,8 +773,8 @@ def _run_pipeline(
         observer.raise_if_stopped("before section prose")
         section_publications = finalize_sections(
             section_tree,
-            section_nodes,
-            nodes,
+            own_text_nodes,
+            (*nodes, *own_text_reductions),
             recording,
             source_id=document.source_id,
             model=app.model,
