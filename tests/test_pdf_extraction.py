@@ -292,6 +292,28 @@ def test_same_style_headings_with_body_between_are_kept(tmp_path: Path):
     ]
 
 
+def test_text_slightly_off_body_size_still_separates_headings(tmp_path: Path):
+    # Scanned books set body text a little larger or smaller on some pages; it still counts as body.
+    lines = []
+    for index, title in enumerate(("First", "Second", "Third")):
+        top = 740 - 120 * index
+        lines += [(title, 14, top), (f"A short paragraph line under the heading number {index}.", 11.5, top - 40)]
+    path, writer = _layout_pdf(tmp_path, [[*_body(700)], lines])
+    assert [h.title for h in extract_pdf(_save(path, writer), ignore_progress, None).outline_hints] == [
+        "First", "Second", "Third"
+    ]
+
+
+def test_small_print_between_same_style_lines_does_not_break_a_run(tmp_path: Path):
+    # A list of titles with small print under each (a series list, a byline with affiliations) is not sections.
+    lines = []
+    for index, title in enumerate(("Book One", "Book Two", "Book Three")):
+        top = 740 - 60 * index
+        lines += [(title, 14, top), ("Small print about this item", 8, top - 16)]
+    path, writer = _layout_pdf(tmp_path, [[*_body(700)], lines])
+    assert extract_pdf(_save(path, writer), ignore_progress, None).outline_hints == []
+
+
 def test_slightly_larger_formula_or_long_line_is_not_a_heading(tmp_path: Path):
     formula = ("x = y + z and more", 13, 740)
     prose = ("one two three four five six seven eight nine ten eleven twelve thirteen", 13, 700)
