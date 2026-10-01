@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import re
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TypeVar
 
@@ -831,6 +832,120 @@ def _validate_segments(
         raise SegmentationError("segment core ranges do not reconstruct the source")
 
 
+def _validate_span_segments(
+    document: SourceDocument,
+    segments: list[SourceSegment],
+    counter: TokenCounter,
+    max_tokens: int,
+    spans: Sequence[tuple[int, int]],
+    *,
+    strict_cached: bool = False,
+) -> None:
+    """Check segments produced span by span, with ids and order run-global.
+
+    Each span is tiled exactly by its own segments, and no segment's context
+    reaches outside its span, so nothing crosses a span boundary. The text
+    between spans (none is passed when it holds no body text) is not covered.
+    """
+    boundaries = [start for start, _ in spans]
+    expected_start: int | None = None
+    previous: SourceSegment | None = None
+    span_index = -1
+    for order, segment in enumerate(segments):
+        if segment.segment_id != f"S{order + 1:06d}" or segment.order != order:
+            raise SegmentationError("segment identifiers or order are unstable")
+        if segment.source_id != document.source_id:
+            raise SegmentationError("segment source identity does not match document")
+        found = bisect.bisect_right(boundaries, segment.core_start) - 1
+        if found < 0 or segment.core_end > spans[found][1]:
+            raise SegmentationError("a segment lies outside the spans or crosses one")
+        if found != span_index:
+            if expected_start is not None and expected_start != spans[span_index][1]:
+                raise SegmentationError("segment core ranges do not tile a span")
+            if found != span_index + 1:
+                raise SegmentationError("a span has no segments")
+            span_index, expected_start, previous = found, spans[found][0], None
+        if segment.core_start != expected_start:
+            raise SegmentationError("segment core ranges are not contiguous")
+        span_start, span_end = spans[span_index]
+        if segment.context_start < span_start or segment.context_end > span_end:
+            raise SegmentationError("segment context reaches beyond its span")
+        if document.text[segment.context_start : segment.context_end] != segment.text:
+            raise SegmentationError("segment text does not match its source range")
+        if strict_cached and segment.core_token_count != _count_tokens(
+            counter, document.text[segment.core_start : segment.core_end]
+        ):
+            raise SegmentationError("segment core token count does not match its source")
+        if _count_tokens(counter, segment.text) != segment.token_count:
+            raise SegmentationError("segment token count does not match its text")
+        if strict_cached and (
+            segment.leading_overlap_tokens
+            != _count_tokens(counter, document.text[segment.context_start : segment.core_start])
+            or segment.trailing_overlap_tokens
+            != _count_tokens(counter, document.text[segment.core_end : segment.context_end])
+        ):
+            raise SegmentationError("segment overlap token counts do not match context")
+        if previous is not None and segment.context_start < previous.core_start:
+            raise SegmentationError("segment context reaches beyond neighbouring cores")
+        following = segments[order + 1] if order + 1 < len(segments) else None
+        if (
+            following is not None
+            and following.core_start < span_end
+            and segment.context_end > following.core_end
+        ):
+            raise SegmentationError("segment context reaches beyond neighbouring cores")
+        if segment.token_count > max_tokens:
+            raise SegmentationError("segment exceeds the configured token budget")
+        expected_start = segment.core_end
+        previous = segment
+    if (
+        span_index != len(spans) - 1
+        or expected_start is None
+        or expected_start != spans[span_index][1]
+    ):
+        raise SegmentationError("segment core ranges do not reconstruct the spans")
+
+
+def segment_spans(
+    document: SourceDocument,
+    counter: TokenCounter,
+    config: SegmentationConfig,
+    spans: Sequence[tuple[int, int]],
+) -> list[SourceSegment]:
+    """Segment each `(start, end)` span of the document on its own.
+
+    `spans` are ordered, disjoint, and each holds text. Every span is split
+    with the same rules and budgets as a whole document, so an oversized span
+    is split inside itself and no segment, overlap context included, crosses a
+    span boundary. Offsets and the segment ids stay relative to the whole
+    document: ids and order run on across spans.
+    """
+    if not spans:
+        raise SegmentationError("there are no spans to segment")
+    segments: list[SourceSegment] = []
+    for start, end in spans:
+        if start < 0 or end > len(document.text) or start >= end:
+            raise SegmentationError("a span must be a nonempty range of the document")
+        if segments and start < segments[-1].core_end:
+            raise SegmentationError("spans must be ordered and disjoint")
+        local = SourceDocument(text=document.text[start:end], source_id=document.source_id)
+        for segment in segment_document(local, counter, config):
+            order = len(segments)
+            segments.append(
+                replace(
+                    segment,
+                    segment_id=f"S{order + 1:06d}",
+                    order=order,
+                    core_start=segment.core_start + start,
+                    core_end=segment.core_end + start,
+                    context_start=segment.context_start + start,
+                    context_end=segment.context_end + start,
+                )
+            )
+    _validate_span_segments(document, segments, counter, config.max_tokens, spans)
+    return segments
+
+
 def segment_document(
     document: SourceDocument,
     counter: TokenCounter,
@@ -909,10 +1024,20 @@ def cached_segment_document(
     config: SegmentationConfig,
     *,
     coordinator: CacheCoordinator | None = None,
+    spans: Sequence[tuple[int, int]] | None = None,
 ) -> list[SourceSegment]:
-    """Segment normally, or reuse a fully revalidated segment sequence."""
+    """Segment normally, or reuse a fully revalidated segment sequence.
+
+    With `spans`, each span is segmented on its own (see `segment_spans`) and
+    the spans join the cache key; without them, nothing changes.
+    """
+    def compute_segments() -> list[SourceSegment]:
+        if spans is None:
+            return segment_document(document, counter, config)
+        return segment_spans(document, counter, config, spans)
+
     if coordinator is None:
-        return segment_document(document, counter, config)
+        return compute_segments()
 
     def decode(payload: object) -> list[SourceSegment]:
         if not isinstance(payload, list):
@@ -934,9 +1059,14 @@ def cached_segment_document(
             segment.source_id != document.source_id for segment in segments
         ):
             raise SegmentationError("cached segments identify another source")
-        _validate_segments(
-            document, segments, counter, config.max_tokens, strict_cached=True
-        )
+        if spans is None:
+            _validate_segments(
+                document, segments, counter, config.max_tokens, strict_cached=True
+            )
+        else:
+            _validate_span_segments(
+                document, segments, counter, config.max_tokens, spans, strict_cached=True
+            )
         return segments
 
     def encode(segments: list[SourceSegment]) -> object:
@@ -964,9 +1094,13 @@ def cached_segment_document(
         work_id="segmentation",
         prompt_version=SEGMENTATION_CACHE_VERSION,
         schema_version=SEGMENTATION_CACHE_VERSION,
-        input_value={"source_id": document.source_id, "config": {"max_tokens": config.max_tokens, "overlap_tokens": config.overlap_tokens}},
+        input_value={
+            "source_id": document.source_id,
+            "config": {"max_tokens": config.max_tokens, "overlap_tokens": config.overlap_tokens},
+            **({} if spans is None else {"spans": [list(span) for span in spans]}),
+        },
         behavior={"segmentation": {"max_tokens": config.max_tokens, "overlap_tokens": config.overlap_tokens}},
         decode=decode,
         encode=encode,
-        compute=lambda: segment_document(document, counter, config),
+        compute=compute_segments,
     )

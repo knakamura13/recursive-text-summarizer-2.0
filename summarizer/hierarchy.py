@@ -35,6 +35,7 @@ from summarizer.providers.base import (
 from summarizer.runtime.items import ObservedItem, generate_observed, tree_node_id
 from summarizer.runtime.observers import RuntimeObserver, StageName, get_observer
 from summarizer.scheduler import BoundedScheduler, ScheduledResult, ScheduledWork
+from summarizer.sections import SectionTree
 from summarizer.segmentation import CacheCoordinator
 from summarizer.summaries import LEAF_SCHEMA_VERSION, SummaryNode
 from summarizer.tokenization import TokenCounter
@@ -81,6 +82,7 @@ class _PreparedMerge:
     preserved_provenance: tuple[str, ...]
     grounding: MergeGrounding
     descriptor: CacheDescriptor | None
+    section_id: str | None = None
 
     def parse(self, text: str) -> SummaryNode:
         return parse_merged_summary(
@@ -108,6 +110,7 @@ class _PreparedMerge:
             children=self.children,
             covered_segments=self.covered_segments,
             grounding=self.grounding,
+            section_id=self.section_id,
         )
 
 
@@ -121,6 +124,9 @@ class TreeNode:
     `SummaryNode` carries no identifier, no children, and no order, so the
     tree lives here. Order is explicit rather than implied by list position,
     which keeps ordering deterministic if merges later run concurrently.
+
+    `section_id` names the section whose reduction built the node in a
+    section-mode run, and is None otherwise.
     """
 
     node_id: str
@@ -130,6 +136,7 @@ class TreeNode:
     children: tuple[str, ...]
     covered_segments: tuple[str, ...]
     grounding: MergeGrounding | None = None
+    section_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.node_id.strip():
@@ -163,9 +170,11 @@ class HierarchyReport:
     levels: tuple[LevelReport, ...] = field(default_factory=tuple)
 
 
-def measure_child_tokens(node: SummaryNode, counter: TokenCounter) -> int:
+def measure_child_tokens(
+    node: SummaryNode, counter: TokenCounter, heading: str | None = None
+) -> int:
     """Measure what one child costs inside a merge request, delimiters included."""
-    return counter.count(serialize_child(node)) + child_fence_tokens(counter)
+    return counter.count(serialize_child(node, heading)) + child_fence_tokens(counter)
 
 
 def plan_merge_request(
@@ -174,6 +183,7 @@ def plan_merge_request(
     level: int,
     provider_schema_reserve: int = 0,
     evidence: int = 0,
+    section_headings: bool = False,
 ) -> RequestBudget:
     """Budget one merge request at `level`, or raise `RequestBudgetError`.
 
@@ -186,6 +196,7 @@ def plan_merge_request(
             limits.counter,
             level=level,
             provider_schema_reserve=provider_schema_reserve,
+            section_headings=section_headings,
         ),
         evidence=evidence,
     )
@@ -197,6 +208,7 @@ def merge_fanout(
     *,
     budget: RequestBudget,
     ceiling: int | None = None,
+    headings: Sequence[str | None] | None = None,
 ) -> tuple[int, str]:
     """Derive how many children fit one merge request, and say why.
 
@@ -215,7 +227,12 @@ def merge_fanout(
     if ceiling is not None and ceiling < 2:
         raise ValueError("max_merge_children must be at least 2 to make progress")
 
-    costs = [measure_child_tokens(child, counter) for child in children]
+    costs = [
+        measure_child_tokens(
+            child, counter, headings[index] if headings is not None else None
+        )
+        for index, child in enumerate(children)
+    ]
     largest = max(costs)
     budget.require_merge_pair(largest)
     capacity = budget.input_capacity
@@ -253,6 +270,349 @@ def group_children(count: int, fanout: int) -> tuple[tuple[int, ...], ...]:
         indices.append(tuple(range(start, start + size)))
         start += size
     return tuple(indices)
+
+
+def _prepare_leaf_nodes(
+    leaves: Sequence[SummaryNode],
+    covered: Sequence[Sequence[str]],
+    attributable: Mapping[str, str],
+    section_ids: Sequence[str | None] | None = None,
+) -> list[TreeNode]:
+    """Validate each leaf against its own segments and wrap it as a level-0 node."""
+    if len(covered) != len(leaves):
+        raise ValueError("each leaf needs its covered segment identifiers")
+    nodes: list[TreeNode] = []
+    for index, (leaf, identifiers) in enumerate(zip(leaves, covered)):
+        local_covered = tuple(identifiers)
+        missing = [
+            identifier for identifier in local_covered if identifier not in attributable
+        ]
+        if missing:
+            raise ValueError(
+                "attributable text is missing for segments " + ", ".join(missing)
+            )
+        legal = {identifier: attributable[identifier] for identifier in local_covered}
+        subject = tree_node_id(0, index)
+        validate_provenance(leaf, legal=legal, subject=subject)
+        prepared = leaf.model_copy(
+            update={"provenance": derive_provenance(leaf, source_order=local_covered)}
+        )
+        nodes.append(
+            TreeNode(
+                node_id=subject,
+                level=0,
+                order=index,
+                summary=prepared,
+                children=(),
+                covered_segments=local_covered,
+                section_id=section_ids[index] if section_ids is not None else None,
+            )
+        )
+    return nodes
+
+
+def _aligned(node: TreeNode, level: int) -> TreeNode:
+    """Show a node to a merge at `level`, as the model sees its children.
+
+    A flat reduction has every child at the previous level already. Section
+    reduction mixes heights: a leaf may sit beside a node that took several
+    levels to build. The prompt reports every child at the level just below the
+    merge, so the model never sees children at mixed levels; the recorded node
+    keeps its own.
+    """
+    if node.summary.level == level:
+        return node
+    return replace(node, summary=node.summary.model_copy(update={"level": level}))
+
+
+class _Reducer:
+    """Reduce ordered nodes to one through as many levels as needed.
+
+    One reducer serves a whole run. Shared state - the merge-call count, the
+    tree's nodes, the level reports, the manifest's planned merge ids and the
+    next node order at each level - lives here so that several reductions (one
+    per section) number their nodes and plan their work as one run.
+    """
+
+    def __init__(
+        self,
+        provider: ModelProvider,
+        counter: TokenCounter,
+        *,
+        source_id: str,
+        attributable: Mapping[str, str],
+        limits: RequestLimits,
+        model: str,
+        timeout_seconds: float,
+        max_merge_children: int | None,
+        grounding_policy: GroundingPolicy | None,
+        coordinator: CacheCoordinator | None,
+        provider_schema_reserve: int,
+        runtime: RuntimeObserver,
+        section_headings: bool = False,
+    ) -> None:
+        self.calls = _CountingProvider(provider)
+        self.counter = counter
+        self.source_id = source_id
+        self.attributable = attributable
+        self.limits = limits
+        self.model = model
+        self.timeout_seconds = timeout_seconds
+        self.max_merge_children = max_merge_children
+        self.configured_policy = (
+            grounding_policy
+            if grounding_policy is not None
+            else DEFAULT_GROUNDING_POLICY
+        )
+        self.adaptive_grounding = grounding_policy is None
+        self.coordinator = coordinator
+        self.provider_schema_reserve = provider_schema_reserve
+        self.runtime = runtime
+        self.section_headings = section_headings
+        # Heading data for a node that finishes a section, by node id.
+        self.headings: dict[str, str] = {}
+        self.all_nodes: list[TreeNode] = []
+        self.levels: list[LevelReport] = []
+        self._next_order: dict[int, int] = {}
+        self._planned_merge_ids: list[str] = []
+        if coordinator is not None and coordinator.session is not None:
+            plan = coordinator.session.manifest.work_ids
+            first_merge = next(
+                (
+                    index
+                    for index, work_id in enumerate(plan)
+                    if work_id.startswith("L")
+                ),
+                len(plan),
+            )
+            self._merge_prefix = plan[:first_merge]
+        else:
+            self._merge_prefix = ()
+
+    def reduce(
+        self, current: list[TreeNode], *, section_id: str | None = None
+    ) -> TreeNode:
+        """Merge `current`, in order, until one node remains, and return it.
+
+        A merge group never holds a node from outside `current`. Nodes are
+        numbered by level across the run: `order` continues from the last node
+        built at that level, so reductions of different sections never collide
+        and a flat run keeps `L{level}N0001` onwards.
+        """
+        runtime = self.runtime
+        counter = self.counter
+        coordinator = self.coordinator
+        adaptive_grounding = self.adaptive_grounding
+        configured_policy = self.configured_policy
+        while len(current) > 1:
+            runtime.raise_if_stopped("during merging")
+            level = max(node.level for node in current) + 1
+            budget = plan_merge_request(
+                self.limits,
+                level=level,
+                provider_schema_reserve=self.provider_schema_reserve,
+                evidence=0 if adaptive_grounding else configured_policy.max_tokens,
+                section_headings=self.section_headings,
+            )
+            pool = [_aligned(node, level - 1) for node in current]
+            headings = [self.headings.get(node.node_id) for node in current]
+            base = self._next_order.get(level, 0)
+            # An adaptive default has no fixed source reserve, so a fanout sized
+            # purely from children can leave no room for a group's mandatory
+            # source evidence. Retry with a narrower fanout when that happens;
+            # a fanout that already cannot drop below a pair propagates the
+            # failure, matching the fixed-policy path's fail-closed behavior.
+            ceiling = self.max_merge_children
+            while True:
+                fanout, reason = merge_fanout(
+                    [node.summary for node in pool],
+                    counter,
+                    budget=budget,
+                    ceiling=ceiling,
+                    headings=headings,
+                )
+                groups = group_children(len(current), fanout)
+                prepared: list[_PreparedMerge] = []
+                passthrough: dict[int, TreeNode] = {}
+                try:
+                    for position, indices in enumerate(groups):
+                        members = [pool[index] for index in indices]
+                        if len(members) == 1:
+                            # Pass a lone node upward without a call; the count
+                            # still falls because other groups merged.
+                            only = members[0]
+                            passthrough[position] = TreeNode(
+                                node_id=tree_node_id(level, base + position),
+                                level=level,
+                                order=base + position,
+                                # Restamped: the merged path asserts that a
+                                # node's summary reports its own level, and this
+                                # path is fed into the next level's payload, so
+                                # a stale value would show the model children
+                                # at mixed levels.
+                                summary=only.summary.model_copy(
+                                    update={"level": level}
+                                ),
+                                children=(only.node_id,),
+                                covered_segments=only.covered_segments,
+                                section_id=section_id,
+                            )
+                            continue
+                        prepared.append(
+                            _prepare_merge(
+                                members,
+                                attributable=self.attributable,
+                                level=level,
+                                order=base + position,
+                                source_id=self.source_id,
+                                model=self.model,
+                                timeout_seconds=self.timeout_seconds,
+                                counter=counter,
+                                budget=budget,
+                                grounding_policy=(
+                                    GroundingPolicy(max_tokens=budget.request_capacity)
+                                    if adaptive_grounding
+                                    else configured_policy
+                                ),
+                                configured_grounding_policy=configured_policy,
+                                adaptive_grounding=adaptive_grounding,
+                                coordinator=coordinator,
+                                provider_schema_reserve=self.provider_schema_reserve,
+                                # A narrower fanout grounds on whole passages;
+                                # excerpts only when no narrower fanout exists.
+                                allow_excerpts=adaptive_grounding and fanout <= 2,
+                                child_headings=[headings[index] for index in indices],
+                                section_headings=self.section_headings,
+                                section_id=section_id,
+                            )
+                        )
+                except BudgetError:
+                    if not adaptive_grounding or fanout <= 2:
+                        raise
+                    ceiling = fanout - 1
+                    continue
+                break
+
+            by_position = {item.order - base: item for item in prepared}
+            level_items = {
+                position: ObservedItem(
+                    kind="passthrough" if position in passthrough else "merge",
+                    work_id=tree_node_id(level, base + position),
+                    stage=StageName.MERGING,
+                    level=level,
+                    order=base + position,
+                    total=len(groups),
+                    child_ids=tuple(current[index].node_id for index in indices),
+                    covered_segment_ids=(
+                        passthrough[position].covered_segments
+                        if position in passthrough
+                        else by_position[position].covered_segments
+                    ),
+                )
+                for position, indices in enumerate(groups)
+            }
+            for position in range(len(groups)):
+                runtime.emit_item(level_items[position].event("planned"))
+            for position, node in sorted(passthrough.items()):
+                runtime.emit_item(
+                    level_items[position].event(
+                        "completed", summary=node.summary.model_dump(mode="json")
+                    )
+                )
+
+            # Every request, descriptor, and legal grounding scope is frozen before
+            # a sibling can call the provider. The manifest therefore witnesses the
+            # entire level before its first externally visible side effect.
+            if coordinator is not None and coordinator.session is not None:
+                self._planned_merge_ids.extend(item.node_id for item in prepared)
+                coordinator.session.ensure_work_prefix(
+                    (*self._merge_prefix, *self._planned_merge_ids)
+                )
+                descriptors = {item.node_id: item.descriptor for item in prepared}
+                assert all(
+                    descriptor is not None for descriptor in descriptors.values()
+                )
+                values = coordinator.reusable_batch(
+                    work_ids=tuple(item.node_id for item in prepared),
+                    descriptors=descriptors,
+                    validators={item.node_id: item.validate for item in prepared},
+                )
+                for item in prepared:
+                    if item.node_id in values:
+                        runtime.emit_item(
+                            level_items[item.order - base].event(
+                                "reused", summary=values[item.node_id]
+                            )
+                        )
+                scheduled = BoundedScheduler(
+                    max_in_flight=coordinator.max_in_flight,
+                    cache=coordinator.store,
+                    should_stop=runtime.should_stop,
+                    on_complete=_completion_reporter(
+                        runtime,
+                        {
+                            item.node_id: level_items[item.order - base]
+                            for item in prepared
+                        },
+                    ),
+                ).run(
+                    tuple(
+                        ScheduledWork(
+                            descriptor=item.descriptor,
+                            operation=lambda item=item, observed=level_items[
+                                item.order - base
+                            ]: _execute_prepared_merge(
+                                item, self.calls, observed, runtime
+                            ),
+                            validate=item.validate,
+                        )
+                        for item in prepared
+                        if item.node_id not in values
+                    ),
+                    coordinator.session,
+                )
+                values.update(
+                    {result.work_id: result.payload for result in scheduled}
+                )
+            else:
+                values = {}
+                for item in prepared:
+                    runtime.raise_if_stopped("during merging")
+                    observed = level_items[item.order - base]
+                    values[item.node_id] = _execute_prepared_merge(
+                        item, self.calls, observed, runtime
+                    )
+                    runtime.emit_item(
+                        observed.event("completed", summary=values[item.node_id])
+                    )
+
+            produced = []
+            for position in range(len(groups)):
+                if position in passthrough:
+                    produced.append(passthrough[position])
+                else:
+                    item = by_position[position]
+                    produced.append(item.node(values[item.node_id]))
+
+            if len(produced) >= len(current):
+                raise HierarchyError(
+                    f"level {level} did not reduce the tree: {len(current)} nodes "
+                    f"produced {len(produced)} with a fanout of {fanout}"
+                )
+
+            self.levels.append(
+                LevelReport(
+                    level=level,
+                    nodes_in=len(current),
+                    nodes_out=len(produced),
+                    fanout=fanout,
+                    reason=reason,
+                )
+            )
+            self._next_order[level] = base + len(groups)
+            self.all_nodes.extend(produced)
+            current = produced
+        return current[0]
 
 
 def build_hierarchy(
@@ -303,255 +663,146 @@ def build_hierarchy(
         raise ValueError("each leaf needs its covered segment identifiers")
     if provider_schema_reserve < 0:
         raise ValueError("provider schema reserve must not be negative")
-    runtime = get_observer(observer)
-    calls = _CountingProvider(provider)
-    configured_policy = (
-        grounding_policy if grounding_policy is not None else DEFAULT_GROUNDING_POLICY
+    reducer = _Reducer(
+        provider,
+        counter,
+        source_id=source_id,
+        attributable=attributable,
+        limits=limits,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        max_merge_children=max_merge_children,
+        grounding_policy=grounding_policy,
+        coordinator=coordinator,
+        provider_schema_reserve=provider_schema_reserve,
+        runtime=get_observer(observer),
     )
-    adaptive_grounding = grounding_policy is None
-    prepared_leaves: list[SummaryNode] = []
-    prepared_covered: list[tuple[str, ...]] = []
-    for index, (leaf, identifiers) in enumerate(zip(leaves, covered)):
-        local_covered = tuple(identifiers)
-        missing = [
-            identifier for identifier in local_covered if identifier not in attributable
-        ]
-        if missing:
-            raise ValueError(
-                "attributable text is missing for segments " + ", ".join(missing)
-            )
-        legal = {identifier: attributable[identifier] for identifier in local_covered}
-        subject = tree_node_id(0, index)
-        validate_provenance(leaf, legal=legal, subject=subject)
-        prepared_leaves.append(
-            leaf.model_copy(
-                update={"provenance": derive_provenance(leaf, source_order=local_covered)}
-            )
-        )
-        prepared_covered.append(local_covered)
-
-    all_nodes: list[TreeNode] = []
-    current = [
-        TreeNode(
-            node_id=tree_node_id(0, index),
-            level=0,
-            order=index,
-            summary=leaf,
-            children=(),
-            covered_segments=tuple(segments),
-        )
-        for index, (leaf, segments) in enumerate(
-            zip(prepared_leaves, prepared_covered)
-        )
-    ]
-    all_nodes.extend(current)
-
-    levels: list[LevelReport] = []
-    level = 0
-    planned_merge_ids: list[str] = []
-    if coordinator is not None and coordinator.session is not None:
-        plan = coordinator.session.manifest.work_ids
-        first_merge = next(
-            (index for index, work_id in enumerate(plan) if work_id.startswith("L")),
-            len(plan),
-        )
-        merge_prefix = plan[:first_merge]
-    else:
-        merge_prefix = ()
-
-    while len(current) > 1:
-        runtime.raise_if_stopped("during merging")
-        level += 1
-        budget = plan_merge_request(
-            limits,
-            level=level,
-            provider_schema_reserve=provider_schema_reserve,
-            evidence=0 if adaptive_grounding else configured_policy.max_tokens,
-        )
-        # An adaptive default has no fixed source reserve, so a fanout sized
-        # purely from children can leave no room for a group's mandatory
-        # source evidence. Retry with a narrower fanout when that happens;
-        # a fanout that already cannot drop below a pair propagates the
-        # failure, matching the fixed-policy path's fail-closed behavior.
-        ceiling = max_merge_children
-        while True:
-            fanout, reason = merge_fanout(
-                [node.summary for node in current],
-                counter,
-                budget=budget,
-                ceiling=ceiling,
-            )
-            groups = group_children(len(current), fanout)
-            prepared: list[_PreparedMerge] = []
-            passthrough: dict[int, TreeNode] = {}
-            try:
-                for order, indices in enumerate(groups):
-                    members = [current[index] for index in indices]
-                    if len(members) == 1:
-                        # Pass a lone node upward without a call; the count
-                        # still falls because other groups merged.
-                        only = members[0]
-                        passthrough[order] = TreeNode(
-                            node_id=tree_node_id(level, order),
-                            level=level,
-                            order=order,
-                            # Restamped: the merged path asserts that a
-                            # node's summary reports its own level, and this
-                            # path is fed into the next level's payload, so
-                            # a stale value would show the model children
-                            # at mixed levels.
-                            summary=only.summary.model_copy(update={"level": level}),
-                            children=(only.node_id,),
-                            covered_segments=only.covered_segments,
-                        )
-                        continue
-                    prepared.append(
-                        _prepare_merge(
-                            members,
-                            attributable=attributable,
-                            level=level,
-                            order=order,
-                            source_id=source_id,
-                            model=model,
-                            timeout_seconds=timeout_seconds,
-                            counter=counter,
-                            budget=budget,
-                            grounding_policy=(
-                                GroundingPolicy(max_tokens=budget.request_capacity)
-                                if adaptive_grounding
-                                else configured_policy
-                            ),
-                            configured_grounding_policy=configured_policy,
-                            adaptive_grounding=adaptive_grounding,
-                            coordinator=coordinator,
-                            provider_schema_reserve=provider_schema_reserve,
-                            # A narrower fanout grounds on whole passages;
-                            # excerpts only when no narrower fanout exists.
-                            allow_excerpts=adaptive_grounding and fanout <= 2,
-                        )
-                    )
-            except BudgetError:
-                if not adaptive_grounding or fanout <= 2:
-                    raise
-                ceiling = fanout - 1
-                continue
-            break
-
-        by_order = {item.order: item for item in prepared}
-        level_items = {
-            order: ObservedItem(
-                kind="passthrough" if order in passthrough else "merge",
-                work_id=tree_node_id(level, order),
-                stage=StageName.MERGING,
-                level=level,
-                order=order,
-                total=len(groups),
-                child_ids=tuple(current[index].node_id for index in indices),
-                covered_segment_ids=(
-                    passthrough[order].covered_segments
-                    if order in passthrough
-                    else by_order[order].covered_segments
-                ),
-            )
-            for order, indices in enumerate(groups)
-        }
-        for order in range(len(groups)):
-            runtime.emit_item(level_items[order].event("planned"))
-        for order, node in sorted(passthrough.items()):
-            runtime.emit_item(
-                level_items[order].event(
-                    "completed", summary=node.summary.model_dump(mode="json")
-                )
-            )
-
-        # Every request, descriptor, and legal grounding scope is frozen before
-        # a sibling can call the provider. The manifest therefore witnesses the
-        # entire level before its first externally visible side effect.
-        if coordinator is not None and coordinator.session is not None:
-            planned_merge_ids.extend(item.node_id for item in prepared)
-            coordinator.session.ensure_work_prefix((*merge_prefix, *planned_merge_ids))
-            descriptors = {item.node_id: item.descriptor for item in prepared}
-            assert all(descriptor is not None for descriptor in descriptors.values())
-            values = coordinator.reusable_batch(
-                work_ids=tuple(item.node_id for item in prepared),
-                descriptors=descriptors,
-                validators={item.node_id: item.validate for item in prepared},
-            )
-            for item in prepared:
-                if item.node_id in values:
-                    runtime.emit_item(
-                        level_items[item.order].event(
-                            "reused", summary=values[item.node_id]
-                        )
-                    )
-            scheduled = BoundedScheduler(
-                max_in_flight=coordinator.max_in_flight,
-                cache=coordinator.store,
-                should_stop=runtime.should_stop,
-                on_complete=_completion_reporter(
-                    runtime,
-                    {item.node_id: level_items[item.order] for item in prepared},
-                ),
-            ).run(
-                tuple(
-                    ScheduledWork(
-                        descriptor=item.descriptor,
-                        operation=lambda item=item, observed=level_items[
-                            item.order
-                        ]: _execute_prepared_merge(item, calls, observed, runtime),
-                        validate=item.validate,
-                    )
-                    for item in prepared
-                    if item.node_id not in values
-                ),
-                coordinator.session,
-            )
-            values.update({result.work_id: result.payload for result in scheduled})
-        else:
-            values = {}
-            for item in prepared:
-                runtime.raise_if_stopped("during merging")
-                observed = level_items[item.order]
-                values[item.node_id] = _execute_prepared_merge(
-                    item, calls, observed, runtime
-                )
-                runtime.emit_item(
-                    observed.event("completed", summary=values[item.node_id])
-                )
-
-        produced = []
-        for order in range(len(groups)):
-            if order in passthrough:
-                produced.append(passthrough[order])
-            else:
-                item = by_order[order]
-                produced.append(item.node(values[item.node_id]))
-
-        if len(produced) >= len(current):
-            raise HierarchyError(
-                f"level {level} did not reduce the tree: {len(current)} nodes "
-                f"produced {len(produced)} with a fanout of {fanout}"
-            )
-
-        levels.append(
-            LevelReport(
-                level=level,
-                nodes_in=len(current),
-                nodes_out=len(produced),
-                fanout=fanout,
-                reason=reason,
-            )
-        )
-        all_nodes.extend(produced)
-        current = produced
-
+    current = _prepare_leaf_nodes(leaves, covered, attributable)
+    reducer.all_nodes.extend(current)
+    root = reducer.reduce(current)
     report = HierarchyReport(
         leaf_count=len(leaves),
-        level_count=level,
-        provider_calls=calls.count,
-        levels=tuple(levels),
+        level_count=root.level,
+        provider_calls=reducer.calls.count,
+        levels=tuple(reducer.levels),
     )
-    return current[0], tuple(all_nodes), report
+    return root, tuple(reducer.all_nodes), report
+
+
+@dataclass(frozen=True)
+class SectionHierarchy:
+    """A summary tree reduced section by section.
+
+    `section_nodes` maps each section id to the id of the node that summarizes
+    it. A section with nothing to summarize has no entry, and a section whose
+    only input was a single node is summarized by that node itself. Each
+    `TreeNode.section_id` names the section whose reduction built the node;
+    the nodes that merge top-level sections belong to none.
+    """
+
+    root: TreeNode
+    nodes: tuple[TreeNode, ...]
+    report: HierarchyReport
+    section_nodes: Mapping[str, str]
+
+
+def build_section_hierarchy(
+    leaves: Sequence[SummaryNode],
+    provider: ModelProvider,
+    counter: TokenCounter,
+    *,
+    tree: SectionTree,
+    leaf_sections: Sequence[str],
+    source_id: str,
+    covered: Sequence[Sequence[str]],
+    attributable: Mapping[str, str],
+    limits: RequestLimits,
+    model: str,
+    timeout_seconds: float,
+    max_merge_children: int | None = None,
+    grounding_policy: GroundingPolicy | None = None,
+    coordinator: CacheCoordinator | None = None,
+    provider_schema_reserve: int = 0,
+    observer: RuntimeObserver | None = None,
+) -> SectionHierarchy:
+    """Reduce leaves bottom-up through the section tree; no merge crosses a section.
+
+    A section's node reduces its own leaves, in order, followed by each child
+    section's node in document order - a section's own text precedes its
+    children's, so that is document order. The reduction uses the same fanout,
+    budgets and grounding as `build_hierarchy`, so a section with many inputs
+    takes several levels inside the section. A section with a single input
+    adds no node. The document root reduces the top-level sections' nodes.
+
+    `leaf_sections` gives each leaf's section id, in the order of `leaves`.
+    """
+    if not leaves:
+        raise ValueError("a hierarchy requires at least one leaf")
+    if len(leaf_sections) != len(leaves):
+        raise ValueError("each leaf needs its section identifier")
+    if provider_schema_reserve < 0:
+        raise ValueError("provider schema reserve must not be negative")
+    known = {node.id: node for node in tree.nodes}
+    unknown = sorted(set(leaf_sections) - set(known))
+    if unknown:
+        raise ValueError("leaves name unknown sections: " + ", ".join(unknown))
+    reducer = _Reducer(
+        provider,
+        counter,
+        source_id=source_id,
+        attributable=attributable,
+        limits=limits,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        max_merge_children=max_merge_children,
+        grounding_policy=grounding_policy,
+        coordinator=coordinator,
+        provider_schema_reserve=provider_schema_reserve,
+        runtime=get_observer(observer),
+        section_headings=True,
+    )
+    leaf_nodes = _prepare_leaf_nodes(leaves, covered, attributable, leaf_sections)
+    reducer.all_nodes.extend(leaf_nodes)
+    own_leaves: dict[str, list[TreeNode]] = {}
+    for node in leaf_nodes:
+        assert node.section_id is not None
+        own_leaves.setdefault(node.section_id, []).append(node)
+
+    section_nodes: dict[str, str] = {}
+
+    def summarize(section_id: str) -> TreeNode | None:
+        section = known[section_id]
+        inputs = list(own_leaves.get(section_id, ()))
+        for child_id in section.child_ids:
+            child = summarize(child_id)
+            if child is not None:
+                inputs.append(child)
+        if not inputs:
+            return None
+        node = reducer.reduce(inputs, section_id=section_id)
+        section_nodes[section_id] = node.node_id
+        # The finished section's own heading names its node from here on, even
+        # when the node is the child's, which the section adopted unchanged.
+        if section.heading is not None:
+            reducer.headings[node.node_id] = section.heading
+        else:
+            reducer.headings.pop(node.node_id, None)
+        return node
+
+    tops = [node for root in tree.roots if (node := summarize(root.id)) is not None]
+    root = reducer.reduce(tops)
+    report = HierarchyReport(
+        leaf_count=len(leaves),
+        level_count=root.level,
+        provider_calls=reducer.calls.count,
+        levels=tuple(reducer.levels),
+    )
+    return SectionHierarchy(
+        root=root,
+        nodes=tuple(reducer.all_nodes),
+        report=report,
+        section_nodes=section_nodes,
+    )
 
 
 class _CountingProvider:
@@ -596,6 +847,9 @@ def _prepare_merge(
     adaptive_grounding: bool,
     provider_schema_reserve: int,
     allow_excerpts: bool = False,
+    child_headings: Sequence[str | None] | None = None,
+    section_headings: bool = False,
+    section_id: str | None = None,
 ) -> _PreparedMerge:
     node_id = tree_node_id(level, order)
     # A union in document order: deduplicated, first occurrence wins. Three
@@ -629,6 +883,8 @@ def _prepare_merge(
                     model=model,
                     timeout_seconds=timeout_seconds,
                     max_output_tokens=budget.output_allowance_tokens,
+                    child_headings=child_headings,
+                    section_headings=section_headings,
                 ),
                 audit_work_id=node_id,
             )
@@ -674,6 +930,8 @@ def _prepare_merge(
         model=model,
         timeout_seconds=timeout_seconds,
         max_output_tokens=budget.output_allowance_tokens,
+        child_headings=child_headings,
+        section_headings=section_headings,
     )
     request = replace(request, audit_work_id=node_id)
     budget.require_request(
@@ -730,6 +988,7 @@ def _prepare_merge(
             ),
         ),
         descriptor=descriptor,
+        section_id=section_id,
     )
 
 
