@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Collection
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
@@ -21,6 +22,7 @@ from summarizer.leaf import (
     _describe,
     _extract_json_object,
     _sanitize,
+    owned_segment_ids,
     prose_cites_segment_id,
     reader_summary_node,
 )
@@ -324,7 +326,12 @@ def plan_editorial_request(
     )
 
 
-def parse_final_draft(text: str, *, subject: str = EDITORIAL_WORK_ID) -> FinalDraft:
+def parse_final_draft(
+    text: str,
+    *,
+    subject: str = EDITORIAL_WORK_ID,
+    owned: Collection[str] = (),
+) -> FinalDraft:
     try:
         payload = json.loads(_extract_json_object(text))
     except (ValueError, json.JSONDecodeError) as error:
@@ -337,7 +344,7 @@ def parse_final_draft(text: str, *, subject: str = EDITORIAL_WORK_ID) -> FinalDr
         raise EditorialError(
             f"{subject}: response failed validation ({_describe(error)})"
         ) from error
-    if prose_cites_segment_id(draft.text):
+    if prose_cites_segment_id(draft.text, owned):
         raise EditorialError(f"{subject}: the draft cites an internal segment id")
     return draft
 
@@ -415,6 +422,7 @@ def write_editorial(
     if coordinator is not None and not isinstance(coordinator, CacheCoordinator):
         raise TypeError("cache_coordinator must be a CacheCoordinator")
     runtime = get_observer(observer)
+    owned = owned_segment_ids(root)
 
     def report(state: ItemState, *, attempt: int | None = None, message: str | None = None) -> None:
         runtime.emit_item(
@@ -430,7 +438,7 @@ def write_editorial(
 
     def decode(payload: object) -> str:
         text = redact_text(FinalDraft.model_validate(payload).text).strip()
-        if prose_cites_segment_id(text):
+        if prose_cites_segment_id(text, owned):
             raise ValueError(f"{work_id}: the draft cites an internal segment id")
         return text
 
@@ -440,7 +448,9 @@ def write_editorial(
 
     def parse(result: GenerationResult) -> tuple[GenerationResult, str]:
         nonlocal unfinished
-        text = redact_text(parse_final_draft(result.text, subject=work_id).text).strip()
+        text = redact_text(
+            parse_final_draft(result.text, subject=work_id, owned=owned).text
+        ).strip()
         if split_unfinished_ending(text)[1] is not None:
             unfinished = _UnfinishedDraft(result, text)
             raise unfinished

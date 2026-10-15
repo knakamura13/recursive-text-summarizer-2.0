@@ -33,7 +33,7 @@ from summarizer.tokenization import TokenCounter
 
 # A distinct cache-key input from the leaf prompt. Bump it whenever a change
 # could alter a model's output for identical children.
-MERGE_PROMPT_VERSION = "merge-prompt/6"
+MERGE_PROMPT_VERSION = "merge-prompt/7"
 
 MERGE_SCHEMA_NAME = "merged_summary"
 
@@ -57,8 +57,10 @@ not evidence that its child summary or references are unsupported. Do not add \
 outside knowledge.
 - Merge repeated information instead of restating it, but keep every \
 supporting reference shown in the generated child summaries, including when \
-that reference's passage was not selected for authoritative grounding. Losing \
-a visible reference loses the ability to trace a claim back to its source.
+that reference's passage was not selected for authoritative grounding. Keep \
+that reference in provenance and evidence. Do not copy it into the summary \
+as a parenthetical or bracketed label. Losing a visible reference loses the \
+ability to trace a claim back to its source.
 - Keep material qualifications and uncertainty. Do not resolve a hedge into a \
 statement.
 - Keep disagreements. Where two summaries conflict, record the conflict rather \
@@ -69,6 +71,9 @@ preceded, or followed from another.
 - Cite only identifiers already carried by the child summaries or attached to \
 the authoritative source passages below. Do not invent an identifier and do \
 not cite one that is merely plausible. List every cited identifier in provenance.
+- Do not write an internal segment identifier in the summary, in a content \
+unit's text or qualification, or in an entity. An identifier is not a fact \
+of the source.
 - Copy any quotation character for character from the summary that carries it. \
 Every quote must be one of the values the schema allows, or null when none of \
 them fits. When its authoritative source passage is supplied below, the \
@@ -391,7 +396,7 @@ def parse_merged_summary(
         quotation_sources=quotation_sources,
         subject=subject,
     )
-    require_prose_without_segment_ids(node, subject=subject)
+    require_prose_without_segment_ids(node, subject=subject, owned=tuple(legal))
     canonical_order = source_order or tuple(legal)
     retained = set(preserved_provenance)
     retained.update(derive_provenance(node, source_order=canonical_order))
