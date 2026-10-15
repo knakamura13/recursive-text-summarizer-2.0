@@ -118,7 +118,7 @@ class PipelineResult:
 
 
 # Bump when section prose changes in a way a resumed run must not reuse.
-SECTION_PROSE_VERSION = 2
+SECTION_PROSE_VERSION = 3
 _DEFAULT_PIPELINE_CONFIG = PipelineConfig()
 _DEFAULT_SEGMENT_CAPACITY_DIVISOR = 4
 

@@ -88,6 +88,7 @@ from summarizer.editorial import (
 from summarizer.grounding import SourcePassage, serialize_source_passage
 from summarizer.hierarchy import TreeNode
 from summarizer.ingestion import SourceDocument
+from summarizer.leaf import reader_summary_node
 from summarizer.providers.base import GenerationResult, ModelProvider
 from summarizer.reliability import ReliabilityTracker
 from summarizer.runtime.observers import (
@@ -1594,6 +1595,8 @@ def _draft_and_verify(
     """
     scope = section.scope if section is not None else None
     detail = section.label if section is not None else None
+    # Labels in the stored summary are not facts to keep or to restore.
+    root = reader_summary_node(root)
     compression_generations: tuple[GenerationResult, ...] = ()
     if source_cores is not None:
         root, compression_generations = _prepare_root_for_editorial(
@@ -1611,6 +1614,7 @@ def _draft_and_verify(
             reserve_work=reserve_work,
             work_prefix=section.compression_prefix if section is not None else "",
         )
+        root = reader_summary_node(root)
     if reserve_work is not None:
         reserve_work(
             (
