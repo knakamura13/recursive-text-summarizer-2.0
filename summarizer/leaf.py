@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -25,6 +26,81 @@ from summarizer.summaries import (
 
 class LeafSummaryError(ValueError):
     """A provider response could not become a valid leaf record."""
+
+
+# Parenthetical and bracketed labels, the form merge writes into a summary
+# (`(S000033)`, `(S000038, S000039)`). A bare identifier can be source text.
+_SEGMENT_CITATION = re.compile(
+    r"[ \t]*\(\s*[SD]\d{6}(?:\s*[,;]\s*[SD]\d{6})*\s*\)"
+    r"|[ \t]*\[\s*[SD]\d{6}(?:\s*[,;]\s*[SD]\d{6})*\s*\]"
+)
+_PROSE_KEYS = frozenset({"summary", "text", "qualification"})
+
+
+def prose_cites_segment_id(text: str) -> bool:
+    return _SEGMENT_CITATION.search(text) is not None
+
+
+def without_segment_citations(text: str) -> str:
+    """Drop internal segment labels, leaving the rest of the prose unchanged.
+
+    A string with no label is returned as it was, including its whitespace.
+    """
+    cleaned = _SEGMENT_CITATION.sub("", text)
+    if cleaned == text:
+        return text
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r" +([.,;:!?])", r"\1", cleaned)
+    return cleaned
+
+
+def reader_summary_node(node: SummaryNode) -> SummaryNode:
+    """A copy whose prose no longer carries internal segment labels.
+
+    Provenance and evidence stay, so verification can still cite them. A field
+    whose text would become blank keeps its original text.
+    """
+    payload = node.model_dump(mode="json")
+    _clean_prose(payload)
+    cleaned = SummaryNode.model_validate(payload)
+    return node if cleaned == node else cleaned
+
+
+def _clean_prose(value: object) -> None:
+    if isinstance(value, dict):
+        for key, child in list(value.items()):
+            if key == "quote":
+                continue
+            if key in _PROSE_KEYS and isinstance(child, str):
+                updated = without_segment_citations(child)
+                if updated.strip():
+                    value[key] = updated
+            elif key == "entities" and isinstance(child, list):
+                value[key] = [
+                    without_segment_citations(item) if isinstance(item, str) else item
+                    for item in child
+                    if not isinstance(item, str) or without_segment_citations(item).strip()
+                ]
+            else:
+                _clean_prose(child)
+    elif isinstance(value, list):
+        for item in value:
+            _clean_prose(item)
+
+
+def require_prose_without_segment_ids(node: SummaryNode, *, subject: str) -> None:
+    """Reject a record that wrote an internal segment label into its prose."""
+    texts = [node.summary, *node.entities]
+    for unit in node.content_units:
+        texts.append(unit.text)
+        if unit.qualification:
+            texts.append(unit.qualification)
+    texts.extend(item.text for item in (*node.qualifications, *node.contradictions))
+    if any(prose_cites_segment_id(text) for text in texts):
+        raise LeafSummaryError(
+            f"{subject}: summary cites an internal segment id; write identifiers "
+            "only in provenance and evidence, never in the summary"
+        )
 
 
 # Identifies the prompt wording for cache keys and audit artifacts. Bump it
@@ -360,7 +436,7 @@ def parse_leaf_summary(text: str, *, segment: SourceSegment) -> SummaryNode:
             f"{segment.segment_id}: leaf response reported level {node.level}; "
             f"leaf summaries must have level 0"
         )
-
+    require_prose_without_segment_ids(node, subject=segment.segment_id)
     return node
 
 
@@ -491,6 +567,7 @@ class _PreparedLeaf:
             legal={self.segment.segment_id: core_text(self.segment)},
             subject=self.segment.segment_id,
         )
+        require_prose_without_segment_ids(node, subject=self.segment.segment_id)
         return node
 
     def validate(self, payload: object) -> object:

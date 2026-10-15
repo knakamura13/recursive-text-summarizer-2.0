@@ -411,7 +411,21 @@ def test_prose_with_braces_before_valid_json_is_accepted() -> None:
     assert node.level == 0
 
 
-def test_rejects_leaf_response_with_nonzero_level() -> None:
+def test_rejects_a_summary_that_cites_an_internal_segment_id() -> None:
+    with pytest.raises(LeafSummaryError, match="internal segment id"):
+        parse_leaf_summary(
+            payload(summary="The archive moved (S000001)."),
+            segment=segment(),
+        )
+
+
+def test_a_bare_segment_id_in_the_summary_is_not_a_citation() -> None:
+    node = parse_leaf_summary(
+        payload(summary="A local summary for S000001."),
+        segment=segment(),
+    )
+
+    assert node.summary == "A local summary for S000001."
     """A leaf summary must report level 0.
 
     Accepting level=3 (or any non-zero value) silently creates a mismatch

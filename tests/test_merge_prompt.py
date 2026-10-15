@@ -348,7 +348,14 @@ def test_parsing_rejects_malformed_output_naming_the_subject() -> None:
         )
 
 
-def test_prompt_version_is_bound_into_the_fences() -> None:
+def test_parsing_rejects_a_segment_id_written_into_the_summary() -> None:
+    with pytest.raises(LeafSummaryError, match="internal segment id"):
+        parse_merged_summary(
+            merged_payload(summary="The hall vanished (S000034)."),
+            legal=LEGAL,
+            subject="L1N0007",
+            level=1,
+        )
     """The version is a cache-key input, so it must change the request bytes."""
     import summarizer.merge as merge
 

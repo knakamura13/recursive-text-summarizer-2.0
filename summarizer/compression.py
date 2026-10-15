@@ -11,7 +11,12 @@ from dataclasses import dataclass, replace
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from summarizer.budget import OverheadMeasurement, RequestLimits, measure_request_tokens
-from summarizer.leaf import _describe, _extract_json_object, _sanitize
+from summarizer.leaf import (
+    _describe,
+    _extract_json_object,
+    _sanitize,
+    prose_cites_segment_id,
+)
 from summarizer.providers.base import (
     GenerationRequest,
     GenerationResult,
@@ -64,6 +69,8 @@ class CompressedDraft(BaseModel):
     def _nonblank(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("must not be blank")
+        if prose_cites_segment_id(value):
+            raise ValueError("cites an internal segment id")
         return value
 
 

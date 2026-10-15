@@ -3,7 +3,12 @@ import json
 import pytest
 
 from summarizer.cache import CacheStore
-from summarizer.editorial import EditorialError, build_editorial_request, write_editorial
+from summarizer.editorial import (
+    EditorialError,
+    build_editorial_request,
+    parse_final_draft,
+    write_editorial,
+)
 from summarizer.providers.base import GenerationRequest, GenerationResult
 from summarizer.runtime.observers import ItemFailedError, RuntimeObserver, StageName
 from summarizer.segmentation import CacheCoordinator
@@ -54,6 +59,39 @@ def test_request_is_a_dedicated_genre_neutral_fenced_final_call() -> None:
     assert root().summary not in request.instructions
     assert root().summary in request.input_text
     assert "GROUNDED-ROOT" in request.input_text
+    assert "internal source identifier" in request.instructions
+    assert "S000001" not in request.input_text
+    assert "segment_id" not in request.input_text
+    assert "provenance" not in request.input_text
+
+
+def test_editorial_input_drops_a_segment_citation_from_the_summary() -> None:
+    cited = root().model_copy(update={"summary": "The hall vanished (S000034)."})
+    request = build_editorial_request(
+        cited, source_id=SOURCE_ID, model="m", timeout_seconds=30, target_words=120
+    )
+
+    assert "The hall vanished." in request.input_text
+    assert "S000034" not in request.input_text
+
+
+def test_a_draft_that_cites_a_segment_id_is_reasked() -> None:
+    provider = ScriptedProvider(
+        '{"text":"The hall vanished (S000034)."}',
+        '{"text":"The hall vanished."}',
+    )
+
+    result = write_editorial(
+        root(), provider, source_id=SOURCE_ID, model="m", timeout_seconds=30, target_words=50
+    )
+
+    assert result.text == "The hall vanished."
+    assert len(provider.requests) == 2
+
+
+def test_parse_final_draft_rejects_a_segment_citation() -> None:
+    with pytest.raises(EditorialError, match="internal segment id"):
+        parse_final_draft('{"text":"The hall vanished (S000002)."}')
 
 
 def test_final_writer_returns_redacted_plain_text_and_is_deterministic() -> None:

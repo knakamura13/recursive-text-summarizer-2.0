@@ -15,6 +15,7 @@ from summarizer.leaf import (
     _sanitize,
     bound_heading,
     derive_provenance,
+    require_prose_without_segment_ids,
     validate_provenance,
 )
 from summarizer.providers.base import GenerationRequest
@@ -390,6 +391,7 @@ def parse_merged_summary(
         quotation_sources=quotation_sources,
         subject=subject,
     )
+    require_prose_without_segment_ids(node, subject=subject)
     canonical_order = source_order or tuple(legal)
     retained = set(preserved_provenance)
     retained.update(derive_provenance(node, source_order=canonical_order))
