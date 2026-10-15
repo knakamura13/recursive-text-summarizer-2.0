@@ -17,6 +17,7 @@ from summarizer.verification import (
     _redact_finding,
     build_decomposition_request,
     build_source_lexical_index,
+    evidence_overlap_too_low,
     reduce_batch_findings,
     split_draft_spans,
     verify_draft_once,
@@ -176,6 +177,60 @@ def test_a_supported_sentence_whose_quotes_share_too_few_of_its_words_is_not_sup
         ClaimVerdict.INSUFFICIENTLY_SUPPORTED,
     ]
     assert "evidence_overlap_below_floor" in result.diagnostic_codes
+
+
+@pytest.mark.parametrize(
+    ("sentence", "quote"),
+    [
+        ("The harbour opened in May.", "The harbour opened in May."),
+        ("Cities house agencies.", "A city houses an agency."),
+        (
+            "The harbour opened in May, welcoming boats arriving.",
+            "The harbour opened in May and welcomed a boat that arrived.",
+        ),
+        (
+            "The crew painted the harbour under clear skies.",
+            "The crew painted the harbour.",
+        ),
+        (
+            "The crew painted the harbour before noon.",
+            "The crew painted the harbour before noon.",
+        ),
+    ],
+)
+def test_a_fully_quoted_sentence_clears_the_overlap_floor(sentence: str, quote: str) -> None:
+    assert evidence_overlap_too_low(sentence, [quote]) is False
+
+
+@pytest.mark.parametrize(
+    ("sentence", "quote"),
+    [
+        (
+            "Stories lasted twenty minutes while the visitors waited outside.",
+            "The meetings ran twenty minutes overtime.",
+        ),
+        (
+            "Mayor Chen told the crowd the harbour opened in spring.",
+            "The harbour opened in May.",
+        ),
+        (
+            "The harbour opened, for example when the harbour flooded overnight after rain.",
+            "The harbour opened in May.",
+        ),
+        (
+            "The harbour opened in May and the northern villages flooded that night.",
+            "The harbour opened in May.",
+        ),
+        (
+            "The crew painted the harbour and the northern villages flooded.",
+            "The crew painted the harbour before noon.",
+        ),
+    ],
+)
+def test_a_clause_that_reuses_a_few_quote_words_is_not_supported(
+    sentence: str, quote: str
+) -> None:
+    assert evidence_overlap_too_low(sentence, [quote]) is True
 
 
 def test_a_supported_sentence_with_an_unquoted_clause_is_not_supported() -> None:

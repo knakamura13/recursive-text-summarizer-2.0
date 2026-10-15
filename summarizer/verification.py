@@ -670,6 +670,14 @@ def _terms(text: str) -> frozenset[str]:
 # unstated (#148).
 MIN_EVIDENCE_TERM_SHARE = 0.15
 MIN_CLAUSE_WORDS = 3
+# One or two shared words can still clear the 15% floor (#185). A stretch of
+# at least this many content words must share `MIN_SHARED_CONTENT_WORDS` of
+# them. A shorter stretch is left to the 15% floor, so a five-word sentence
+# can still rest on one quoted word. A run of `MIN_CLAUSE_WORDS` unstated
+# content words is an added fact when the quotes themselves state at least
+# `MIN_SHARED_CONTENT_WORDS` content words.
+MIN_SHARED_CONTENT_WORDS = 3
+MIN_SHARED_WORD_SPAN = 6
 _CLAUSE_BREAK = re.compile(r"[,;:()\u2013\u2014]| - ")
 # English stems, so that word forms match ("gatherings" and "gather",
 # "cities" and "city").
@@ -720,38 +728,75 @@ def _stem(word: str) -> str:
     return _STEMMER.stem(word)
 
 
-def _content_words(text: str) -> set[str]:
-    """`text`'s words minus function words, with common suffixes stripped.
+def _content_word_sequence(text: str) -> list[str]:
+    """`text`'s content words in order, with common suffixes stripped.
 
     A word in a script without spaces between words can't be told apart from
     its neighbours, so it is left out.
     """
-    return {
-        _stem(word)
-        for word in _terms(text) - _FUNCTION_WORDS
-        if not _is_unsegmented(word)
-    }
+    normalized = unicodedata.normalize("NFC", text).casefold()
+    words: list[str] = []
+    for match in _TERM.finditer(normalized):
+        word = match.group()
+        if word in _FUNCTION_WORDS or _is_unsegmented(word):
+            continue
+        words.append(_stem(word))
+    return words
+
+
+def _content_words(text: str) -> set[str]:
+    """`text`'s content words, with common suffixes stripped."""
+    return set(_content_word_sequence(text))
+
+
+def _unstated_run(sequence: Sequence[str], quoted: set[str]) -> bool:
+    """True when `MIN_CLAUSE_WORDS` content words in a row are absent from `quoted`."""
+    run = 0
+    for word in sequence:
+        if word in quoted:
+            run = 0
+            continue
+        run += 1
+        if run >= MIN_CLAUSE_WORDS:
+            return True
+    return False
 
 
 def evidence_overlap_too_low(text: str, quotes: Sequence[str]) -> bool:
-    """True when `quotes` share too few of the content words of `text`, or of
-    one of its clauses, to support it.
+    """True when `quotes` leave part of `text` unstated.
 
-    Clauses are split at commas, semicolons, colons, dashes and brackets, and
-    a clause with fewer than `MIN_CLAUSE_WORDS` content words is not checked
-    on its own. Text with no content words is never too low.
+    The 15% floor still applies to the sentence and to each clause of at least
+    `MIN_CLAUSE_WORDS` content words. A stretch of `MIN_SHARED_WORD_SPAN`
+    content words that clears that floor on fewer than
+    `MIN_SHARED_CONTENT_WORDS` quote words is still unstated. So is a run of
+    `MIN_CLAUSE_WORDS` content words the quotes do not contain, when those
+    quotes state at least `MIN_SHARED_CONTENT_WORDS` content words. Clauses
+    are split at commas, semicolons, colons, dashes and brackets. A shorter
+    clause is covered only by the sentence checks. Text with no content words
+    is never too low.
     """
     quoted = _content_words(" ".join(quotes))
 
-    def too_low(words: set[str]) -> bool:
-        return bool(words) and len(words & quoted) / len(words) < MIN_EVIDENCE_TERM_SHARE
+    def too_low(raw: str) -> bool:
+        sequence = _content_word_sequence(raw)
+        words = set(sequence)
+        if not words:
+            return False
+        shared = len(words & quoted)
+        if shared / len(words) < MIN_EVIDENCE_TERM_SHARE:
+            return True
+        if len(words) >= MIN_SHARED_WORD_SPAN and shared < MIN_SHARED_CONTENT_WORDS:
+            return True
+        if len(quoted) >= MIN_SHARED_CONTENT_WORDS and _unstated_run(sequence, quoted):
+            return True
+        return False
 
-    if too_low(_content_words(text)):
+    if too_low(text):
         return True
     return any(
-        too_low(words)
+        too_low(clause)
         for clause in _CLAUSE_BREAK.split(text)
-        if len(words := _content_words(clause)) >= MIN_CLAUSE_WORDS
+        if len(_content_words(clause)) >= MIN_CLAUSE_WORDS
     )
 
 
@@ -2809,7 +2854,7 @@ def verify_and_repair(
     return coordinator.resolve(
         stage="verification",
         work_id=work_id,
-        prompt_version="verification/9",
+        prompt_version="verification/10",
         schema_version="verification/1",
         input_value={
             "source_id": source_id,
