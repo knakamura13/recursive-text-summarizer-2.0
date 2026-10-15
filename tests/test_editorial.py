@@ -65,19 +65,28 @@ def test_request_is_a_dedicated_genre_neutral_fenced_final_call() -> None:
     assert "provenance" not in request.input_text
 
 
-def test_editorial_input_drops_a_segment_citation_from_the_summary() -> None:
-    cited = root().model_copy(update={"summary": "The hall vanished (S000034)."})
+def test_editorial_input_drops_an_owned_segment_citation_from_the_summary() -> None:
+    cited = root().model_copy(update={"summary": "The hall vanished (S000001)."})
     request = build_editorial_request(
         cited, source_id=SOURCE_ID, model="m", timeout_seconds=30, target_words=120
     )
 
     assert "The hall vanished." in request.input_text
-    assert "S000034" not in request.input_text
+    assert "S000001" not in request.input_text
 
 
-def test_a_draft_that_cites_a_segment_id_is_reasked() -> None:
+def test_editorial_input_keeps_a_foreign_parenthetical_id() -> None:
+    cited = root().model_copy(update={"summary": "The sample (S123456) remained."})
+    request = build_editorial_request(
+        cited, source_id=SOURCE_ID, model="m", timeout_seconds=30, target_words=120
+    )
+
+    assert "The sample (S123456) remained." in request.input_text
+
+
+def test_a_draft_that_cites_an_owned_segment_id_is_reasked() -> None:
     provider = ScriptedProvider(
-        '{"text":"The hall vanished (S000034)."}',
+        '{"text":"The hall vanished (S000001)."}',
         '{"text":"The hall vanished."}',
     )
 
@@ -89,9 +98,21 @@ def test_a_draft_that_cites_a_segment_id_is_reasked() -> None:
     assert len(provider.requests) == 2
 
 
-def test_parse_final_draft_rejects_a_segment_citation() -> None:
+def test_parse_final_draft_rejects_an_owned_segment_citation() -> None:
     with pytest.raises(EditorialError, match="internal segment id"):
-        parse_final_draft('{"text":"The hall vanished (S000002)."}')
+        parse_final_draft(
+            '{"text":"The hall vanished (S000002)."}',
+            owned=("S000002",),
+        )
+
+
+def test_parse_final_draft_keeps_a_foreign_segment_citation() -> None:
+    draft = parse_final_draft(
+        '{"text":"The sample (S123456) remained."}',
+        owned=("S000001",),
+    )
+
+    assert draft.text == "The sample (S123456) remained."
 
 
 def test_final_writer_returns_redacted_plain_text_and_is_deterministic() -> None:

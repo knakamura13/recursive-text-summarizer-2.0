@@ -177,8 +177,10 @@ def test_ollama_merge_uses_request_budget_not_leaf_capacity() -> None:
         model="qwen3.5:9b",
         ollama_host="http://localhost:11434",
     )
+    # The longer merge instructions need a slightly wider window. The request
+    # must still exceed leaf capacity and stay inside the request budget.
     strategy = StrategyConfig(
-        strategy="hierarchical", context_window=10_000, max_output_tokens=1_024
+        strategy="hierarchical", context_window=10_500, max_output_tokens=1_024
     )
     provider = GroundedPipelineProvider()
 

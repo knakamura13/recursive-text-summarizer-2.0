@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+import summarizer.merge as merge
 from summarizer.leaf import LeafSummaryError
 from summarizer.grounding import SourcePassage
 from summarizer.merge import (
@@ -351,14 +352,34 @@ def test_parsing_rejects_malformed_output_naming_the_subject() -> None:
 def test_parsing_rejects_a_segment_id_written_into_the_summary() -> None:
     with pytest.raises(LeafSummaryError, match="internal segment id"):
         parse_merged_summary(
-            merged_payload(summary="The hall vanished (S000034)."),
+            merged_payload(summary="The hall vanished (S000001)."),
             legal=LEGAL,
             subject="L1N0007",
             level=1,
         )
-    """The version is a cache-key input, so it must change the request bytes."""
-    import summarizer.merge as merge
 
+
+def test_parsing_keeps_a_foreign_parenthetical_id() -> None:
+    node = parse_merged_summary(
+        merged_payload(summary="The sample (S123456) remained."),
+        legal=LEGAL,
+        subject="L1N0007",
+        level=1,
+    )
+
+    assert node.summary == "The sample (S123456) remained."
+
+
+def test_prompt_forbids_identifiers_in_prose() -> None:
+    instructions = request_for().instructions
+
+    assert "Do not write an internal segment identifier" in instructions
+    assert "An identifier is not a fact of the source" in instructions
+    assert "parenthetical or bracketed label" in instructions
+
+
+def test_prompt_version_is_bound_into_the_fences() -> None:
+    """The version is a cache-key input, so it must change the request bytes."""
     baseline = request_for().input_text
     original = merge.MERGE_PROMPT_VERSION
     try:
@@ -367,4 +388,4 @@ def test_parsing_rejects_a_segment_id_written_into_the_summary() -> None:
     finally:
         merge.MERGE_PROMPT_VERSION = original
 
-    assert MERGE_PROMPT_VERSION == "merge-prompt/6"
+    assert MERGE_PROMPT_VERSION == "merge-prompt/7"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 
 from pydantic import ValidationError
@@ -30,6 +30,9 @@ class LeafSummaryError(ValueError):
 
 # Parenthetical and bracketed labels, the form merge writes into a summary
 # (`(S000033)`, `(S000038, S000039)`). A bare identifier can be source text.
+# A label counts only when this operation owns it. A source fact such as
+# `(S123456)` is not one of those identifiers and stays in the prose.
+_SEGMENT_ID = re.compile(r"[SD]\d{6}")
 _SEGMENT_CITATION = re.compile(
     r"[ \t]*\(\s*[SD]\d{6}(?:\s*[,;]\s*[SD]\d{6})*\s*\)"
     r"|[ \t]*\[\s*[SD]\d{6}(?:\s*[,;]\s*[SD]\d{6})*\s*\]"
@@ -37,16 +40,47 @@ _SEGMENT_CITATION = re.compile(
 _PROSE_KEYS = frozenset({"summary", "text", "qualification"})
 
 
-def prose_cites_segment_id(text: str) -> bool:
-    return _SEGMENT_CITATION.search(text) is not None
+def _owned_ids(owned: Collection[str] | None) -> frozenset[str]:
+    return frozenset(owned or ())
 
 
-def without_segment_citations(text: str) -> str:
-    """Drop internal segment labels, leaving the rest of the prose unchanged.
+def _rewrite_owned_citation(match: re.Match[str], owned: frozenset[str]) -> str:
+    raw = match.group(0)
+    labels = _SEGMENT_ID.findall(raw)
+    if not labels or not any(label in owned for label in labels):
+        return raw
+    kept = [label for label in labels if label not in owned]
+    if not kept:
+        return ""
+    opener = "[" if "[" in raw else "("
+    closer = "]" if opener == "[" else ")"
+    leading = raw[: len(raw) - len(raw.lstrip(" \t"))]
+    return f"{leading}{opener}{', '.join(kept)}{closer}"
 
-    A string with no label is returned as it was, including its whitespace.
+
+def prose_cites_segment_id(text: str, owned: Collection[str] | None = None) -> bool:
+    """Whether `text` cites one of `owned` as a parenthetical or bracketed label."""
+    owned_ids = _owned_ids(owned)
+    if not owned_ids:
+        return False
+    return any(
+        any(label in owned_ids for label in _SEGMENT_ID.findall(match.group(0)))
+        for match in _SEGMENT_CITATION.finditer(text)
+    )
+
+
+def without_segment_citations(text: str, owned: Collection[str] | None = None) -> str:
+    """Drop owned segment labels, leaving the rest of the prose unchanged.
+
+    A string with no owned label is returned as it was, including its whitespace.
+    A label this operation does not own is a source fact and stays.
     """
-    cleaned = _SEGMENT_CITATION.sub("", text)
+    owned_ids = _owned_ids(owned)
+    if not owned_ids:
+        return text
+    cleaned = _SEGMENT_CITATION.sub(
+        lambda match: _rewrite_owned_citation(match, owned_ids), text
+    )
     if cleaned == text:
         return text
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
@@ -54,49 +88,69 @@ def without_segment_citations(text: str) -> str:
     return cleaned
 
 
+def owned_segment_ids(node: SummaryNode) -> frozenset[str]:
+    """Identifiers this record already uses for provenance and evidence."""
+    found = set(node.provenance)
+    for unit in node.content_units:
+        found.update(item.segment_id for item in unit.evidence)
+    for annotation in (*node.qualifications, *node.contradictions):
+        found.update(item.segment_id for item in annotation.evidence)
+    found.update(item.segment_id for item in node.quotations)
+    return frozenset(found)
+
+
 def reader_summary_node(node: SummaryNode) -> SummaryNode:
-    """A copy whose prose no longer carries internal segment labels.
+    """A copy whose prose no longer carries this record's segment labels.
 
     Provenance and evidence stay, so verification can still cite them. A field
-    whose text would become blank keeps its original text.
+    whose text would become blank keeps its original text. A parenthetical
+    label that is not one of this record's identifiers stays, because it can
+    be a fact of the source.
     """
     payload = node.model_dump(mode="json")
-    _clean_prose(payload)
+    _clean_prose(payload, owned_segment_ids(node))
     cleaned = SummaryNode.model_validate(payload)
     return node if cleaned == node else cleaned
 
 
-def _clean_prose(value: object) -> None:
+def _clean_prose(value: object, owned: frozenset[str]) -> None:
     if isinstance(value, dict):
         for key, child in list(value.items()):
             if key == "quote":
                 continue
             if key in _PROSE_KEYS and isinstance(child, str):
-                updated = without_segment_citations(child)
+                updated = without_segment_citations(child, owned)
                 if updated.strip():
                     value[key] = updated
             elif key == "entities" and isinstance(child, list):
                 value[key] = [
-                    without_segment_citations(item) if isinstance(item, str) else item
+                    (
+                        without_segment_citations(item, owned)
+                        if isinstance(item, str)
+                        else item
+                    )
                     for item in child
-                    if not isinstance(item, str) or without_segment_citations(item).strip()
+                    if not isinstance(item, str)
+                    or without_segment_citations(item, owned).strip()
                 ]
             else:
-                _clean_prose(child)
+                _clean_prose(child, owned)
     elif isinstance(value, list):
         for item in value:
-            _clean_prose(item)
+            _clean_prose(item, owned)
 
 
-def require_prose_without_segment_ids(node: SummaryNode, *, subject: str) -> None:
-    """Reject a record that wrote an internal segment label into its prose."""
+def require_prose_without_segment_ids(
+    node: SummaryNode, *, subject: str, owned: Collection[str]
+) -> None:
+    """Reject a record that wrote one of `owned` into its prose as a label."""
     texts = [node.summary, *node.entities]
     for unit in node.content_units:
         texts.append(unit.text)
         if unit.qualification:
             texts.append(unit.qualification)
     texts.extend(item.text for item in (*node.qualifications, *node.contradictions))
-    if any(prose_cites_segment_id(text) for text in texts):
+    if any(prose_cites_segment_id(text, owned) for text in texts):
         raise LeafSummaryError(
             f"{subject}: summary cites an internal segment id; write identifiers "
             "only in provenance and evidence, never in the summary"
@@ -105,7 +159,7 @@ def require_prose_without_segment_ids(node: SummaryNode, *, subject: str) -> Non
 
 # Identifies the prompt wording for cache keys and audit artifacts. Bump it
 # whenever a change could alter a model's output for identical input.
-LEAF_PROMPT_VERSION = "leaf-prompt/4"
+LEAF_PROMPT_VERSION = "leaf-prompt/5"
 
 LEAF_SCHEMA_NAME = "leaf_summary"
 
@@ -135,6 +189,10 @@ not infer beyond it.
 at least one evidence item. In every evidence item, segment_id must be exactly \
 {segment_id}; never use an empty string or any other value. Set provenance to \
 ["{segment_id}"].
+- Do not write an internal segment identifier in the summary, in a content \
+unit's text or qualification, or in an entity. Identifiers belong only in \
+provenance and in evidence segment_id fields. An identifier is not a fact of \
+the source.
 - Copy any quotation character for character from the {noun}. Every quote must \
 be one of the values the schema allows, or null when none of them fits. Set \
 quote to null, never an empty string, whenever you are unsure that the text is \
@@ -436,7 +494,9 @@ def parse_leaf_summary(text: str, *, segment: SourceSegment) -> SummaryNode:
             f"{segment.segment_id}: leaf response reported level {node.level}; "
             f"leaf summaries must have level 0"
         )
-    require_prose_without_segment_ids(node, subject=segment.segment_id)
+    require_prose_without_segment_ids(
+        node, subject=segment.segment_id, owned=(segment.segment_id,)
+    )
     return node
 
 
@@ -567,7 +627,9 @@ class _PreparedLeaf:
             legal={self.segment.segment_id: core_text(self.segment)},
             subject=self.segment.segment_id,
         )
-        require_prose_without_segment_ids(node, subject=self.segment.segment_id)
+        require_prose_without_segment_ids(
+            node, subject=self.segment.segment_id, owned=(self.segment.segment_id,)
+        )
         return node
 
     def validate(self, payload: object) -> object:

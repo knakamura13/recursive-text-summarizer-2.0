@@ -88,6 +88,8 @@ def test_instructions_disambiguate_required_and_absent_values() -> None:
     assert "Every content unit must have" in instructions
     assert "segment_id must be exactly S000001" in instructions
     assert 'provenance to ["S000001"]' in instructions
+    assert "Do not write an internal segment identifier" in instructions
+    assert "An identifier is not a fact of the source" in instructions
 
 
 def test_requests_are_deterministic_and_carry_provenance() -> None:

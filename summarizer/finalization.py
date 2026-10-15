@@ -88,7 +88,7 @@ from summarizer.editorial import (
 from summarizer.grounding import SourcePassage, serialize_source_passage
 from summarizer.hierarchy import TreeNode
 from summarizer.ingestion import SourceDocument
-from summarizer.leaf import reader_summary_node
+from summarizer.leaf import owned_segment_ids, reader_summary_node
 from summarizer.providers.base import GenerationResult, ModelProvider
 from summarizer.reliability import ReliabilityTracker
 from summarizer.runtime.observers import (
@@ -752,6 +752,7 @@ def _prepare_root_for_editorial(
         limits=limits,
         reserve_work=reserve_work,
         work_prefix=work_prefix,
+        owned_ids=owned_segment_ids(root),
     )
     return root.model_copy(update={"summary": compressed.text}), compressed.generations
 
@@ -1667,6 +1668,7 @@ def _draft_and_verify(
                 request_limits=request_limits,
                 reserve_work=reserve_work,
                 section=section,
+                owned_ids=owned_segment_ids(root),
             )
             compression_generations = (*compression_generations, *trim_generations)
             final_text = trimmed if trimmed is not None else final_text
@@ -1720,6 +1722,7 @@ def _draft_and_verify(
             request_limits=request_limits,
             reserve_work=reserve_work,
             section=section,
+            owned_ids=owned_segment_ids(root),
         )
         compression_generations = (*compression_generations, *trim_generations)
         if trimmed is not None:
@@ -1772,6 +1775,7 @@ def _trim_prose(
     request_limits: RequestLimits | None,
     reserve_work: Callable[[tuple[str, ...]], None] | None,
     section: _SectionStep,
+    owned_ids: Collection[str] = (),
 ) -> tuple[str | None, tuple[GenerationResult, ...]]:
     """Lightly trim a section's prose when it is above its target band.
 
@@ -1803,6 +1807,7 @@ def _trim_prose(
         reserve_work=reserve_work,
         work_prefix=section.trim_prefix,
         rejected_pass_limit=SECTION_TRIM_REJECTED_PASS_LIMIT,
+        owned_ids=owned_ids,
     )
     if compressed.passes == 0:
         return None, compressed.generations

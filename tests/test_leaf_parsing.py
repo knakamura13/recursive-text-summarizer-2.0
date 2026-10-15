@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from summarizer.leaf import LeafSummaryError, parse_leaf_summary
+from summarizer.leaf import LeafSummaryError, parse_leaf_summary, without_segment_citations
 from summarizer.segmentation import BoundaryKind, SourceSegment
 
 SOURCE_TEXT = (
@@ -419,6 +419,15 @@ def test_rejects_a_summary_that_cites_an_internal_segment_id() -> None:
         )
 
 
+def test_a_foreign_parenthetical_id_in_the_summary_is_kept() -> None:
+    node = parse_leaf_summary(
+        payload(summary="The sample (S123456) moved."),
+        segment=segment(),
+    )
+
+    assert node.summary == "The sample (S123456) moved."
+
+
 def test_a_bare_segment_id_in_the_summary_is_not_a_citation() -> None:
     node = parse_leaf_summary(
         payload(summary="A local summary for S000001."),
@@ -426,6 +435,18 @@ def test_a_bare_segment_id_in_the_summary_is_not_a_citation() -> None:
     )
 
     assert node.summary == "A local summary for S000001."
+
+
+def test_without_segment_citations_keeps_a_foreign_label_in_a_mixed_group() -> None:
+    cleaned = without_segment_citations(
+        "The sample (S000001, S123456) remained.",
+        owned=("S000001",),
+    )
+
+    assert cleaned == "The sample (S123456) remained."
+
+
+def test_rejects_leaf_response_with_nonzero_level() -> None:
     """A leaf summary must report level 0.
 
     Accepting level=3 (or any non-zero value) silently creates a mismatch

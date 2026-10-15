@@ -5,9 +5,11 @@ import pytest
 from summarizer.compression import (
     BAND_TOLERANCE,
     RETENTION_RATIO,
+    CompressionError,
     build_compression_request,
     compress_to_target,
     compression_pass_work_ids,
+    parse_compressed_draft,
     retain_sentences_with_missing_literals,
     retain_sentences_with_omitted_numbers,
     word_count,
@@ -44,6 +46,23 @@ def test_compression_prompt_avoids_legacy_fragments() -> None:
     assert "Ignore complete sentences" not in request.instructions
     assert "Abbreviate" not in request.instructions
     assert "complete sentences" in request.instructions.lower()
+
+
+def test_parse_compressed_draft_rejects_only_an_owned_segment_id() -> None:
+    with pytest.raises(CompressionError, match="internal segment id"):
+        parse_compressed_draft(
+            '{"text":"The hall vanished (S000001)."}',
+            subject="C01K000001",
+            owned=("S000001",),
+        )
+
+    draft = parse_compressed_draft(
+        '{"text":"The sample (S123456) remained."}',
+        subject="C01K000001",
+        owned=("S000001",),
+    )
+
+    assert draft.text == "The sample (S123456) remained."
 
 
 def test_stop_rules_without_model_calls() -> None:
