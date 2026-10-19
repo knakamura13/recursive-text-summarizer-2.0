@@ -1,0 +1,67 @@
+{
+  "data": [
+    {
+      "id": "meta-llama/llama-3.3-70b-instruct",
+      "canonical_slug": "meta-llama/llama-3.3-70b-instruct",
+      "name": "Meta: Llama 3.3 70B Instruct",
+      "created": 1733400000,
+      "context_length": 131072,
+      "architecture": {
+        "modality": "text->text",
+        "tokenizer": "Llama3",
+        "instruct_type": "llama3"
+      },
+      "pricing": {
+        "prompt": "0.0000001",
+        "completion": "0.00000025"
+      },
+      "top_provider": {
+        "context_length": 131072,
+        "max_completion_tokens": null,
+        "is_moderated": false
+      },
+      "supported_parameters": [
+        "max_tokens",
+        "response_format",
+        "structured_outputs",
+        "temperature"
+      ]
+    },
+    {
+      "id": "vendor/free-small:free",
+      "canonical_slug": "vendor/free-small",
+      "name": "Vendor: Free Small (free)",
+      "created": 1733500000,
+      "context_length": 32768,
+      "pricing": {
+        "prompt": "0",
+        "completion": "0"
+      },
+      "top_provider": {
+        "context_length": 16384,
+        "max_completion_tokens": 4096,
+        "is_moderated": false
+      },
+      "supported_parameters": [
+        "max_tokens"
+      ]
+    },
+    {
+      "id": "vendor/no-length",
+      "canonical_slug": "vendor/no-length",
+      "name": "Vendor: No Length",
+      "created": 1733600000,
+      "context_length": null,
+      "pricing": {
+        "prompt": "0.000001",
+        "completion": "0.000002"
+      },
+      "top_provider": {
+        "context_length": null,
+        "max_completion_tokens": null,
+        "is_moderated": false
+      },
+      "supported_parameters": []
+    }
+  ]
+}

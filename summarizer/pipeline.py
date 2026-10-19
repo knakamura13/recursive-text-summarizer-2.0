@@ -297,6 +297,14 @@ def plan_section_requests(
         )
 
 
+def _app_audit_configuration(app: AppConfig) -> dict[str, object]:
+    """Audit-visible app settings; the pinned upstream appears only when set."""
+    values = asdict(app)
+    if not app.openrouter_upstream:
+        del values["openrouter_upstream"]
+    return values
+
+
 def _provider_schema_reserve(app: AppConfig) -> int:
     return MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES if app.provider == "ollama" else 0
 
@@ -386,6 +394,10 @@ def run_pipeline(
                 "context_window_tokens": report.context_window_tokens,
                 "timeout_seconds": app.timeout_seconds,
             }
+            if app.openrouter_upstream:
+                verification_runtime_descriptor["openrouter_upstream"] = (
+                    app.openrouter_upstream
+                )
         else:
             verification_runtime_descriptor = {
                 "provider": runtime.provider_identity,
@@ -400,6 +412,12 @@ def run_pipeline(
             "provider": app.provider,
             "model": app.model,
             "timeout_seconds": app.timeout_seconds,
+            # Absent when unset, so a run without a pin keeps its descriptor.
+            **(
+                {"openrouter_upstream": app.openrouter_upstream}
+                if app.openrouter_upstream
+                else {}
+            ),
         },
         "counter": {"identity": counter.identity, "exact": counter.exact},
         "strategy": asdict(strategy),
@@ -448,6 +466,7 @@ def run_pipeline(
             provider=app.provider,
             model=app.model,
             ollama_host=app.ollama_host,
+            openrouter_upstream=app.openrouter_upstream,
             counter_identity=counter.identity,
             counter_exact=counter.exact,
             context_window_tokens=report.context_window_tokens,
@@ -716,6 +735,11 @@ def _run_pipeline(
             provider=verifier_runtime.provider_identity,
             model=verifier_runtime.model,
             ollama_host=coordinator.ollama_host,
+            openrouter_upstream=(
+                coordinator.openrouter_upstream
+                if verifier_runtime.provider_identity == "openrouter"
+                else ""
+            ),
             counter_identity=verifier_runtime.counter.identity,
             counter_exact=verifier_runtime.counter.exact,
             context_window_tokens=verifier_runtime.context_window_tokens,
@@ -731,7 +755,7 @@ def _run_pipeline(
         and coordinator.session is not None
     )
     audit_configuration = {
-        "app": asdict(app),
+        "app": _app_audit_configuration(app),
         "strategy": asdict(strategy),
         "pipeline": {
             "target_words": config.target_words,

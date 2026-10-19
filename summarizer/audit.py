@@ -113,6 +113,7 @@ from pydantic import (
     model_validator,
 )
 
+from summarizer.config import PROVIDER_NAMES, normalize_openrouter_upstream
 from summarizer.hierarchy import TreeNode
 from summarizer.providers.base import GenerationResult
 from summarizer.safety import redact_text
@@ -146,8 +147,11 @@ _SEGMENT_ID = re.compile(r"^[DS]\d{6}$")
 _NODE_ID = re.compile(r"^L\d+N\d{4}$")
 _SECTION_ID = re.compile(r"^s[1-9][0-9]*$")
 _SAFE_IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+# A model name, optionally vendor-qualified as `vendor/model` and optionally
+# carrying a `:variant` tag or a leading `~` alias marker, as OpenRouter names do.
 _SAFE_MODEL_IDENTITY = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?::[A-Za-z0-9][A-Za-z0-9._-]{0,127})?$"
+    r"^~?[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,127}){0,2}"
+    r"(?::[A-Za-z0-9][A-Za-z0-9._-]{0,127})?$"
 )
 _VERIFICATION_PROMPT_VERSION = frozenset(
     {
@@ -1697,6 +1701,7 @@ _SAFE_CONFIGURATION = frozenset(
     {
         "provider",
         "model",
+        "openrouter_upstream",
         "timeout_seconds",
         "strategy",
         "context_window",
@@ -1772,9 +1777,21 @@ def _safe_configuration_value(
             return value
         raise _configuration_error(f"{key} must be boolean")
     if key == "provider":
-        if value in {"openai", "ollama"}:
+        if value in PROVIDER_NAMES:
             return value
         raise _configuration_error("provider must be an allowed identity")
+    if key == "openrouter_upstream":
+        try:
+            valid = (
+                isinstance(value, str)
+                and bool(value)
+                and normalize_openrouter_upstream(value) == value
+            )
+        except ValueError:
+            valid = False
+        if valid:
+            return value  # type: ignore[return-value]
+        raise _configuration_error("openrouter_upstream must be a provider slug")
     if key == "strategy":
         if value in {"auto", "direct", "hierarchical"}:
             return value

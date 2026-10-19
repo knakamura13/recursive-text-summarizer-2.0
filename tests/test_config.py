@@ -133,3 +133,30 @@ def test_configuration_rejects_invalid_values(
 ) -> None:
     with pytest.raises(ValueError, match=field_name):
         factory()
+
+
+def test_openrouter_is_an_accepted_provider_with_an_optional_pinned_upstream() -> None:
+    assert AppConfig(provider="openrouter", model="vendor/model").openrouter_upstream == ""
+    pinned = AppConfig(
+        provider="openrouter", model="vendor/model", openrouter_upstream="deepinfra/turbo"
+    )
+    assert pinned.openrouter_upstream == "deepinfra/turbo"
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: AppConfig(provider="openai", openrouter_upstream="deepinfra"),
+        lambda: AppConfig(provider="ollama", ollama_host="http://h", openrouter_upstream="x"),
+        lambda: AppConfig(provider="openrouter", openrouter_upstream="two words"),
+        lambda: AppConfig(provider="openrouter", openrouter_upstream="a/b/c"),
+        lambda: AppConfig(provider="openrouter", openrouter_upstream=" deepinfra"),
+        lambda: AppConfig(provider="openrouter", openrouter_upstream="-leading"),
+        lambda: AppConfig(provider="openrouter", openrouter_upstream="x" * 65),
+    ],
+)
+def test_openrouter_upstream_must_be_a_slug_for_the_openrouter_provider(
+    factory: object,
+) -> None:
+    with pytest.raises(ValueError, match="openrouter_upstream"):
+        factory()  # type: ignore[operator]

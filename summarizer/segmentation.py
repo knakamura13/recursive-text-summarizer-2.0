@@ -61,6 +61,7 @@ class CacheCoordinator:
     counter_exact: bool
     context_window_tokens: int
     behavior: Mapping[str, object]
+    openrouter_upstream: str = ""
     session: CheckpointSession | None = None
     allow_unreferenced_cache: bool = True
     max_in_flight: int = 1
@@ -79,6 +80,7 @@ class CacheCoordinator:
             counter_identity=self.counter_identity, counter_exact=self.counter_exact,
             context_window_tokens=self.context_window_tokens,
             behavior={**self.behavior, **behavior},
+            openrouter_upstream=self.openrouter_upstream,
         )
 
     def resolve(

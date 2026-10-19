@@ -98,7 +98,7 @@ class VerificationRuntime:
     model: str
     timeout_seconds: float
     context_window_tokens: int
-    provider_identity: Literal["openai", "ollama"] = "openai"
+    provider_identity: Literal["openai", "ollama", "openrouter"] = "openai"
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -107,8 +107,8 @@ class VerificationRuntime:
             raise ValueError("timeout_seconds must be positive")
         if self.context_window_tokens <= 0:
             raise ValueError("context_window_tokens must be positive")
-        if self.provider_identity not in ("openai", "ollama"):
-            raise ValueError("provider_identity must be openai or ollama")
+        if self.provider_identity not in ("openai", "ollama", "openrouter"):
+            raise ValueError("provider_identity must be openai, ollama or openrouter")
 
 
 @dataclass(frozen=True)
