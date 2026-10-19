@@ -144,23 +144,40 @@ def _tier_patterns(words: list[str]) -> tuple[re.Pattern[str], ...]:
     )
 
 
-def _title_patterns(title: str) -> tuple[_TitlePattern, ...] | None:
-    """Patterns for a title with any whitespace between its words, ignoring
-    case, from most to least likely a heading: the title as a whole line,
-    then at the start of a line, then anywhere. Each needs whole words, so
-    "Intro" does not match inside "Introduction".
+@dataclass(frozen=True)
+class _TitlePatterns:
+    """How to find one title, ignoring case.
 
-    Each comes as a pair: the title as written, for the text as written, and the
-    title folded (`compat_fold`), for the text's folded view. A title that folding
-    leaves alone has the same pattern object in both places.
+    `tiers` hold the title with any whitespace between its words, from most to least likely a
+    heading: the title as a whole line, then at the start of a line, then anywhere. Each needs
+    whole words, so "Intro" does not match inside "Introduction". Each comes as a pair: the title
+    as written, for the text as written, and the title folded (`compat_fold`), for the text's
+    folded view. A title that folding leaves alone has the same pattern object in both places.
+
+    `respaced` is for a title that no tier finds. A PDF text layer decides spaces from glyph
+    positions, so it can drop or move one where the font changes, as around inline math. It
+    matches a line that is the title alone with all whitespace ignored, on the folded view, so a
+    title's words run together inside a sentence, or a line that only begins with the title,
+    never match. It is compiled the first time a title needs it.
     """
+
+    tiers: tuple[_TitlePattern, ...]
+    folded_letters: str
+
+    @cached_property
+    def respaced(self) -> re.Pattern[str]:
+        letters = r"\s*".join(re.escape(char) for char in self.folded_letters)
+        return re.compile(rf"^[ \t]*({letters})[ \t]*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _title_patterns(title: str) -> _TitlePatterns | None:
     words = clean_text(title).split()
     if not words:
         return None
     as_written = _tier_patterns(words)
     folded_words = compat_fold(" ".join(words)).split()
     folded = as_written if folded_words == words else _tier_patterns(folded_words)
-    return tuple(zip(as_written, folded, strict=True))
+    return _TitlePatterns(tuple(zip(as_written, folded, strict=True)), "".join(folded_words))
 
 
 def _folds(pattern: _TitlePattern, haystack: _Haystack) -> bool:
@@ -170,13 +187,13 @@ def _folds(pattern: _TitlePattern, haystack: _Haystack) -> bool:
     return folded is not as_written or not haystack.text.isascii()
 
 
-def _find_title(
-    patterns: tuple[_TitlePattern, ...], haystack: _Haystack, start: int, end: int
+def _find_spelled(
+    patterns: _TitlePatterns, haystack: _Haystack, start: int, end: int
 ) -> tuple[int, int] | None:
-    """The title's first occurrence in `haystack.text[start:end]`, as source offsets. Each pattern,
+    """The title's first occurrence in `haystack.text[start:end]`, as source offsets. Each tier,
     from most to least likely a heading, is tried on the text as written and then on its folded
     view, so folding only adds matches: a title that matched as written is placed as before."""
-    for pattern in patterns:
+    for pattern in patterns.tiers:
         match = pattern[0].search(haystack.text, start, end)
         if match is not None:
             return match.span(1)
@@ -187,11 +204,26 @@ def _find_title(
     return None
 
 
-def _title_at(
-    patterns: tuple[_TitlePattern, ...], haystack: _Haystack, offset: int
+def _find_title(
+    patterns: _TitlePatterns, haystack: _Haystack, windows: Sequence[tuple[int, int]]
 ) -> tuple[int, int] | None:
-    """The title at exactly `offset` under the loosest pattern, as source offsets."""
-    pattern = patterns[-1]
+    """The title's first occurrence within the first of `windows` that holds it, as source
+    offsets. A line that is the title with its spaces lost or moved is only tried once no
+    window holds the title as written, so a title found as written is placed where it was."""
+    for start, end in windows:
+        if (found := _find_spelled(patterns, haystack, start, end)) is not None:
+            return found
+    for start, end in windows:
+        if (found := haystack.folded.search(patterns.respaced, start, end)) is not None:
+            return found
+    return None
+
+
+def _title_at(
+    patterns: _TitlePatterns, haystack: _Haystack, offset: int
+) -> tuple[int, int] | None:
+    """The title at exactly `offset` under the loosest tier, as source offsets."""
+    pattern = patterns.tiers[-1]
     match = pattern[0].match(haystack.text, offset)
     if match is not None:
         return match.span(1)
@@ -207,7 +239,9 @@ def anchor_outline(
     repeated title lands on its next occurrence. A hint with a page is
     searched within that page, after the previous title when that is on the
     page. Two hints found at one place keep the first. A hint with an
-    offset is placed exactly there, or counted as not found.
+    offset is placed exactly there, or counted as not found. A title not
+    found as written may still match a line that is the title alone with
+    its spaces lost or moved (`_TitlePatterns.respaced`).
     """
     if not hints:
         return (), 0
@@ -224,11 +258,10 @@ def anchor_outline(
                 # The extractor knows where the title is: place it there, never earlier.
                 found = _title_at(patterns, haystack, hint.offset)
             elif hint.page is None:
-                found = _find_title(patterns, haystack, cursor, len(text))
+                found = _find_title(patterns, haystack, [(cursor, len(text))])
             elif (span := by_page.get(hint.page)) is not None:
-                found = _find_title(
-                    patterns, haystack, max(cursor, span.start), span.end
-                ) or _find_title(patterns, haystack, span.start, span.end)
+                windows = [(max(cursor, span.start), span.end), (span.start, span.end)]
+                found = _find_title(patterns, haystack, windows)
         if found is None or found[0] in placed:
             unplaced += 1
             continue
