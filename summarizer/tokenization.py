@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import struct
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -185,6 +187,23 @@ def _search_suffix(
     return best
 
 
+def estimate_notice(counter: TokenCounter) -> str | None:
+    """Return a user-facing notice when a counter's numbers are estimates.
+
+    Budgets, strategy choice and segment sizes all follow these counts, so a
+    run that depends on an estimate should say so wherever it reports them.
+    """
+    if counter.exact:
+        return None
+    notice = (
+        f"Token counts are estimates ({counter.identity}), not the model's own "
+        "tokenizer. Budgets are conservative, so segments may be smaller than "
+        "the context window requires."
+    )
+    reason = getattr(counter, "reason", "")
+    return f"{notice} No exact counter was used: {reason}." if reason else notice
+
+
 # GGUF tokenizers whose counts were checked against Ollama's prompt_eval_count:
 # (tokenizer.ggml.model, tokenizer.ggml.pre). gemma4 matched every one of 1,742
 # recorded requests at system + user tokens + a fixed chat template.
@@ -334,6 +353,207 @@ def _gguf_tokenizer_metadata(path: Path) -> dict[str, Any]:
         raise TokenAccountingError(f"cannot read GGUF metadata from {path.name}") from error
 
 
+# Ollama's tensor layout has no GGUF layer. The model's Hugging Face
+# tokenizer.json is one of several JSON layers beside its configuration, so it
+# is told apart by content. These are the sections `Tokenizer.to_str()` always
+# writes; the library has the last word when the layer is loaded. A manifest
+# can hold more than one tokenizer.json (gemma4:31b lists a second for its
+# companion model), so layers are compared by what they count, not by file.
+_OLLAMA_JSON_LAYER = "application/vnd.ollama.image.json"
+_OLLAMA_LAYER_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_TOKENIZER_JSON_SECTIONS = frozenset(
+    {"added_tokens", "normalizer", "pre_tokenizer", "post_processor", "decoder", "model"}
+)
+
+# Counting fingerprints of tokenizer.json layers whose counts were checked
+# against Ollama's prompt_eval_count (see `_counting_fingerprint`). Empty: no
+# such check has been recorded, so a tokenizer.json is never used silently.
+# Add a fingerprint only with the comparison made by
+# experiments/token_counter_verification, on requests that cover long and
+# non-ASCII text, since the counter must never count fewer tokens than Ollama
+# processes (#120). A tokenizer that counts differently has another
+# fingerprint and stays refused.
+_VERIFIED_TOKENIZER_JSON_FINGERPRINTS: frozenset[str] = frozenset()
+
+
+class _NoTokenizerLayerError(TokenAccountingError):
+    """The model has no tokenizer.json layer, so an earlier refusal is the better reason."""
+
+
+@dataclass(frozen=True)
+class TokenizerJsonCounter:
+    """Count exactly with a model's own tokenizer, read from its tokenizer.json layer.
+
+    For Ollama models in the tensor layout, which carry no GGUF file. Like
+    `GgufTokenCounter`, it does not recognise special tokens in counted text,
+    so a marker such as ``<|turn>`` inside a document counts as its pieces,
+    which can only count more than the model does. It never adds the start
+    token or the chat template, which Ollama wraps around the messages.
+
+    It is not trusted until its layer is listed in
+    `_VERIFIED_TOKENIZER_JSON_FINGERPRINTS`; `allow_unverified` exists only for the
+    comparison against Ollama that earns that listing.
+    """
+
+    tokenizer: Any
+    fingerprint: str
+
+    @classmethod
+    def for_ollama_model(
+        cls,
+        model: str,
+        *,
+        models_dir: Path | None = None,
+        allow_unverified: bool = False,
+    ) -> TokenizerJsonCounter:
+        """Load the tokenizer of a locally installed Ollama model."""
+        root = models_dir or Path(
+            os.environ.get("OLLAMA_MODELS") or Path.home() / ".ollama" / "models"
+        )
+        manifest = root / "manifests" / _ollama_manifest_path(model)
+        try:
+            layers = json.loads(manifest.read_text(encoding="utf-8"))["layers"]
+            digests = [
+                layer["digest"] for layer in layers if layer["mediaType"] == _OLLAMA_JSON_LAYER
+            ]
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise _NoTokenizerLayerError(f"no local Ollama model file for {model!r}") from error
+
+        found: dict[str, Path] = {}
+        for digest in dict.fromkeys(digests):
+            if not isinstance(digest, str) or _OLLAMA_LAYER_DIGEST.fullmatch(digest) is None:
+                raise TokenAccountingError(f"malformed layer digest in the manifest of {model!r}")
+            path = root / "blobs" / digest.replace(":", "-")
+            try:
+                fingerprint = _tokenizer_json_fingerprint(path)
+            except OSError as error:
+                raise TokenAccountingError(f"cannot read layer {digest[:19]} of {model!r}") from error
+            if fingerprint is not None:
+                found.setdefault(fingerprint, path)
+        if not found:
+            raise _NoTokenizerLayerError(f"no tokenizer.json layer in the model {model!r}")
+        if len(found) > 1:
+            raise TokenAccountingError(
+                f"more than one tokenizer.json layer in the model {model!r}, and they count differently"
+            )
+        [(fingerprint, path)] = found.items()
+
+        if not allow_unverified and fingerprint not in _VERIFIED_TOKENIZER_JSON_FINGERPRINTS:
+            raise TokenAccountingError(
+                f"the tokenizer.json of {model!r} (counting fingerprint {fingerprint[:12]}) "
+                "has not been checked against Ollama"
+            )
+        return cls(_tokenizer_from_json(path), fingerprint)
+
+    @property
+    def identity(self) -> str:
+        return "tokenizer-json:" + self.fingerprint[:16]
+
+    @property
+    def exact(self) -> bool:
+        return True
+
+    @property
+    def monotonic(self) -> bool:
+        return False
+
+    def count(self, text: str) -> int:
+        return len(self.tokenizer.encode(text, add_special_tokens=False).ids)
+
+    def fitting_prefix(self, text: str, start: int, end: int, max_tokens: int) -> int:
+        """Same contract as `TiktokenCounter.fitting_prefix`."""
+        return _search_prefix(self.count, text, start, end, max_tokens)
+
+    def fitting_suffix(self, text: str, floor: int, end: int, max_tokens: int) -> int:
+        """Same contract as `TiktokenCounter.fitting_suffix`."""
+        return _search_suffix(self.count, text, floor, end, max_tokens)
+
+
+def _file_stamp(path: Path) -> tuple[int, int]:
+    """Identify a blob's current contents cheaply, so a cache never outlives a replaced file."""
+    stat = path.stat()
+    return stat.st_mtime_ns, stat.st_size
+
+
+def _tokenizer_json_fingerprint(path: Path) -> str | None:
+    """Return the counting fingerprint of a JSON layer if it has a tokenizer's shape, else None."""
+    return _tokenizer_json_fingerprint_at(path, *_file_stamp(path))
+
+
+@lru_cache(maxsize=64)
+def _tokenizer_json_fingerprint_at(path: Path, mtime_ns: int, size: int) -> str | None:
+    # The stamp is part of the cache key, not an input.
+    try:
+        document = json.loads(path.read_bytes())
+    except ValueError:
+        return None
+    if not _has_tokenizer_shape(document):
+        return None
+    return _counting_fingerprint(document)
+
+
+def _counting_fingerprint(document: dict[str, Any]) -> str:
+    """SHA-256 of the parts of a tokenizer definition that decide how many tokens a text costs.
+
+    That is the model, the normalizer, the pre-tokenizer and the added tokens
+    that are matched in ordinary text. Special tokens are left out because the
+    counter splits them into pieces, and so are the post-processor and decoder,
+    which never change how many tokens a counted text takes. Truncation and
+    padding are switched off when the tokenizer is loaded, so they are left out
+    too. Two layers with one fingerprint therefore count every text alike.
+    """
+    counting = {
+        "model": document["model"],
+        "normalizer": document["normalizer"],
+        "pre_tokenizer": document["pre_tokenizer"],
+        "added_tokens": [
+            token
+            for token in document["added_tokens"]
+            if not (isinstance(token, dict) and token.get("special"))
+        ],
+    }
+    canonical = json.dumps(counting, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _has_tokenizer_shape(document: object) -> bool:
+    if not isinstance(document, dict) or not _TOKENIZER_JSON_SECTIONS <= document.keys():
+        return False
+    model = document["model"]
+    return (
+        isinstance(model, dict)
+        and isinstance(model.get("type"), str)
+        and isinstance(document["added_tokens"], list)
+    )
+
+
+def _tokenizer_from_json(path: Path) -> Any:
+    try:
+        return _tokenizer_from_json_at(path, *_file_stamp(path))
+    except OSError as error:
+        raise TokenAccountingError(f"cannot read the tokenizer in {path.name}") from error
+
+
+@lru_cache(maxsize=2)
+def _tokenizer_from_json_at(path: Path, mtime_ns: int, size: int) -> Any:
+    """Build a tokenizer from a tokenizer.json layer. The stamp is only a cache key."""
+    try:
+        from tokenizers import Tokenizer
+    except ImportError as error:
+        raise TokenAccountingError("the tokenizers package is not installed") from error
+    try:
+        tokenizer = Tokenizer.from_str(path.read_text(encoding="utf-8"))
+        # Match special-token markers in text as their pieces, as the GGUF
+        # counter does, so a document cannot count fewer than the model does.
+        tokenizer.encode_special_tokens = True
+        # A truncation or padding rule in the file would clip or pad the ids.
+        tokenizer.no_truncation()
+        tokenizer.no_padding()
+    except Exception as error:  # the library raises a bare Exception for a bad definition
+        raise TokenAccountingError(f"cannot load the tokenizer in {path.name}") from error
+    return tokenizer
+
+
 def _is_loopback(host: str) -> bool:
     hostname = urlsplit(host if "://" in host else f"http://{host}").hostname
     return hostname in _LOOPBACK_HOSTS
@@ -341,11 +561,16 @@ def _is_loopback(host: str) -> bool:
 
 @dataclass(frozen=True)
 class ConservativeUtf8TokenCounter:
-    """Use UTF-8 bytes as a conservative offline token estimate."""
+    """Use UTF-8 bytes as a conservative offline token estimate.
+
+    `reason` says why no exact counter was used. It feeds `estimate_notice`
+    and is never part of the counter's identity or equality.
+    """
 
     identity: str = "estimate:utf8-bytes"
     exact: bool = False
     monotonic: bool = True
+    reason: str = field(default="", compare=False)
 
     def count(self, text: str) -> int:
         return len(text.encode("utf-8"))
@@ -393,14 +618,37 @@ def resolve_token_counter(
     its local model file when that tokenizer has been checked against Ollama.
     Any other Ollama model or host falls back to the conservative byte count.
     Once constructed, counter calls perform local encoding only.
+
+    A model in the tensor layout has no model file, so its tokenizer.json layer
+    is used instead, and only once its tokenizer is in
+    `_VERIFIED_TOKENIZER_JSON_FINGERPRINTS`. Every fallback to the byte count says
+    why in `reason`, which `estimate_notice` reports.
     """
     if encoding_name is not None:
         return TiktokenCounter.for_encoding(encoding_name)
     if provider.strip().lower() == "openai":
         return TiktokenCounter.for_model(model)
-    if provider.strip().lower() == "ollama" and ollama_host and _is_loopback(ollama_host):
-        try:
-            return GgufTokenCounter.for_ollama_model(model)
-        except TokenAccountingError:
-            pass
+    if provider.strip().lower() == "ollama":
+        return _local_ollama_counter(model, ollama_host)
     return ConservativeUtf8TokenCounter()
+
+
+def _local_ollama_counter(model: str, host: str | None) -> TokenCounter:
+    """The model's own tokenizer when it can be read and trusted, else bytes and why not."""
+    if not host:
+        return ConservativeUtf8TokenCounter(reason="no Ollama host was given")
+    if not _is_loopback(host):
+        return ConservativeUtf8TokenCounter(
+            reason="the Ollama host is not on this machine, so its model files cannot be read"
+        )
+    try:
+        return GgufTokenCounter.for_ollama_model(model)
+    except TokenAccountingError as gguf_error:
+        reason = str(gguf_error)
+    try:
+        return TokenizerJsonCounter.for_ollama_model(model)
+    except _NoTokenizerLayerError:
+        pass  # Not a tensor-layout model, so the GGUF refusal is the reason.
+    except TokenAccountingError as error:
+        reason = str(error)
+    return ConservativeUtf8TokenCounter(reason=reason)
