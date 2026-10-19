@@ -516,3 +516,78 @@ def test_a_failure_record_never_contains_the_key() -> None:
     failure = _classify(error)
 
     assert KEY not in failure.model_dump_json()
+
+
+# --- real provider, failing wire -------------------------------------------------------------
+
+
+def _failing_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    handler,
+    capfd: pytest.CaptureFixture[str],
+) -> tuple[dict, str]:
+    from tests.support.web_runs import use_data_dir
+
+    use_data_dir(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        runner,
+        "build_provider",
+        lambda app: OpenRouterProvider(
+            upstream=app.openrouter_upstream,
+            client_factory=lambda **kwargs: httpx.Client(
+                transport=httpx.MockTransport(handler), **kwargs
+            ),
+        ),
+    )
+    document_id, revision_id = seed_run_document()
+    run_id = seed_run(
+        document_id,
+        revision_id,
+        {"provider": "openrouter", "model": MODEL, "verify": False, "citations": False,
+         "context_window": 100_000, "max_retries": 1},
+    )
+    assert start_attempt(run_id) is not None
+    assert runner.run_job(run_id) == "failed"
+    attempt = get_database().fetchone("SELECT * FROM run_attempts WHERE run_id = ?", (run_id,))
+    return json.loads(attempt["failure_json"]), capfd.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("handler", "code"),
+    [
+        (lambda request: httpx.Response(401, json={"error": {"code": 401, "message": f"bad {KEY}"}}),
+         "openrouter_key_invalid"),
+        (lambda request: (_ for _ in ()).throw(httpx.ConnectError(f"refused {KEY}")),
+         "openrouter_unreachable"),
+        (lambda request: httpx.Response(402, json={"error": {"code": 402, "message": f"x {KEY}",
+                                                              "metadata": {"limit_source": "openrouter_key_limit"}}}),
+         "provider_error"),
+        (lambda request: httpx.Response(400, json={"error": {"code": 400, "message": f"x {KEY}"}}),
+         "provider_error"),
+    ],
+    ids=["401", "connect", "402", "400"],
+)
+def test_a_failed_openrouter_run_is_classified_without_the_key_anywhere(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    handler,
+    code: str,
+) -> None:
+    failure, stderr = _failing_run(tmp_path, monkeypatch, handler, capfd)
+
+    assert failure["code"] == code
+    stored = " ".join(
+        str(value)
+        for table in ("runs", "run_attempts", "run_events")
+        for row in get_database().fetchall(f"SELECT * FROM {table}")
+        for value in dict(row).values()
+    )
+    on_disk = " ".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in load_paths().runs.rglob("*")
+        if path.is_file()
+    )
+    for place in (json.dumps(failure), stderr, stored, on_disk):
+        assert KEY not in place and "sk-or-v1-" not in place

@@ -41,6 +41,7 @@ from summarizer.providers.base import (
     ProviderTimeoutError,
     RetryErrorCategory,
 )
+from summarizer.providers.openrouter import redact_api_key
 from summarizer.providers.retrying import RetryingProvider
 from summarizer.runtime.observers import (
     ItemEvent,
@@ -133,7 +134,7 @@ def error_detail(error: BaseException) -> str:
     lines = [
         "".join(traceback.format_exception_only(type(item), item)).strip() for item in _chain(error)
     ]
-    return _truncate_utf8("\nCaused by: ".join(lines), MAX_FAILURE_DETAIL_BYTES)
+    return _truncate_utf8(redact_api_key("\nCaused by: ".join(lines)), MAX_FAILURE_DETAIL_BYTES)
 
 
 def _last_retry_category(error: BaseException) -> RetryErrorCategory | None:
@@ -659,7 +660,7 @@ def run_job(run_id: str) -> str | None:
             # A Stop can surface as an error from an abandoned call.
             recorder.finish("stopped")
             return "stopped"
-        traceback.print_exc(file=sys.stderr)
+        print(redact_api_key(traceback.format_exc()), file=sys.stderr, end="")
         item = recorder.item_label(error) if isinstance(error, ItemFailedError) else tracker.current_label()
         failure = classify_failure(
             error,

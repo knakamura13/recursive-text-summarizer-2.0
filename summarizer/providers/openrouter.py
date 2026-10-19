@@ -86,6 +86,17 @@ def _read_api_key() -> str:
     return value
 
 
+def redact_api_key(text: str) -> str:
+    """Replace the configured key in text bound for a log or a stored record.
+
+    The adapter's own messages never carry it. This guards the exception chain
+    behind them, whose text comes from the HTTP layer and is persisted by the
+    web worker, so a key an upstream library echoed would still not be kept.
+    """
+    key = os.environ.get(API_KEY_ENV, "").strip()
+    return text.replace(key, "[REDACTED]") if key else text
+
+
 def _count(value: object) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value

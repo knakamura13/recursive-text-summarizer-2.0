@@ -774,3 +774,24 @@ def test_a_pinned_upstream_is_flagged_because_the_listing_is_model_wide() -> Non
 
     assert provider.window_notice is not None
     assert "deepinfra" in provider.window_notice
+
+
+# --- redacting the key from text that is stored or logged ---------------------------
+
+
+def test_redact_api_key_replaces_every_occurrence_of_the_configured_key() -> None:
+    from summarizer.providers.openrouter import redact_api_key
+
+    text = f"first {KEY} and again {KEY}, unrelated sk-other text stays"
+
+    assert redact_api_key(text) == "first [REDACTED] and again [REDACTED], unrelated sk-other text stays"
+
+
+def test_redact_api_key_changes_nothing_when_no_key_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from summarizer.providers.openrouter import redact_api_key
+
+    monkeypatch.delenv("OPENROUTER_API_KEY")
+
+    assert redact_api_key("anything at all") == "anything at all"
