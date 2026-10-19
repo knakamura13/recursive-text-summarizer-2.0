@@ -86,6 +86,7 @@ def run(
     provider: FakeProvider | None = None,
     sections: bool = True,
     target_words: int = 300,
+    app: AppConfig = APP,
     **config: object,
 ) -> tuple[PipelineResult, FakeProvider]:
     document = ingest_text(text)
@@ -97,7 +98,7 @@ def run(
         document,
         provider,
         CharacterCounter(),
-        app=APP,
+        app=app,
         strategy=STRATEGY,
         config=PipelineConfig(
             target_words=target_words,
@@ -425,8 +426,11 @@ def test_node_ids_are_unique_and_stable_across_runs() -> None:
 
 def test_a_resumed_section_run_reuses_every_call(tmp_path) -> None:
     cache = CacheConfig(enabled=True, root=tmp_path / "cache")
+    # A cached run with an audit path publishes the summary, so keep it out of the cwd.
+    app = replace(APP, output_path=tmp_path / "summary.txt")
     first, provider = run(
         NESTED,
+        app=app,
         cache=cache,
         reliability=ReliabilityConfig(run_id="sections"),
         audit_path=tmp_path / "audit.json",
@@ -434,6 +438,7 @@ def test_a_resumed_section_run_reuses_every_call(tmp_path) -> None:
     resumed_provider = FakeProvider()
     resumed, _ = run(
         NESTED,
+        app=app,
         provider=resumed_provider,
         cache=cache,
         reliability=ReliabilityConfig(run_id="sections", run_mode="resume"),
