@@ -28,7 +28,7 @@ from summarizer.providers.retrying import RetryingProvider
 from summarizer.runtime.observers import ItemFailedError
 from summarizer.sections import SectionOutline, build_section_tree
 from summarizer.segmentation import SegmentationConfig, detect_markdown_headings
-from summarizer.tokenization import TokenCounter, resolve_token_counter
+from summarizer.tokenization import TokenCounter, estimate_notice, resolve_token_counter
 from summarizer.verification import VerificationConfig
 
 
@@ -267,6 +267,9 @@ def main(
     try:
         document = read_source(config.app.input_path)
         counter = counter_factory(config.app)
+        notice = estimate_notice(counter)
+        if notice is not None:
+            print(notice, file=sys.stderr)
         pipeline_config = config.pipeline
         outline: SectionOutline | None = None
         if config.preserve_sections:

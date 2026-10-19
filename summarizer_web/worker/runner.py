@@ -52,6 +52,7 @@ from summarizer.runtime.observers import (
 )
 from summarizer.sections import SectionOutline
 from summarizer.segmentation import SegmentationConfig, SegmentationError
+from summarizer.tokenization import estimate_notice
 from summarizer.verification import VerificationCapacityError, VerificationConfig
 from summarizer_web.config import load_paths
 from summarizer_web.db.connection import get_database, init_database
@@ -251,6 +252,9 @@ class _Page:
 # import/4), so importing the Document again may find headings.
 NO_OUTLINE_WARNING = "sections_no_outline"
 OUTLINE_NOT_EXTRACTED_WARNING = "sections_outline_not_extracted"
+# Audit warning code for a Run whose token counts are estimates, so the Run
+# shows what preflight showed.
+ESTIMATED_COUNTS_WARNING = "token_counts_estimated"
 
 
 def _json_list(value: str | None) -> list[object]:
@@ -516,6 +520,7 @@ def _execute(
         ollama_host=host,
         timeout_seconds=config.timeout_seconds,
     )
+    counter = build_counter(app)
     strategy = strategy_config(config)
     raw_provider = build_provider(app)
     if isinstance(raw_provider, ContextWindowProvider):
@@ -536,6 +541,8 @@ def _execute(
             if revision["outline_json"] is None
             else NO_OUTLINE_WARNING,
         )
+    if estimate_notice(counter) is not None:
+        audit_warnings = (*audit_warnings, ESTIMATED_COUNTS_WARNING)
     pipeline_config = PipelineConfig(
         target_words=config.target_words,
         segmentation=segmentation_config(config),
@@ -562,7 +569,7 @@ def _execute(
     return run_pipeline(
         document,
         provider,
-        build_counter(app),
+        counter,
         app=app,
         strategy=strategy,
         config=pipeline_config,

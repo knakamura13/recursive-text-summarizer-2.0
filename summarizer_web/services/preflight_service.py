@@ -48,7 +48,7 @@ from summarizer.pipeline import leaf_segmentation, plan_run_requests
 from summarizer.providers.ollama import DEFAULT_OLLAMA_CONTEXT_WINDOW
 from summarizer.segmentation import SegmentationConfig, SegmentationError, segment_document
 from summarizer.summaries import MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
-from summarizer.tokenization import TokenCounter, resolve_token_counter
+from summarizer.tokenization import TokenCounter, estimate_notice, resolve_token_counter
 from summarizer_web.errors import ApiError
 from summarizer_web.models.api import Notice, PreflightResponse, RunConfig
 from summarizer_web.services.documents_service import (
@@ -151,6 +151,9 @@ def run_preflight(payload: dict[str, Any]) -> PreflightResponse:
         strategy = replace(strategy, context_window=window)
     assumed = source == "assumed"
     counter = resolve_token_counter(provider="ollama", model=model, ollama_host=host)
+    notice = estimate_notice(counter)
+    if notice is not None:
+        warnings.append(_warning("token_counts_estimated", notice))
     response = PreflightResponse(
         ok=False,
         context_window_tokens=resolve_context_window(

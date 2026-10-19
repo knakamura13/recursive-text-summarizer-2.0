@@ -57,7 +57,9 @@ def test_short_document_goes_direct_with_the_model_window(
     plain = _preflight(client, verify=False)
     verified = _preflight(client, verify=True)
 
-    assert plain["ok"] is True and plain["errors"] == [] and plain["warnings"] == []
+    assert plain["ok"] is True and plain["errors"] == []
+    # No model file on this machine, so the byte counter is in use and preflight says so (#190).
+    assert _codes(plain["warnings"]) == ["token_counts_estimated"]
     assert plain["selected_strategy"] == "direct"
     # Worker rule: min(model maximum, 32768) when no window is configured.
     assert (plain["context_window_tokens"], plain["context_window_source"]) == (32_768, "model")
@@ -150,7 +152,8 @@ def test_unreachable_ollama_is_a_warning_with_the_assumed_window(
     result = _preflight(client, max_output_tokens=1024)
 
     assert result["ok"] is True
-    assert _codes(result["warnings"]) == ["ollama_unreachable"]
+    # With Ollama unreachable the model files are still read locally; none is installed here.
+    assert _codes(result["warnings"]) == ["ollama_unreachable", "token_counts_estimated"]
     assert result["warnings"][0]["severity"] == "warning"
     assert result["model_installed"] is None
     assert (result["context_window_tokens"], result["context_window_source"]) == (8192, "assumed")
