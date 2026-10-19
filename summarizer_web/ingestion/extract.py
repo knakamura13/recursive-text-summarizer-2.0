@@ -156,9 +156,10 @@ class _TitlePatterns:
 
     `respaced` is for a title that no tier finds. A PDF text layer decides spaces from glyph
     positions, so it can drop or move one where the font changes, as around inline math. It
-    matches a line that is the title alone with all whitespace ignored, on the folded view, so a
-    title's words run together inside a sentence, or a line that only begins with the title,
-    never match. It is compiled the first time a title needs it.
+    matches one line that is the title alone with its spaces and tabs ignored, on the folded view,
+    so a title's words run together inside a sentence, a line that only begins with the title,
+    and separate lines that together spell it never match. It is compiled the first time a title
+    needs it.
     """
 
     tiers: tuple[_TitlePattern, ...]
@@ -166,7 +167,7 @@ class _TitlePatterns:
 
     @cached_property
     def respaced(self) -> re.Pattern[str]:
-        letters = r"\s*".join(re.escape(char) for char in self.folded_letters)
+        letters = r"[ \t]*".join(re.escape(char) for char in self.folded_letters)
         return re.compile(rf"^[ \t]*({letters})[ \t]*$", re.IGNORECASE | re.MULTILINE)
 
 

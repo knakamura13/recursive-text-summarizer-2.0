@@ -268,6 +268,14 @@ def test_a_line_that_only_begins_with_the_title_without_its_spaces_is_not_a_head
     assert (imported.outline, imported.unplaced_headings) == ((), 2)
 
 
+def test_separate_lines_that_together_spell_the_title_are_not_a_heading() -> None:
+    text = "Overview\n\nKeyPo\nints\n\nBody."
+
+    imported = assemble(Extraction("txt", text=text, outline_hints=[OutlineHint("Key Points", 1)]))
+
+    assert (imported.outline, imported.unplaced_headings) == ((), 1)
+
+
 def test_the_title_as_written_wins_over_an_earlier_line_that_matches_without_its_spaces() -> None:
     text = "KeyPoints\n\nBody that lists the key points below.\n\nKey Points\n\nMore."
 
