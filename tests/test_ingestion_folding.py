@@ -10,6 +10,16 @@ def test_text_without_compatibility_forms_folds_to_itself() -> None:
     assert (folded.to_folded(7), folded.to_source(7), folded.span_to_source(6, 10)) == (7, 7, (6, 10))
 
 
+def test_one_for_one_folds_keep_offsets_and_need_no_entries() -> None:
+    source = "a bΩc" * 1000 + "ﬁx"
+    folded = FoldedText.of(source)
+
+    assert folded.text == "a bΩc" * 1000 + "fix"
+    # Only the ligature changes a length; the no-break spaces and the Ohm sign do not.
+    assert (folded.source_at, folded.folded_at, folded.folded_len) == ([5000], [5000], [2])
+    assert (folded.to_folded(4999), folded.to_source(4999), folded.span_to_source(0, 5001)) == (4999, 4999, (0, 5001))
+
+
 def test_each_character_is_folded_alone() -> None:
     assert compat_fold("oﬃce ﬁx") == "office fix"
     # A combining sequence is not composed: that would tie one folded character to two source ones.

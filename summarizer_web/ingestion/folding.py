@@ -26,11 +26,12 @@ def compat_fold(text: str) -> str:
 
 @dataclass(frozen=True)
 class FoldedText:
-    """`text` folded, with where each changed source character sits in it.
+    """`text` folded, with where each source character that folding resized sits in it.
 
-    The three lists run in step, one entry per source character that folding changed, in
-    source order: its source offset, the offset where its folding begins in `text`, and
-    that folding's length. Every other character folds to itself.
+    The three lists run in step, one entry per source character whose folding is not one
+    character long, in source order: its source offset, the offset where its folding begins
+    in `text`, and that folding's length. A character that folds to one character, itself
+    or another, keeps its offset and needs no entry.
     """
 
     text: str
@@ -45,26 +46,29 @@ class FoldedText:
             for char in set(source)
             if (folded := unicodedata.normalize("NFKC", char)) != char
         }
-        if not changed:
-            return cls(source, [], [], [])
-        pattern = re.compile("[" + re.escape("".join(changed)) + "]")
+        resized = {char: folded for char, folded in changed.items() if len(folded) != 1}
+        # One-for-one folds (a no-break space becomes a space) are done in one pass in C.
+        text = source.translate({ord(char): folded for char, folded in changed.items() if char not in resized})
+        if not resized:
+            return cls(text, [], [], [])
+        pattern = re.compile("[" + re.escape("".join(resized)) + "]")
         parts: list[str] = []
         source_at: list[int] = []
         folded_at: list[int] = []
         folded_len: list[int] = []
         taken = 0  # Source characters copied so far.
         growth = 0  # Folded length minus source length over what was copied.
-        for match in pattern.finditer(source):
+        for match in pattern.finditer(text):
             start = match.start()
-            folded = changed[match.group()]
-            parts.append(source[taken:start])
+            folded = resized[match.group()]
+            parts.append(text[taken:start])
             parts.append(folded)
             source_at.append(start)
             folded_at.append(start + growth)
             folded_len.append(len(folded))
             growth += len(folded) - 1
             taken = start + 1
-        parts.append(source[taken:])
+        parts.append(text[taken:])
         return cls("".join(parts), source_at, folded_at, folded_len)
 
     def to_folded(self, offset: int) -> int:

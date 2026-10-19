@@ -4,6 +4,7 @@ from pathlib import Path
 
 from summarizer_web.db.migrations import LATEST_VERSION, MIGRATIONS, apply_migrations
 from summarizer_web.ingestion.common import Extraction, OutlineHint, PageText
+from summarizer_web.ingestion import extract
 from summarizer_web.ingestion.extract import assemble, build_report
 from summarizer_web.worker.imports import insert_revision
 
@@ -114,6 +115,17 @@ def test_a_page_hint_is_searched_on_its_page_after_earlier_ligatures() -> None:
     [entry] = imported.outline
     assert imported.text[entry.start :] == "Reﬁning\n\nAgain."
     assert (entry.page_start, entry.page_end) == (3, 3)
+
+
+def test_a_text_with_no_hints_is_not_folded(monkeypatch) -> None:
+    def fail(_text: str):
+        raise AssertionError("folded a text that has no headings to find")
+
+    monkeypatch.setattr(extract.FoldedText, "of", fail)
+
+    imported = assemble(Extraction("txt", text=LIGATURES + "Body."))
+
+    assert (imported.outline, imported.unplaced_headings) == ((), 0)
 
 
 def test_a_title_matches_a_whole_heading_line_before_a_line_it_only_begins() -> None:

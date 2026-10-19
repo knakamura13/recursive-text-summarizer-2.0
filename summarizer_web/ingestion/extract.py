@@ -160,6 +160,8 @@ def anchor_outline(
     page. Two hints found at one place keep the first. A hint with an
     offset is placed exactly there, or counted as not found.
     """
+    if not hints:
+        return (), 0
     by_page = {span.page: span for span in pages or () if not span.blank}
     folded = FoldedText.of(text)
     placed: dict[int, tuple[str, int]] = {}
