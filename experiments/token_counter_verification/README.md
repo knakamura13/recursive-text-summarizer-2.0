@@ -26,7 +26,7 @@ For each probe, the counter counts the system message and the user message. Olla
 
 - **The overhead is observed, not assumed.** Every plain probe must show the same `reported - counted`. If they differ, the run fails and names the probes in each group. Two causes are likely: the counter does not match Ollama's tokenization on those texts, or a reused prompt cache lowered a count. Each system message opens with a different word so a reused prefix is only the template header, and a throwaway warm-up request goes first so that header is cached the same way for every probe.
 - **Never fewer.** Any probe that Ollama counts higher than counter plus overhead fails the run.
-- **Schema is not prompt text.** Two probes carry a `format` schema as the summarizer's requests do. They share the plain overhead only if Ollama does not count the schema as prompt tokens, which is what the budget code assumes.
+- **Schema is not prompt text.** Two probes carry a `format` schema as the summarizer's requests do. They share the plain overhead only if Ollama does not count the schema as prompt tokens, as #120 found for gemma4 on its GGUF path. If it does, the run fails.
 - **Special-token markers.** One probe quotes markers such as `<bos>` and `<|turn>`. The counter splits a marker into pieces, which can only count more than Ollama does, so Ollama may count fewer here and never more.
 - A missing `prompt_eval_count` is a failure, not a pass.
 
