@@ -15,8 +15,8 @@ Warnings: ``ollama_unreachable`` (the installed models could not be fetched),
 For an OpenRouter Run the Ollama checks are skipped. Errors: ``openrouter_key_missing`` (the server's
 environment has no key), ``openrouter_key_rejected`` (the model listing refused it). Warnings:
 ``token_counts_estimated`` (the counts behind every estimate are not exact), ``third_party_processing``
-(the document text leaves this machine and each request is billed), ``context_window_upstream`` (a
-pinned upstream may have a smaller window than the model's listed one), and ``context_window_assumed``
+(the document text leaves this machine and each request is billed), ``context_window_note`` (a
+caveat about the window: a pinned upstream may have a smaller one, or the model was matched through its base), and ``context_window_assumed``
 when the model listing was unusable. The window is the explicit value bounded by the listing, else
 the listing, else assumed, as the worker resolves it.
 
@@ -261,7 +261,7 @@ def _preflight_openrouter(
     if config is None or document is None or not model:
         return PreflightResponse(ok=False, provider="openrouter", errors=errors, warnings=warnings)
     if not openrouter_service.key_is_set():
-        errors.append(_error("openrouter_key_missing", openrouter_service.KEY_MISSING_MESSAGE))
+        errors.append(_error("openrouter_key_missing", openrouter_service.key_problem_message()))
         return PreflightResponse(ok=False, provider="openrouter", errors=errors, warnings=warnings)
 
     window, source = _openrouter_window(config, model, errors, warnings)
@@ -357,7 +357,7 @@ def _openrouter_window(
             )
         )
     elif provider.window_notice is not None:
-        warnings.append(_warning("context_window_upstream", provider.window_notice))
+        warnings.append(_warning("context_window_note", provider.window_notice))
     return window, source
 
 

@@ -549,3 +549,12 @@ def test_audit_still_rejects_malformed_model_identities(model: str) -> None:
         _openrouter_audit(
             "vendor/model", {"app": {"provider": "openrouter"}}, generation_model=model
         )
+
+
+@pytest.mark.parametrize("model", ["a/b/c/d", "a:b:c", "a/" + "b" * 129])
+def test_audit_and_config_agree_on_which_model_names_are_recordable(model: str) -> None:
+    from summarizer.config import is_model_identity
+
+    assert is_model_identity(model) is False
+    with pytest.raises(ValueError):
+        _openrouter_audit("vendor/model", {"app": {"provider": "openrouter"}}, generation_model=model)

@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from summarizer.config import normalize_openrouter_upstream
+from summarizer.config import is_model_identity, normalize_openrouter_upstream
 
 
 class ApiModel(BaseModel):
@@ -117,6 +117,17 @@ class RunConfig(ApiModel):
     def _overlap_below_chunk(self) -> RunConfig:
         if self.chunk_tokens is not None and self.overlap_tokens >= self.chunk_tokens:
             raise ValueError("overlap_tokens must be smaller than chunk_tokens")
+        return self
+
+    @model_validator(mode="after")
+    def _openrouter_model_is_recordable(self) -> RunConfig:
+        if self.provider == "openrouter":
+            self.model = self.model.strip()
+            if self.model and not is_model_identity(self.model):
+                raise ValueError(
+                    "model must be an OpenRouter model ID such as vendor/model, with at most "
+                    "three path segments and one :variant tag"
+                )
         return self
 
     @model_validator(mode="after")

@@ -305,7 +305,7 @@ def test_a_pinned_upstream_is_noted_because_the_window_is_model_wide(
 
     result = preflight(client, openrouter_upstream="deepinfra")
 
-    assert "context_window_upstream" in codes(result["warnings"])
+    assert "context_window_note" in codes(result["warnings"])
 
 
 # --- creating a Run ---------------------------------------------------------------------
@@ -591,3 +591,123 @@ def test_a_failed_openrouter_run_is_classified_without_the_key_anywhere(
     )
     for place in (json.dumps(failure), stderr, stored, on_disk):
         assert KEY not in place and "sk-or-v1-" not in place
+
+
+# --- adversarial review findings ----------------------------------------------------------------
+
+
+def test_a_malformed_key_is_reported_as_unusable_not_as_set(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "bad key with spaces")
+
+    status = client.get("/api/v1/openrouter/health").json()
+
+    assert status["key_set"] is False
+    assert "cannot be used" in status["message"]
+    assert "bad key" not in json.dumps(status)
+
+
+def test_preflight_and_run_creation_refuse_a_malformed_key_with_the_same_message(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runs_service, "get_supervisor", _QueueOnlySupervisor)
+    seed_document(text=SHORT_TEXT)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "bad key with spaces")
+
+    result = preflight(client)
+    created = client.post(
+        "/api/v1/runs",
+        json={"document_id": "doc-1", "config": {"provider": "openrouter", "model": MODEL}},
+        headers=csrf_headers(client),
+    )
+
+    assert codes(result["errors"]) == ["openrouter_key_missing"]
+    assert "cannot be used" in result["errors"][0]["message"]
+    assert created.status_code == 409 and "cannot be used" in created.json()["message"]
+
+
+@pytest.mark.parametrize("model", ["a/b/c/d", "a:b:c", "has space inside", "m" * 129])
+def test_an_openrouter_model_the_audit_could_not_record_is_refused_up_front(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, model: str
+) -> None:
+    monkeypatch.setattr(runs_service, "get_supervisor", _QueueOnlySupervisor)
+    seed_document(text=SHORT_TEXT)
+
+    result = preflight(client, model=model)
+    created = client.post(
+        "/api/v1/runs",
+        json={"document_id": "doc-1", "config": {"provider": "openrouter", "model": model}},
+        headers=csrf_headers(client),
+    )
+
+    assert result["ok"] is False and codes(result["errors"]) == ["invalid_config"]
+    assert created.status_code == 422
+
+
+def test_an_openrouter_model_is_trimmed_before_it_is_stored(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runs_service, "get_supervisor", _QueueOnlySupervisor)
+    seed_document(text=SHORT_TEXT)
+
+    response = client.post(
+        "/api/v1/runs",
+        json={"document_id": "doc-1", "config": {"provider": "openrouter", "model": f"  {MODEL}\n"}},
+        headers=csrf_headers(client),
+    )
+
+    assert response.status_code == 201 and response.json()["config"]["model"] == MODEL
+
+
+def test_a_not_found_message_on_an_openrouter_run_is_not_a_missing_ollama_model() -> None:
+    failure = _classify(ProviderRequestError("OpenRouter rejected: model not found"))
+
+    assert failure.code == "provider_error"
+    assert _classify(ProviderRequestError("model not found"), provider="ollama").code == "model_not_found"
+
+
+def test_the_failure_message_is_scrubbed_even_for_an_unclassified_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    def explode(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError(f"unexpected {KEY} in an error")
+
+    failure, stderr = _failing_run(tmp_path, monkeypatch, explode, capfd)
+
+    assert failure["code"] == "internal_error"
+    assert KEY not in json.dumps(failure) and KEY not in stderr
+    assert "[REDACTED]" in failure["message"]
+
+
+def test_the_scaled_estimate_uses_its_factor_per_output_token_in_preflight() -> None:
+    from summarizer.tokenization import ScaledTiktokenCounter
+    from summarizer_web.services.preflight_service import _output_units_per_token
+
+    assert _output_units_per_token(ScaledTiktokenCounter(_FakeEncoding(), 1.5)) == 2
+    assert _output_units_per_token(ScaledTiktokenCounter(_FakeEncoding(), 1.0)) == 1
+
+
+def test_an_estimate_counter_never_uses_the_ollama_schema_reserve(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The same document, window and limits must size merges without the Ollama
+    # decoder's schema reserve, which a hosted adapter does not send.
+    from summarizer_web.services import preflight_service
+
+    seen: list[int] = []
+    original = preflight_service.plan_merge_request
+
+    def spy(limits, *, level, provider_schema_reserve):
+        seen.append(provider_schema_reserve)
+        return original(limits, level=level, provider_schema_reserve=provider_schema_reserve)
+
+    monkeypatch.setattr(preflight_service, "plan_merge_request", spy)
+    long_text = "\n\n".join(f"Paragraph {i}. " + "The pier was inspected carefully. " * 40 for i in range(120))
+    seed_document(text=long_text)
+    listing(monkeypatch)
+
+    result = preflight(client, strategy="hierarchical", chunk_tokens=600, context_window=60_000)
+
+    assert result["estimated_leaf_count"] > 1
+    assert seen and set(seen) == {0}

@@ -40,6 +40,18 @@ describe('validateRunConfig for OpenRouter', () => {
 		}
 	});
 
+	it.each(['a/b/c/d', 'a:b:c', 'has space', '/lead', 'trail/'])('rejects the model %j', (model) => {
+		const errors = validateRunConfig(config({ provider: 'openrouter', model }));
+		expect(errors.model).toMatch(/model ID/);
+	});
+
+	it.each(['x-ai/grok-4', '~openai/gpt-latest', 'openai/gpt-4o:online', 'gpt-4o-mini'])(
+		'accepts the model %j',
+		(model) => {
+			expect(validateRunConfig(config({ provider: 'openrouter', model })).model).toBeUndefined();
+		}
+	);
+
 	it('asks for a typed model name rather than a choice', () => {
 		const errors = validateRunConfig(config({ provider: 'openrouter', model: ' ' }), {
 			requireModel: true

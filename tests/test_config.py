@@ -160,3 +160,30 @@ def test_openrouter_upstream_must_be_a_slug_for_the_openrouter_provider(
 ) -> None:
     with pytest.raises(ValueError, match="openrouter_upstream"):
         factory()  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    "model", ["a/b/c/d", "a:b:c", "m" * 129, "has space", "/lead", "trail/", "sk-or-v1-" + "a" * 30]
+)
+def test_an_openrouter_model_must_be_one_the_audit_and_cache_accept(model: str) -> None:
+    # Refused before any request, not after the run is paid for.
+    with pytest.raises(ValueError, match="model"):
+        AppConfig(provider="openrouter", model=model)
+
+
+@pytest.mark.parametrize(
+    "model", ["meta-llama/llama-3.3-70b-instruct:free", "~openai/gpt-latest", "x-ai/grok-4", "gpt-4o-mini"]
+)
+def test_an_openrouter_model_in_ordinary_form_is_accepted(model: str) -> None:
+    assert AppConfig(provider="openrouter", model=model).model == model
+
+
+def test_other_providers_keep_accepting_their_model_names() -> None:
+    assert AppConfig(provider="openai", model="a/b/c/d").model == "a/b/c/d"
+
+
+def test_an_upstream_that_looks_like_a_credential_is_refused() -> None:
+    with pytest.raises(ValueError, match="openrouter_upstream"):
+        AppConfig(
+            provider="openrouter", model="v/m", openrouter_upstream="sk-or-v1-0123456789abcdef0123"
+        )

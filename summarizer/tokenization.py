@@ -196,8 +196,11 @@ def _search_suffix(
 # repository's sample documents o200k_base yields 4.0 to 5.2 characters per
 # token; 1.5 puts the estimate near 3, where the byte counter's 1 character
 # per token is what #190 reported as shrinking and refusing work that fits.
-# Compare `usage.prompt_tokens`, which OpenRouter reports for each request and
-# the provider records, against these counts before relying on the factor.
+# `usage.prompt_tokens`, which OpenRouter reports for each request and the
+# provider records, is the check to make against these counts. Whether that
+# figure is the model's native count or normalized to one tokenizer was not
+# established (the documentation read says native; some accounts say
+# otherwise), so confirm it before trusting a calibration.
 OPENROUTER_ESTIMATE_ENCODING = "o200k_base"
 OPENROUTER_ESTIMATE_FACTOR = 1.5
 

@@ -129,6 +129,11 @@ def _truncate_utf8(text: str, limit: int) -> str:
     return encoded[: limit - 3].decode("utf-8", errors="ignore") + "..."
 
 
+def _print_traceback() -> None:
+    """Print the current exception's traceback with the OpenRouter key removed."""
+    print(redact_api_key(traceback.format_exc()), file=sys.stderr, end="")
+
+
 def error_detail(error: BaseException) -> str:
     """The error and its causes, one per line, bounded to 4 KB."""
     lines = [
@@ -375,7 +380,7 @@ class RunRecorder:
             with self._lock:
                 record(argument)
         except Exception:
-            traceback.print_exc(file=sys.stderr)
+            _print_traceback()
 
     def _record_stage(self, event: StageEvent) -> None:
         changed = self.tracker.on_stage(event)
@@ -443,7 +448,7 @@ class RunRecorder:
                 with get_database().transaction() as connection:
                     self._progress(connection, self._cursor, force=True)
         except Exception:
-            traceback.print_exc(file=sys.stderr)
+            _print_traceback()
 
     def start_flusher(self) -> threading.Thread:
         def flush_until_stopped() -> None:
@@ -660,7 +665,7 @@ def run_job(run_id: str) -> str | None:
             # A Stop can surface as an error from an abandoned call.
             recorder.finish("stopped")
             return "stopped"
-        print(redact_api_key(traceback.format_exc()), file=sys.stderr, end="")
+        _print_traceback()
         item = recorder.item_label(error) if isinstance(error, ItemFailedError) else tracker.current_label()
         failure = classify_failure(
             error,
@@ -671,6 +676,7 @@ def run_job(run_id: str) -> str | None:
             item=item,
             provider=getattr(config, "provider", "ollama"),
         )
+        failure = failure.model_copy(update={"message": redact_api_key(failure.message)})
         _write_failure_file(run_id, failure)
         recorder.finish("failed", failure)
         return "failed"
@@ -723,7 +729,7 @@ def worker_main(run_id: str, parent_pid: int) -> None:
         hold_worker_lock(run_id)
         code = 1 if run_job(run_id) == "failed" else 0
     except BaseException:
-        traceback.print_exc(file=sys.stderr)
+        _print_traceback()
     finally:
         sys.stdout.flush()
         sys.stderr.flush()

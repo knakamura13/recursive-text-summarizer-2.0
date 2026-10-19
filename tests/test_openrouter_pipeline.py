@@ -88,3 +88,90 @@ def test_cached_results_are_not_reused_across_a_different_pinned_upstream(
     assert len(first.requests) == 2
     assert same.requests == []  # same identity: every stage came from the cache
     assert len(other.requests) == 2  # a different upstream answers differently
+
+
+# --- review: the pin reaches every identity the verifier and the checkpoint use ---------------
+
+
+def test_the_verifier_cache_and_the_run_descriptor_follow_the_pinned_upstream(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace as replace_
+
+    from summarizer.verification import VerificationConfig
+    from tests.test_verification_integration import VerificationPipelineProvider
+
+    class Shaped(VerificationPipelineProvider):
+        def generate(self, request):
+            return replace_(super().generate(request), provider="openrouter")
+
+    def run(upstream: str, run_id: str) -> Shaped:
+        provider = Shaped(verification="supported")
+        run_pipeline(
+            ingest_text("The source confirms the value is 41."),
+            provider,
+            CharacterCounter(),
+            app=AppConfig(
+                output_path=tmp_path / f"{run_id}.txt",
+                provider="openrouter",
+                model=MODEL,
+                timeout_seconds=30,
+                openrouter_upstream=upstream,
+            ),
+            strategy=_strategy(),
+            config=PipelineConfig(
+                target_words=40,
+                audit_path=tmp_path / f"{run_id}.json",
+                verification=VerificationConfig(enabled=True),
+                cache=CacheConfig(enabled=True, root=tmp_path / "cache"),
+                reliability=ReliabilityConfig(run_id=run_id),
+            ),
+        )
+        return provider
+
+    def verification_ops(provider: Shaped) -> list[str]:
+        return [
+            request.operation_id
+            for request in provider.requests
+            if (request.operation_id or "").startswith("verification-")
+        ]
+
+    first = run("deepinfra", "run-one")
+    same = run("deepinfra", "run-two")
+    other = run("together", "run-three")
+
+    assert verification_ops(first)
+    assert same.requests == []
+    # A different pinned upstream answers differently, so no verification
+    # result may be reused from the other one.
+    assert verification_ops(other) == verification_ops(first)
+    assert len(other.requests) == len(first.requests)
+
+
+def test_resuming_a_run_with_a_different_pinned_upstream_is_refused(tmp_path: Path) -> None:
+    import pytest
+
+    from summarizer.checkpoint import CheckpointError
+
+    _run(tmp_path, upstream="deepinfra", run_id="resumable", provider=OpenRouterShapedProvider())
+
+    with pytest.raises(CheckpointError):
+        run_pipeline(
+            ingest_text("A short source for the OpenRouter pipeline."),
+            OpenRouterShapedProvider(),
+            CharacterCounter(),
+            app=AppConfig(
+                output_path=tmp_path / "resumed.txt",
+                provider="openrouter",
+                model=MODEL,
+                timeout_seconds=30,
+                openrouter_upstream="together",
+            ),
+            strategy=_strategy(),
+            config=PipelineConfig(
+                target_words=40,
+                audit_path=tmp_path / "resumed.json",
+                cache=CacheConfig(enabled=True, root=tmp_path / "cache"),
+                reliability=ReliabilityConfig(run_id="resumable", run_mode="resume"),
+            ),
+        )

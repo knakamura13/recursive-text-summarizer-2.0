@@ -795,3 +795,267 @@ def test_redact_api_key_changes_nothing_when_no_key_is_configured(
     monkeypatch.delenv("OPENROUTER_API_KEY")
 
     assert redact_api_key("anything at all") == "anything at all"
+
+
+# --- adversarial review findings -------------------------------------------------------
+
+
+def _reply_with_model(model: str) -> httpx.Response:
+    body = fixture("chat_completion_ok.json")
+    body["model"] = model
+    return httpx.Response(200, json=body)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "a:b:c",
+        "a/b/c/d",
+        "m" * 129,
+        "sk-or-v1-" + "a" * 40,
+        "x y",
+        "bad\nname",
+        "/leading",
+        "trailing/",
+    ],
+)
+def test_a_response_model_the_audit_would_refuse_falls_back_to_the_requested_model(
+    model: str,
+) -> None:
+    # Recording it would fail the audit after every request had been paid for.
+    provider, _ = provider_for(lambda request: _reply_with_model(model))
+
+    assert provider.generate(REQUEST).model == MODEL
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "x-ai/grok-4",
+        "~openai/gpt-latest",
+        "openai/gpt-4o:online",
+        "qwen/qwen3-235b-a22b-2507",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "gpt-4o-mini",
+    ],
+)
+def test_a_response_model_in_openrouter_form_is_recorded(model: str) -> None:
+    provider, _ = provider_for(lambda request: _reply_with_model(model))
+
+    assert provider.generate(REQUEST).model == model
+
+
+def test_deeply_nested_json_is_a_response_error_and_a_500_with_it_stays_transient() -> None:
+    nested = b"[" * 200_000 + b"]" * 200_000
+    provider, _ = provider_for(lambda request: httpx.Response(200, content=nested))
+    with pytest.raises(ProviderResponseError):
+        provider.generate(REQUEST)
+
+    server, _ = provider_for(lambda request: httpx.Response(500, content=nested))
+    with pytest.raises(ProviderServerError):
+        server.generate(REQUEST)
+
+    listing, _ = provider_for(lambda request: httpx.Response(200, content=nested))
+    assert listing.configure_context_window(MODEL, None, timeout_seconds=5) is None
+
+
+@pytest.mark.parametrize("source", [["x"], {"a": 1}, 7, None])
+def test_a_402_limit_source_that_is_not_text_is_the_generic_credit_error(source: object) -> None:
+    body = {"error": {"code": 402, "metadata": {"limit_source": source}}}
+    provider, _ = provider_for(lambda request: httpx.Response(402, json=body))
+
+    with pytest.raises(ProviderRequestError, match="insufficient credits"):
+        provider.generate(REQUEST)
+
+
+def test_a_plain_http_500_is_a_server_error() -> None:
+    provider, _ = provider_for(lambda request: httpx.Response(500, json={"error": {"code": 500}}))
+
+    with pytest.raises(ProviderServerError):
+        provider.generate(REQUEST)
+
+
+@pytest.mark.parametrize("failure", [ImportError("socksio-missing-xyz"), ValueError("bad-proxy-url-xyz"), FileNotFoundError("/private/ca-bundle-xyz.pem")])
+def test_a_client_that_cannot_be_configured_is_a_request_error_without_its_text(
+    failure: Exception,
+) -> None:
+    def broken_factory(**kwargs: object) -> httpx.Client:
+        raise failure
+
+    provider = OpenRouterProvider(client_factory=broken_factory)
+
+    with pytest.raises(ProviderRequestError) as caught:
+        provider.generate(REQUEST)
+
+    assert str(failure) not in str(caught.value)
+    assert "proxy" in str(caught.value).lower()
+    assert provider.request_count == 0
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [{"enum": {1, 2}}, {"x": float("nan")}],
+    ids=["set", "nan"],
+)
+def test_a_request_that_cannot_be_encoded_is_a_request_error_and_is_not_counted(
+    schema: dict,
+) -> None:
+    provider, requests = provider_for(replying(200, "chat_completion_structured_ok.json"))
+    request = GenerationRequest(**{**SCHEMA_REQUEST.__dict__, "response_schema": schema})
+
+    with pytest.raises(ProviderRequestError, match="encoded"):
+        provider.generate(request)
+
+    assert requests == [] and provider.request_count == 0
+
+
+def test_a_lone_surrogate_in_the_input_is_a_request_error() -> None:
+    provider, requests = provider_for(replying(200, "chat_completion_ok.json"))
+    request = GenerationRequest(**{**REQUEST.__dict__, "input_text": "bad \ud800 text"})
+
+    with pytest.raises(ProviderRequestError, match="encoded"):
+        provider.generate(request)
+
+    assert requests == []
+
+
+@pytest.mark.parametrize("code", [0, -7, 99, 600, 10**4000], ids=["zero", "negative", "99", "600", "huge"])
+def test_an_in_body_error_code_outside_the_http_range_is_an_unusable_response(code: int) -> None:
+    body = {"error": {"code": code, "message": "x"}}
+    provider, _ = provider_for(lambda request: httpx.Response(200, json=body))
+
+    with pytest.raises(ProviderResponseError) as caught:
+        provider.generate(REQUEST)
+
+    assert len(str(caught.value)) < 120
+
+
+@pytest.mark.parametrize(
+    "name", ["Bearer abcdefghijklmnop", "sk-or-v1-abcdefghijklmnopqrstuvwxyz", "token=abcdefgh1234"]
+)
+def test_an_upstream_name_that_looks_like_a_credential_is_not_echoed(name: str) -> None:
+    body = fixture("error_429.json")
+    body["error"]["metadata"]["provider_name"] = name  # type: ignore[index]
+    provider, _ = provider_for(lambda request: httpx.Response(429, json=body))
+
+    with pytest.raises(ProviderRateLimitError) as caught:
+        provider.generate(REQUEST)
+
+    assert name not in str(caught.value) and "upstream" not in str(caught.value)
+
+
+def test_the_request_timeout_is_sent_with_every_request() -> None:
+    provider, requests = provider_for(replying(200, "chat_completion_ok.json"))
+
+    provider.generate(GenerationRequest(**{**REQUEST.__dict__, "timeout_seconds": 7.5}))
+
+    assert requests[0].extensions["timeout"]["read"] == 7.5
+
+
+@pytest.mark.parametrize(
+    ("message", "hint"),
+    [
+        ("This endpoint's maximum context length is 8192 tokens. However, you requested about 9000", "context window"),
+        ("No endpoints found that can handle the requested parameters", "endpoint"),
+        ("something else entirely", None),
+    ],
+)
+def test_rejections_name_a_likely_cause_without_copying_the_message(
+    message: str, hint: str | None
+) -> None:
+    body = {"error": {"code": 400, "message": message}}
+    provider, _ = provider_for(lambda request: httpx.Response(400, json=body))
+
+    with pytest.raises(ProviderRequestError) as caught:
+        provider.generate(REQUEST)
+
+    text = str(caught.value)
+    assert message not in text
+    if hint is not None:
+        assert hint in text
+
+
+@pytest.mark.parametrize("bad_key", ["bad key", "line\nbreak"])
+def test_a_malformed_key_is_not_reported_as_set(
+    monkeypatch: pytest.MonkeyPatch, bad_key: str
+) -> None:
+    from summarizer.providers.openrouter import openrouter_key_state
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", bad_key)
+
+    assert openrouter_key_state() == "invalid"
+    assert openrouter_api_key_is_set() is False
+    monkeypatch.setenv("OPENROUTER_API_KEY", KEY)
+    assert openrouter_key_state() == "ok" and openrouter_api_key_is_set() is True
+    monkeypatch.delenv("OPENROUTER_API_KEY")
+    assert openrouter_key_state() == "missing"
+
+
+# --- listing resolution (review findings) ------------------------------------------------
+
+
+def _listing_of(entries: list[dict]) -> httpx.Response:
+    return httpx.Response(200, json={"data": entries})
+
+
+def _entry(identity: str, slug: str, length: int | None, top: int | None = None) -> dict:
+    return {
+        "id": identity,
+        "canonical_slug": slug,
+        "context_length": length,
+        "top_provider": {"context_length": top if top is not None else length},
+    }
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_a_variant_listed_before_its_base_never_shadows_the_base_window(reverse: bool) -> None:
+    entries = [_entry("x/y:free", "x/y", 8192), _entry("x/y", "x/y", 131_072)]
+    provider, _ = provider_for(lambda request: _listing_of(entries[::-1] if reverse else entries))
+
+    assert provider.configure_context_window("x/y", None, timeout_seconds=5) == 131_072
+
+
+def test_an_alias_entry_never_shadows_the_real_model_it_points_at() -> None:
+    entries = [
+        _entry("~anthropic/claude-sonnet-latest", "anthropic/claude-sonnet-4.5", 1_000_000),
+        _entry("anthropic/claude-sonnet-4.5", "anthropic/claude-sonnet-4.5", 200_000),
+    ]
+    provider, _ = provider_for(lambda request: _listing_of(entries))
+
+    window = provider.configure_context_window(
+        "anthropic/claude-sonnet-4.5", None, timeout_seconds=5
+    )
+
+    assert window == 200_000
+
+
+def test_a_model_is_found_by_its_canonical_slug_when_no_id_matches() -> None:
+    provider, _ = provider_for(
+        lambda request: _listing_of([_entry("x/y-20251001", "x/y", 65_536)])
+    )
+
+    assert provider.configure_context_window("x/y", None, timeout_seconds=5) == 65_536
+
+
+def test_a_variant_resolved_through_its_base_says_so() -> None:
+    provider, _ = provider_for(lambda request: _listing_of([_entry("x/y", "x/y", 131_072)]))
+
+    assert provider.configure_context_window("x/y:free", None, timeout_seconds=5) == 131_072
+    assert provider.window_notice is not None and "x/y" in provider.window_notice
+
+
+def test_an_explicit_window_equal_to_the_listed_maximum_is_accepted() -> None:
+    provider, _ = listing_provider()
+
+    assert provider.configure_context_window(MODEL, 131_072, timeout_seconds=5) == 131_072
+
+
+def test_an_explicit_window_between_the_smaller_and_larger_listed_length_is_allowed_with_a_note() -> None:
+    entries = [_entry("x/y", "x/y", 131_072, top=8_192)]
+    provider, _ = provider_for(lambda request: _listing_of(entries), upstream="deepinfra")
+
+    assert provider.configure_context_window("x/y", 100_000, timeout_seconds=5) == 100_000
+    assert provider.window_source == "explicit"
+    assert provider.window_notice is not None and "8192" in provider.window_notice
+    with pytest.raises(ProviderRequestError):
+        provider.configure_context_window("x/y", 131_073, timeout_seconds=5)

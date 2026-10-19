@@ -19,6 +19,22 @@ _OPENROUTER_UPSTREAM = re.compile(
 )
 
 
+# A model name as the audit and the cache identity both accept it: optionally
+# vendor-qualified as `vendor/model` (at most three segments), optionally
+# carrying one `:variant` tag or a leading `~` alias marker, as OpenRouter names
+# do. One definition, so a name cannot pass one check and fail another after
+# the requests it names have been paid for.
+MODEL_IDENTITY = re.compile(
+    r"^~?[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,127}){0,2}"
+    r"(?::[A-Za-z0-9][A-Za-z0-9._-]{0,127})?$"
+)
+
+
+def is_model_identity(value: str) -> bool:
+    """Whether a model name is one the audit and the cache can record."""
+    return MODEL_IDENTITY.fullmatch(value) is not None and redact_text(value) == value
+
+
 def normalize_openrouter_upstream(value: str) -> str:
     """Return a valid pinned-upstream slug, or the empty string for no pin."""
     upstream = value.strip()
@@ -91,6 +107,11 @@ class AppConfig:
             raise ValueError("output_path must differ from input_path")
         if not self.model.strip():
             raise ValueError("model must not be empty")
+        if self.provider == "openrouter" and not is_model_identity(self.model):
+            raise ValueError(
+                "model must be an OpenRouter model ID such as vendor/model, with at most "
+                "three path segments and one :variant tag"
+            )
         if self.provider not in PROVIDER_NAMES:
             raise ValueError("provider must be openai, ollama or openrouter")
         if self.provider == "ollama" and not self.ollama_host.strip():

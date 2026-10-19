@@ -113,7 +113,7 @@ from pydantic import (
     model_validator,
 )
 
-from summarizer.config import PROVIDER_NAMES, normalize_openrouter_upstream
+from summarizer.config import MODEL_IDENTITY, PROVIDER_NAMES, normalize_openrouter_upstream
 from summarizer.hierarchy import TreeNode
 from summarizer.providers.base import GenerationResult
 from summarizer.safety import redact_text
@@ -147,12 +147,7 @@ _SEGMENT_ID = re.compile(r"^[DS]\d{6}$")
 _NODE_ID = re.compile(r"^L\d+N\d{4}$")
 _SECTION_ID = re.compile(r"^s[1-9][0-9]*$")
 _SAFE_IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-# A model name, optionally vendor-qualified as `vendor/model` and optionally
-# carrying a `:variant` tag or a leading `~` alias marker, as OpenRouter names do.
-_SAFE_MODEL_IDENTITY = re.compile(
-    r"^~?[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,127}){0,2}"
-    r"(?::[A-Za-z0-9][A-Za-z0-9._-]{0,127})?$"
-)
+_SAFE_MODEL_IDENTITY = MODEL_IDENTITY
 _VERIFICATION_PROMPT_VERSION = frozenset(
     {
         "verification-decomposition/1",

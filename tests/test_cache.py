@@ -510,3 +510,19 @@ def test_a_pinned_upstream_change_is_reported_as_a_model_change() -> None:
     from summarizer.cache import _descriptor_invalidation_reasons
 
     assert "model_changed" in _descriptor_invalidation_reasons(previous, current)
+
+
+def test_an_upstream_change_in_either_direction_invalidates_as_a_model_change() -> None:
+    from summarizer.cache import _descriptor_invalidation_reasons
+
+    pinned = _descriptor(provider="openrouter", openrouter_upstream="deepinfra")
+    unpinned = _descriptor(provider="openrouter")
+
+    assert "model_changed" in _descriptor_invalidation_reasons(unpinned, pinned)
+    assert "model_changed" in _descriptor_invalidation_reasons(pinned, unpinned)
+    assert "model_changed" not in _descriptor_invalidation_reasons(pinned, pinned)
+
+
+@pytest.mark.parametrize("model", ["~vendor/model", "vendor/model:free"])
+def test_descriptor_accepts_alias_and_variant_openrouter_model_names(model: str) -> None:
+    assert _descriptor(provider="openrouter", model=model).model == model

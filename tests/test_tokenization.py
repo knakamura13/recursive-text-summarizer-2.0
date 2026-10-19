@@ -514,3 +514,9 @@ def test_estimate_notice_is_silent_for_exact_counters_and_names_inexact_ones(
     assert "estimate" in notice
     assert estimated.identity in notice
     assert "tokenizer" in notice
+
+
+@pytest.mark.parametrize("factor", [0.99, 0.0, -1.0, float("nan"), float("inf")])
+def test_an_estimate_factor_below_one_or_not_finite_is_refused(factor: float) -> None:
+    with pytest.raises(TokenAccountingError, match="factor"):
+        ScaledTiktokenCounter(_FakeEncoding(), factor)
