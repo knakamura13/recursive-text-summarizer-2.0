@@ -27,7 +27,7 @@ For each probe, the counter counts the system message and the user message. Olla
 Probes come in three kinds, so that edge whitespace, which a server may trim, cannot hide a real mismatch or fail an exact one:
 
 - **Clean** (11): no whitespace at either edge of either message. They set the overhead, which is observed, not assumed: every clean probe must show the same `reported - counted`, or the run fails and names the probes in each group. They include internal runs of spaces, tabs, newlines and indentation, non-ASCII text, markup, long text, and two probes with a `format` schema as the summarizer's requests have. The schema probes share the overhead only if Ollama does not count the schema as prompt tokens, as #120 found on the GGUF path.
-- **Boundary** (7): `Count these words.` with one run of one kind of whitespace at one edge, each alone: trailing and leading newline, space and tab in the user message, and a trailing newline in the system message. They only need `reported <= counted + overhead`. A probe Ollama counts lower is reported with its gap, which is how the run shows whether a server trims and which characters.
+- **Boundary** (7): `Count these words.` with one run of one kind of whitespace at one edge, each alone: trailing and leading newline, space and tab in the user message (the leading space is two, because one merges into the first word and costs no token), and a trailing newline in the system message. They only need `reported <= counted + overhead`. A probe Ollama counts lower is reported with its gap, which is how the run shows whether a server trims and which characters.
 - **Marker** (1): special-token markers such as `<bos>` and `<|turn>`. The counter splits a marker into pieces, which can only count more than Ollama, so Ollama may count fewer here and never more.
 
 Any probe that Ollama counts higher than counter plus overhead fails the run, and a missing `prompt_eval_count` is a failure. Each system message opens with a different word so a reused prefix is only the template header, and a throwaway warm-up request goes first so that header is cached the same way for every probe.
@@ -56,7 +56,7 @@ Offline follow-up on the same counts, using the real tokenizer, the model files 
 Reading of the first run (above) predicts:
 
 - Clean probes: `reported - counted` is 14 for all eleven, the figure of #120, because `think: false` removes the two thinking tokens. If it is 16 again, the thinking marker is not the cause and the step from 14 stays unexplained. If clean probes disagree, internal whitespace or content is the cause and the counter is not yet exact.
-- Boundary probes: `trailing-newline` is 1 lower than the overhead, as in the first run. If the renderer trims message whitespace, every other boundary probe is also 1 lower, including `system-trailing-newline`. If only trailing newlines behave differently, the others are 0.
+- Boundary probes: each costs exactly one token under the counter, so each is 1 lower than the overhead if Ollama trims that whitespace and 0 if it keeps it. `trailing-newline` is 1 lower, as in the first run. If the renderer trims message whitespace, all seven are 1 lower, including `system-trailing-newline`. If only trailing newlines behave differently, the other six are 0.
 - `special-markers`: 7 lower than the overhead.
 - Verdict: pass if no gap is positive.
 

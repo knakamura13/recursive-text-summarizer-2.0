@@ -120,7 +120,9 @@ def probes() -> list[Probe]:
         Probe("trailing-space", "boundary", "Mike: answer briefly.", BASE_USER + " "),
         Probe("trailing-tab", "boundary", "November: answer briefly.", BASE_USER + "\t"),
         Probe("leading-newline", "boundary", "Oscar: answer briefly.", "\n" + BASE_USER),
-        Probe("leading-space", "boundary", "Papa: answer briefly.", " " + BASE_USER),
+        # Two spaces: a single leading space merges into the first word ("▁Count" is one token),
+        # so trimming it would change no count and the probe could not tell a trim from none.
+        Probe("leading-space", "boundary", "Papa: answer briefly.", "  " + BASE_USER),
         Probe("leading-tab", "boundary", "Quebec: answer briefly.", "\t" + BASE_USER),
         Probe("system-trailing-newline", "boundary", "Romeo: answer briefly.\n", BASE_USER),
         Probe(

@@ -135,11 +135,18 @@ def test_whitespace_at_a_message_edge_that_ollama_trims_passes_and_is_reported(
     code, _ = _run(models_dir, trim=True)
 
     out = capsys.readouterr().out
+    counter = TokenizerJsonCounter.for_ollama_model(
+        "big:31b", models_dir=models_dir, allow_unverified=True
+    )
     assert code == verify.EXIT_PASSED
-    # Every boundary probe loses its one whitespace token, and the notes name them.
+    # Every boundary probe loses its whitespace tokens, and the notes name the gap.
     for probe in verify.probes():
         if probe.kind == "boundary":
-            assert f"{probe.name}: Ollama counted 1 fewer" in out
+            lost = (counter.count(probe.system) + counter.count(probe.user)) - (
+                counter.count(probe.system.strip()) + counter.count(probe.user.strip())
+            )
+            assert lost >= 1
+            assert f"{probe.name}: Ollama counted {lost} fewer" in out
 
 
 def test_whitespace_at_a_message_edge_that_ollama_keeps_reports_no_difference(
