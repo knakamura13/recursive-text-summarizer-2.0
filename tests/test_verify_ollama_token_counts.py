@@ -1,7 +1,7 @@
 """The #190 verification script, against a scripted Ollama and a synthetic tokenizer.
 
 These tests prove the script's arithmetic and its refusals. They say nothing
-about a real server: the script has never been pointed at one.
+about a real server. The recorded run against one is in the experiment's README.
 """
 
 from __future__ import annotations

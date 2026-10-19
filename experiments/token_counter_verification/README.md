@@ -2,7 +2,7 @@
 
 Ollama models pulled in the newer tensor layout (for example `gemma4:31b` and `gemma4:31b-mlx`) have no GGUF file, so the exact counter of #120 cannot read them. `TokenizerJsonCounter` reads the model's Hugging Face `tokenizer.json` layer instead, but it is refused until its counts have been checked against Ollama's `prompt_eval_count`. Until then the summarizer uses the byte counter and says so in preflight, in the Run and on the command line.
 
-`verify_ollama_token_counts.py` makes that check. **It runs real model inference**: one warm-up request and 12 fixed probes to an Ollama server on this machine, each limited to one generated token. Nothing in the repository runs it, and it has not been run against a real server. Its tests use a scripted server and a synthetic tokenizer.
+`verify_ollama_token_counts.py` makes that check. **It runs real model inference**: one warm-up request and 12 fixed probes to an Ollama server on this machine, each limited to one generated token. Nothing in the repository runs it. Its tests use a scripted server and a synthetic tokenizer. Its one run against a real server is recorded at the end of this file.
 
 ## Run it
 
@@ -37,6 +37,12 @@ Output has no document text: probe names, counts and the verdict. The JSON repor
 A pass prints the counting fingerprint. To enable the counter, add it to `_VERIFIED_TOKENIZER_JSON_FINGERPRINTS` in `summarizer/tokenization.py` in a commit that says what was compared. The fingerprint covers what decides a count (the model, normalizer, pre-tokenizer and ordinary added tokens), so `gemma4:31b` and `gemma4:31b-mlx` share one even though their manifests list a second `tokenizer.json` each. A tokenizer that counts differently has another fingerprint and stays refused.
 
 The fixed probes are a smoke check of a few dozen tokens each. #120 compared 1,742 recorded requests; for a model that will run large baselines, also compare counts on a few long recorded or fresh requests before relying on the counter.
+
+## Run on 2026-10-19 (`gemma4:31b`, Ollama 0.40.6): did not pass
+
+The script exited 1 on its constant-overhead rule. Reported minus counted was +16 on nine of the eleven plain probes and +15 on `whitespace` and `code`, the only two whose user text ends in a newline. The special-marker probe was 7 lower than the plain overhead of 16. Fingerprint `63e8558fe07c03e6...` was not added.
+
+Read against the recorded counts, with the real tokenizer and no further requests: every plain probe equals Ollama's count minus 16 exactly once trailing whitespace is trimmed from each message, and the marker probe equals the count when `<bos>`, `<eos>`, `<pad>`, `<|turn>` and `<|video|>` are matched as one special token each. So no probe was undercounted at an overhead of 16, and the two exceptions are the counter counting one more than Ollama. That reading was found after the run. It needs a run on probes written beforehand to test it (trailing and leading newline, space and tab, each alone) before the criterion is changed or the fingerprint added. The overhead here is 16, not the 14 of #120's GGUF path.
 
 ## Not covered
 
