@@ -223,11 +223,17 @@ class GgufTokenCounter:
     ``<|turn>`` inside a document counts as its pieces. That can only count
     more than the model does, never fewer.
 
-    Ollama wraps the system and user messages in its chat template, 14 tokens
-    for gemma4, which this counter does not see. Request measurement also
-    counts the JSON schema, which Ollama sends as a grammar rather than
-    prompt tokens. On all 1,742 recorded requests the schema count exceeded
-    the template by at least 19 tokens, before any safety margin.
+    Ollama wraps the system and user messages in its chat template, which this
+    counter does not see. #120 recorded 14 tokens for gemma4 (Ollama 0.34.4,
+    llama runner). The MLX runner on Ollama 0.40.6 reported 18 with think false
+    and 16 with it unset (#190), so the figure belongs to a runner and a
+    version. No budget term charges the template by name. Request measurement
+    counts the JSON schema as prompt tokens, which Ollama sends as a grammar
+    rather than prompt tokens, so every request is charged its schema term, and
+    the safety margin, beyond what the template costs. The smallest schema term,
+    33 tokens for the editorial and compression requests, exceeded a 14-token
+    template by 19 on #120's 1,742 requests and exceeds an 18-token one by 15,
+    before any safety margin.
     """
 
     tokenizer: Any
