@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { makeDocument, MockApi } from './support/mockApi';
+import { defaultRunConfig, makeDocument, makeSettings, MockApi } from './support/mockApi';
 import { SMALL_SOURCE } from './support/workspaceFixtures';
 
 const DOC = 'doc-openrouter';
@@ -68,7 +68,7 @@ test('a server without a key says so and an invalid upstream blocks Start', asyn
 	await page.goto(`/documents/${DOC}`);
 	await page.getByLabel('Provider', { exact: true }).selectOption('openrouter');
 
-	await expect(page.getByRole('status').filter({ hasText: 'OPENROUTER_API_KEY' })).toBeVisible();
+	await expect(page.getByRole('alert').filter({ hasText: 'OPENROUTER_API_KEY' })).toBeVisible();
 
 	await page.getByLabel('Model', { exact: true }).fill(MODEL);
 	await page.getByLabel('Upstream provider (optional)').fill('two words');
@@ -76,7 +76,7 @@ test('a server without a key says so and an invalid upstream blocks Start', asyn
 	await expect(page.getByRole('button', { name: 'Start Run' })).toBeDisabled();
 });
 
-test('switching back to Ollama clears the model and the upstream', async ({ page }) => {
+test('switching providers keeps what was typed for each one and drops the upstream for Ollama', async ({ page }) => {
 	await MockApi.install(page, seed());
 
 	await page.goto(`/documents/${DOC}`);
@@ -87,6 +87,51 @@ test('switching back to Ollama clears the model and the upstream', async ({ page
 
 	await expect(page.getByLabel('Model', { exact: true })).toHaveJSProperty('tagName', 'SELECT');
 	await expect(page.getByLabel('Upstream provider (optional)')).toHaveCount(0);
+
+	await page.getByLabel('Provider', { exact: true }).selectOption('openrouter');
+	await expect(page.getByLabel('Model', { exact: true })).toHaveValue(MODEL);
+	await expect(page.getByLabel('Upstream provider (optional)')).toHaveValue('deepinfra');
+});
+
+test('a server without a key blocks Start with a reason and no duplicate', async ({ page }) => {
+	await MockApi.install(page, {
+		...seed(),
+		openrouter: { key_set: false, message: 'OpenRouter needs an API key.' }
+	});
+
+	await page.goto(`/documents/${DOC}`);
+	await page.getByLabel('Provider', { exact: true }).selectOption('openrouter');
+	await page.getByLabel('Model', { exact: true }).fill(MODEL);
+
+	await expect(page.getByRole('button', { name: 'Start Run' })).toBeDisabled();
+	await expect(page.locator('#start-reasons').getByText('OpenRouter needs an API key.')).toHaveCount(1);
+});
+
+test('the estimated label is separated from the token count', async ({ page }) => {
+	const mock = await MockApi.install(page, seed());
+	mock.on('POST', '/preflight', () => ({
+		json: {
+			ok: true,
+			selected_strategy: 'direct',
+			context_window_tokens: 131_072,
+			context_window_source: 'model',
+			provider: 'openrouter',
+			token_counts_estimated: true,
+			usable_input_capacity: 120_000,
+			document_tokens: 600,
+			estimated_leaf_count: 1,
+			estimated_model_calls: 2,
+			model_installed: null,
+			errors: [],
+			warnings: []
+		}
+	}));
+
+	await page.goto(`/documents/${DOC}`);
+	await page.getByLabel('Provider', { exact: true }).selectOption('openrouter');
+	await page.getByLabel('Model', { exact: true }).fill(MODEL);
+
+	await expect(page.locator('.facts')).toContainText('about 600 tokens (estimated)');
 });
 
 test('Settings reports whether the server has a key and never asks for it', async ({ page }) => {
@@ -99,4 +144,20 @@ test('Settings reports whether the server has a key and never asks for it', asyn
 	await expect(page.getByRole('heading', { name: 'OpenRouter' })).toBeVisible();
 	await expect(page.getByText('OpenRouter needs an API key.')).toBeVisible();
 	await expect(page.getByLabel(/api key/i)).toHaveCount(0);
+});
+
+test('making an Ollama model the default selects Ollama when OpenRouter was the default', async ({ page }) => {
+	const mock = await MockApi.install(page, {
+		settings: makeSettings({
+			defaults: defaultRunConfig({ provider: 'openrouter', model: MODEL, openrouter_upstream: 'deepinfra' })
+		})
+	});
+
+	await page.goto('/settings');
+	await page.getByRole('button', { name: 'Use qwen2.5:14b as the default model' }).click();
+
+	await expect.poll(() => mock.calls('PATCH', '/settings').length).toBe(1);
+	const [patch] = mock.calls('PATCH', '/settings');
+	expect(patch.body).toEqual({ defaults: { provider: 'ollama', model: 'qwen2.5:14b' } });
+	await expect(page.getByText('Default', { exact: true })).toBeVisible();
 });

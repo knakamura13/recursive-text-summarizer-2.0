@@ -125,6 +125,9 @@
 				pending: models.loading
 			});
 		}
+		if (config.provider === 'openrouter' && openrouter.keySet === false) {
+			list.push({ text: openrouter.status?.message ?? 'The server has no OpenRouter API key.' });
+		}
 		if (activeRun) list.push({ run: activeRun });
 		if (Object.keys(localErrors).some((field) => field !== 'model')) list.push({ text: 'Fix the settings marked below.' });
 		if (ready && valid && !activeRun) {
@@ -133,7 +136,11 @@
 				list.push({ text: 'The configuration check failed: ' + errorMessage(preflightError) });
 			}
 			else if (preflight && !preflight.ok) {
-				for (const error of preflight.errors) list.push({ text: error.message });
+				for (const error of preflight.errors) {
+					// The missing key is already listed above, from the status check.
+					if (error.code === 'openrouter_key_missing' && openrouter.keySet === false) continue;
+					list.push({ text: error.message });
+				}
 				if (preflight.errors.length === 0) list.push({ text: 'The configuration check did not pass.' });
 			}
 		}
@@ -178,6 +185,14 @@
 		<ErrorBanner error={models.error} title="Could not list the installed models" onretry={() => models.refresh()} />
 	{/if}
 
+	{#if openrouter.error && config?.provider === 'openrouter'}
+		<ErrorBanner
+			error={openrouter.error}
+			title="Could not check for an OpenRouter key"
+			onretry={() => openrouter.refresh()}
+		/>
+	{/if}
+
 	{#if config}
 		<RunConfigFields
 			bind:config
@@ -218,8 +233,7 @@
 					<div>
 						<dt>Document</dt>
 						<dd>
-							about {formatCount(preflight.document_tokens)} tokens{#if preflight.token_counts_estimated}
-								(estimated){/if}
+							about {formatCount(preflight.document_tokens)} tokens{#if preflight.token_counts_estimated}{' '}(estimated){/if}
 						</dd>
 					</div>
 				{/if}

@@ -26,12 +26,19 @@
 	const openrouter = $derived(config.provider === 'openrouter');
 
 	// A model name belongs to one provider, and an upstream pin only to
-	// OpenRouter, so changing the provider starts both over.
+	// OpenRouter, so changing the provider swaps both for what was last entered
+	// for the other provider (empty at first) instead of carrying them across.
+	const remembered: Record<ProviderName, { model: string; upstream: string }> = {
+		ollama: { model: '', upstream: '' },
+		openrouter: { model: '', upstream: '' }
+	};
+
 	function setProvider(provider: ProviderName) {
 		if (config.provider === provider) return;
+		remembered[config.provider] = { model: config.model, upstream: config.openrouter_upstream };
 		config.provider = provider;
-		config.model = '';
-		config.openrouter_upstream = '';
+		config.model = remembered[provider].model;
+		config.openrouter_upstream = provider === 'openrouter' ? remembered[provider].upstream : '';
 	}
 
 	interface AdvancedField {
@@ -101,10 +108,13 @@
 	const installed = $derived(models.some((model) => model.name === config.model));
 	const advancedInvalid = $derived(ADVANCED.some(({ field }) => errors[field]));
 
+	const keyMissing = $derived(openrouter && openrouterKeySet === false);
+
 	function describedBy(field: keyof RunConfigErrors, hasHint: boolean): string | undefined {
 		const ids: string[] = [];
 		if (hasHint) ids.push(`${idPrefix}-${field}-hint`);
 		if (errors[field]) ids.push(`${idPrefix}-${field}-error`);
+		if (field === 'model' && keyMissing) ids.push(`${idPrefix}-openrouter-key`);
 		return ids.length > 0 ? ids.join(' ') : undefined;
 	}
 </script>
@@ -126,24 +136,23 @@
 				{disabled}
 				aria-describedby="{idPrefix}-provider-hint"
 			>
-				<option value="ollama">Ollama (on this machine)</option>
+				<option value="ollama">Ollama</option>
 				<option value="openrouter">OpenRouter (hosted)</option>
 			</select>
 			<p class="field-hint" id="{idPrefix}-provider-hint">
 				{openrouter
 					? 'The Document’s text is sent to OpenRouter, which bills each request.'
-					: 'Runs entirely on this machine.'}
+					: 'Runs on the Ollama host set in Settings.'}
 			</p>
+			{#if keyMissing}
+				<p class="field-error" id="{idPrefix}-openrouter-key" role="alert">
+					The server has no OpenRouter API key. Set OPENROUTER_API_KEY in the environment it runs
+					in, then restart it.
+				</p>
+			{/if}
 		</div>
 
-		{#if openrouter && openrouterKeySet === false}
-			<p class="field-error span" id="{idPrefix}-openrouter-key" role="status">
-				The server has no OpenRouter API key. Set OPENROUTER_API_KEY in the environment it runs in,
-				then restart it.
-			</p>
-		{/if}
-
-		<div class="field">
+		<div class="field" class:span={openrouter}>
 			<label for="{idPrefix}-model">Model</label>
 			{#if openrouter}
 				<input
@@ -155,8 +164,11 @@
 					bind:value={config.model}
 					{disabled}
 					aria-invalid={errors.model ? 'true' : undefined}
-					aria-describedby={describedBy('model', false)}
+					aria-describedby={describedBy('model', true)}
 				/>
+				<p class="field-hint" id="{idPrefix}-model-hint">
+					An OpenRouter model ID, for example meta-llama/llama-3.3-70b-instruct.
+				</p>
 			{:else}
 				<select
 					id="{idPrefix}-model"
@@ -234,7 +246,7 @@
 			</p>
 		</div>
 
-		<label class="checkbox-field">
+		<label class="checkbox-field span">
 			<input type="checkbox" bind:checked={config.verify} {disabled} />
 			<span>Verify every summary sentence against the source</span>
 		</label>
@@ -295,7 +307,7 @@
 	}
 
 	.checkbox-field.span,
-	.field-error.span {
+	.field.span {
 		grid-column: 1 / -1;
 	}
 
