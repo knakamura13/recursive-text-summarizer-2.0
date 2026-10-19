@@ -58,6 +58,64 @@ def test_a_title_is_placed_where_it_begins_a_line_and_whitespace_and_case_may_di
     assert titles == [("Early Days", "Early Days"), ("Later Years", "Later Years")]
 
 
+LIGATURES = "First ﬁne ﬂow of the oﬃce.\n\n"
+
+
+def test_a_title_matches_a_text_that_spells_it_with_ligatures() -> None:
+    text = LIGATURES + "Reﬁning the Estimate\n\nBody.\n\nEﬀort\n\nMore body."
+    hints = [OutlineHint("Refining the Estimate", 1), OutlineHint("Effort", 1)]
+
+    imported = assemble(Extraction("txt", text=text, outline_hints=hints))
+
+    # Offsets and titles are the canonical text's; the ligatures stay in it.
+    assert imported.text == text
+    assert imported.unplaced_headings == 0
+    assert [(entry.title, imported.text[entry.start : entry.end]) for entry in imported.outline] == [
+        ("Reﬁning the Estimate", "Reﬁning the Estimate\n\nBody.\n\n"),
+        ("Eﬀort", "Eﬀort\n\nMore body."),
+    ]
+
+
+def test_a_title_spelled_with_ligatures_matches_a_text_that_is_not() -> None:
+    text = "Refining the Estimate\n\nBody."
+
+    imported = assemble(Extraction("txt", text=text, outline_hints=[OutlineHint("Reﬁning the Estimate", 1)]))
+
+    assert [imported.text[entry.start : entry.end] for entry in imported.outline] == [text]
+
+
+def test_a_title_inside_a_ligature_word_is_not_a_whole_word() -> None:
+    text = "Oﬀer\n\nBody."
+
+    assert assemble(Extraction("txt", text=text, outline_hints=[OutlineHint("Of", 1)])).unplaced_headings == 1
+    assert assemble(Extraction("txt", text=text, outline_hints=[OutlineHint("Offer", 1)])).unplaced_headings == 0
+
+
+def test_a_hint_with_an_offset_is_placed_there_after_earlier_ligatures() -> None:
+    text = LIGATURES + "Reﬁning\n\nBody."
+    offset = text.index("Reﬁning")
+
+    imported = assemble(Extraction("md", text=text, outline_hints=[OutlineHint("Refining", 1, offset=offset)]))
+
+    [entry] = imported.outline
+    assert (entry.start, imported.text[entry.start : entry.end]) == (offset, "Reﬁning\n\nBody.")
+
+
+def test_a_page_hint_is_searched_on_its_page_after_earlier_ligatures() -> None:
+    pages = [
+        # Enough ligatures that, unmapped, page 3's start would fall back onto page 2's heading.
+        PageText(1, " ".join(["oﬃce"] * 20)),
+        PageText(2, "Reﬁning\n\nBody."),
+        PageText(3, "Reﬁning\n\nAgain."),
+    ]
+
+    imported = assemble(Extraction("pdf", pages=pages, outline_hints=[OutlineHint("Refining", 1, page=3)]))
+
+    [entry] = imported.outline
+    assert imported.text[entry.start :] == "Reﬁning\n\nAgain."
+    assert (entry.page_start, entry.page_end) == (3, 3)
+
+
 def test_a_title_matches_a_whole_heading_line_before_a_line_it_only_begins() -> None:
     text = "Results from the pilot were mixed.\n\nIntroduction\n\nResults\n\nThe final numbers."
     hints = [OutlineHint("Results", 1), OutlineHint("Intro", 1)]

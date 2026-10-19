@@ -34,6 +34,7 @@ from summarizer_web.ingestion.common import (
     plural,
 )
 from summarizer_web.ingestion.encoding import DecodedText, decode_text
+from summarizer_web.ingestion.folding import FoldedText, compat_fold
 from summarizer_web.ingestion.markup import declared_charset, html_to_text_and_outline
 from summarizer_web.ingestion.ocr import Tesseract, extract_image
 from summarizer_web.ingestion.packages import extract_docx, extract_epub, extract_odt
@@ -122,8 +123,9 @@ def _title_patterns(title: str) -> tuple[re.Pattern[str], ...] | None:
     """Patterns for a title with any whitespace between its words, ignoring
     case, from most to least likely a heading: the title as a whole line,
     then at the start of a line, then anywhere. Each needs whole words, so
-    "Intro" does not match inside "Introduction"."""
-    words = clean_text(title).split()
+    "Intro" does not match inside "Introduction". They match a compatibility-
+    folded text (`FoldedText`), so the title is folded too."""
+    words = compat_fold(clean_text(title)).split()
     if not words:
         return None
     body = r"(?<!\w)" + r"\s+".join(re.escape(word) for word in words) + r"(?!\w)"
@@ -135,13 +137,15 @@ def _title_patterns(title: str) -> tuple[re.Pattern[str], ...] | None:
 
 
 def _find_title(
-    patterns: tuple[re.Pattern[str], ...], text: str, start: int, end: int
+    patterns: tuple[re.Pattern[str], ...], folded: FoldedText, start: int, end: int
 ) -> tuple[int, int] | None:
-    """The title's first occurrence in `text[start:end]` under the most likely pattern."""
+    """The title's first occurrence in the source text's `[start:end]` under the most likely
+    pattern, as source offsets."""
+    folded_start, folded_end = folded.to_folded(start), folded.to_folded(end)
     for pattern in patterns:
-        match = pattern.search(text, start, end)
+        match = pattern.search(folded.text, folded_start, folded_end)
         if match is not None:
-            return match.span(1)
+            return folded.span_to_source(*match.span(1))
     return None
 
 
@@ -157,6 +161,7 @@ def anchor_outline(
     offset is placed exactly there, or counted as not found.
     """
     by_page = {span.page: span for span in pages or () if not span.blank}
+    folded = FoldedText.of(text)
     placed: dict[int, tuple[str, int]] = {}
     cursor = 0
     unplaced = 0
@@ -166,14 +171,14 @@ def anchor_outline(
         if patterns is not None:
             if hint.offset is not None:
                 # The extractor knows where the title is: place it there, never earlier.
-                match = patterns[-1].match(text, hint.offset)
-                found = match.span(1) if match is not None else None
+                match = patterns[-1].match(folded.text, folded.to_folded(hint.offset))
+                found = folded.span_to_source(*match.span(1)) if match is not None else None
             elif hint.page is None:
-                found = _find_title(patterns, text, cursor, len(text))
+                found = _find_title(patterns, folded, cursor, len(text))
             elif (span := by_page.get(hint.page)) is not None:
                 found = _find_title(
-                    patterns, text, max(cursor, span.start), span.end
-                ) or _find_title(patterns, text, span.start, span.end)
+                    patterns, folded, max(cursor, span.start), span.end
+                ) or _find_title(patterns, folded, span.start, span.end)
         if found is None or found[0] in placed:
             unplaced += 1
             continue
