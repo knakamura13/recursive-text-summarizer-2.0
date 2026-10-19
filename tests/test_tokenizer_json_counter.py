@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from tokenizers import AddedToken, Tokenizer, models, normalizers, processors
+from tokenizers import AddedToken, Tokenizer, models, normalizers, pre_tokenizers, processors
 
 from summarizer import tokenization
 from summarizer.cache import CacheDescriptor
@@ -42,20 +42,23 @@ def _tokenizer_json(
     *,
     extra_piece: str | None = None,
     video_special: bool = False,
-    extra_ordinary: str | None = None,
+    td_added: bool = False,
+    lowercase: bool = False,
+    digits: bool = False,
     clip: bool = False,
 ) -> bytes:
     """A tiny SentencePiece-style BPE tokenizer in Hugging Face's JSON shape.
 
-    `extra_piece` changes the vocabulary. `video_special` declares a piece that
-    is in every vocabulary as a special added token, as gemma4's companion
-    model does with `<|video|>`. `extra_ordinary` adds an ordinary added token.
-    `clip` writes a truncation and a padding rule into the file.
+    `extra_piece` changes the vocabulary. `video_special` and `td_added`
+    declare a piece that every vocabulary holds as a special or an ordinary
+    added token (only one of gemma4:31b's two layers lists `<|video|>`), so
+    each changes nothing but the added tokens. `lowercase` and `digits` change
+    only the normalizer and the pre-tokenizer. `clip` writes a truncation and a
+    padding rule into the file.
     """
-    pieces = ["<unk>", "<bos>", "<sp>", "<", ">", "s", "p", "a", "b", "ab", "▁", "▁ab", "<|video|>"]
-    for piece in (extra_piece, extra_ordinary):
-        if piece is not None:
-            pieces.append(piece)
+    pieces = ["<unk>", "<bos>", "<sp>", "<", ">", "s", "p", "a", "b", "ab", "▁", "▁ab", "<|video|>", "<td>"]
+    if extra_piece is not None:
+        pieces.append(extra_piece)
     tokenizer = Tokenizer(
         models.BPE(
             vocab={piece: index for index, piece in enumerate(pieces)},
@@ -63,13 +66,18 @@ def _tokenizer_json(
             unk_token="<unk>",
         )
     )
-    tokenizer.normalizer = normalizers.Replace(" ", "▁")
+    replace = normalizers.Replace(" ", "▁")
+    tokenizer.normalizer = (
+        normalizers.Sequence([normalizers.Lowercase(), replace]) if lowercase else replace
+    )
+    if digits:
+        tokenizer.pre_tokenizer = pre_tokenizers.Digits(individual_digits=True)
     specials = [AddedToken("<bos>", special=True), AddedToken("<sp>", special=True)]
     if video_special:
         specials.append(AddedToken("<|video|>", special=True))
     tokenizer.add_special_tokens(specials)
-    if extra_ordinary is not None:
-        tokenizer.add_tokens([AddedToken(extra_ordinary, special=False)])
+    if td_added:
+        tokenizer.add_tokens([AddedToken("<td>", special=False)])
     if clip:
         tokenizer.enable_truncation(max_length=3)
         tokenizer.enable_padding(length=50)
@@ -220,8 +228,8 @@ def test_two_tokenizer_layers_that_count_differently_are_refused_as_ambiguous(
 def test_two_layers_that_differ_only_in_a_special_token_are_one_tokenizer(
     models_dir: Path, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    # gemma4:31b lists a second tokenizer.json for its companion model that
-    # differs from the first by one special token, which is never matched.
+    # gemma4:31b lists two tokenizer.json layers that differ by one special
+    # token, which the counter never matches.
     _install_layers(
         models_dir,
         "big",
@@ -245,18 +253,19 @@ def test_two_layers_that_differ_only_in_a_special_token_are_one_tokenizer(
         assert counter.count(text) == reference.count(text)
 
 
-def test_two_layers_that_differ_in_an_ordinary_added_token_are_ambiguous(
-    models_dir: Path,
+@pytest.mark.parametrize(
+    "variant", [{"td_added": True}, {"lowercase": True}, {"digits": True}, {"extra_piece": "zz"}]
+)
+def test_two_layers_that_differ_in_anything_a_count_depends_on_are_ambiguous(
+    models_dir: Path, variant: dict[str, object]
 ) -> None:
-    # A non-special added token is matched in ordinary text, so it changes counts.
+    # An ordinary added token is matched in text, and the normalizer and
+    # pre-tokenizer shape every piece, so each alone changes what a layer counts.
     _install_layers(
         models_dir,
         "big",
         "31b",
-        [
-            (JSON_LAYER, _tokenizer_json()),
-            (JSON_LAYER, _tokenizer_json(extra_ordinary="<td>")),
-        ],
+        [(JSON_LAYER, _tokenizer_json()), (JSON_LAYER, _tokenizer_json(**variant))],
     )
 
     with pytest.raises(TokenAccountingError, match="count differently"):
@@ -264,7 +273,7 @@ def test_two_layers_that_differ_in_an_ordinary_added_token_are_ambiguous(
 
 
 def test_an_ordinary_added_token_counts_as_one_token(models_dir: Path) -> None:
-    _install_layers(models_dir, "big", "31b", [(JSON_LAYER, _tokenizer_json(extra_ordinary="<td>"))])
+    _install_layers(models_dir, "big", "31b", [(JSON_LAYER, _tokenizer_json(td_added=True))])
     counter = TokenizerJsonCounter.for_ollama_model("big:31b", allow_unverified=True)
 
     assert counter.count("<td>") == 1
@@ -496,7 +505,7 @@ def test_a_missing_tokenizers_package_falls_back_with_that_reason(
     _tensor_model(models_dir)
     _verify(monkeypatch, _fingerprint())
     # Loading it above cached the tokenizer; start as a process that never had one.
-    tokenization._tokenizer_from_json_at.cache_clear()
+    tokenization._tokenizer_from_json.cache_clear()
     monkeypatch.setitem(sys.modules, "tokenizers", None)
 
     counter = resolve_token_counter(provider="ollama", model="big:31b", ollama_host=LOCAL)

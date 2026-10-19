@@ -357,8 +357,8 @@ def _gguf_tokenizer_metadata(path: Path) -> dict[str, Any]:
 # tokenizer.json is one of several JSON layers beside its configuration, so it
 # is told apart by content. These are the sections `Tokenizer.to_str()` always
 # writes; the library has the last word when the layer is loaded. A manifest
-# can hold more than one tokenizer.json (gemma4:31b lists a second for its
-# companion model), so layers are compared by what they count, not by file.
+# can hold more than one tokenizer.json (gemma4:31b lists two, which differ by
+# one special token), so layers are compared by what they count, not by file.
 _OLLAMA_JSON_LAYER = "application/vnd.ollama.image.json"
 _OLLAMA_LAYER_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _TOKENIZER_JSON_SECTIONS = frozenset(
@@ -469,20 +469,13 @@ class TokenizerJsonCounter:
         return _search_suffix(self.count, text, floor, end, max_tokens)
 
 
-def _file_stamp(path: Path) -> tuple[int, int]:
-    """Identify a blob's current contents cheaply, so a cache never outlives a replaced file."""
-    stat = path.stat()
-    return stat.st_mtime_ns, stat.st_size
-
-
-def _tokenizer_json_fingerprint(path: Path) -> str | None:
-    """Return the counting fingerprint of a JSON layer if it has a tokenizer's shape, else None."""
-    return _tokenizer_json_fingerprint_at(path, *_file_stamp(path))
-
-
 @lru_cache(maxsize=64)
-def _tokenizer_json_fingerprint_at(path: Path, mtime_ns: int, size: int) -> str | None:
-    # The stamp is part of the cache key, not an input.
+def _tokenizer_json_fingerprint(path: Path) -> str | None:
+    """Return the counting fingerprint of a JSON layer if it has a tokenizer's shape, else None.
+
+    Layers are content-addressed, so what a path holds does not change and the
+    answer is kept. A layer that cannot be read raises and is asked again.
+    """
     try:
         document = json.loads(path.read_bytes())
     except ValueError:
@@ -527,16 +520,9 @@ def _has_tokenizer_shape(document: object) -> bool:
     )
 
 
-def _tokenizer_from_json(path: Path) -> Any:
-    try:
-        return _tokenizer_from_json_at(path, *_file_stamp(path))
-    except OSError as error:
-        raise TokenAccountingError(f"cannot read the tokenizer in {path.name}") from error
-
-
 @lru_cache(maxsize=2)
-def _tokenizer_from_json_at(path: Path, mtime_ns: int, size: int) -> Any:
-    """Build a tokenizer from a tokenizer.json layer. The stamp is only a cache key."""
+def _tokenizer_from_json(path: Path) -> Any:
+    """Build a tokenizer from a tokenizer.json layer."""
     try:
         from tokenizers import Tokenizer
     except ImportError as error:
