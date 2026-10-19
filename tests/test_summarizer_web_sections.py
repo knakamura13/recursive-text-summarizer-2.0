@@ -214,3 +214,26 @@ def test_the_toggle_is_accepted_on_a_run_and_kept_in_settings(
         "/api/v1/settings", json={"defaults": {"preserve_sections": True}}, headers=headers
     )
     assert patched.json()["defaults"]["preserve_sections"] is True
+
+
+@pytest.mark.parametrize("provider", ["ollama", "openrouter"])
+@pytest.mark.parametrize("sections", [True, False])
+def test_one_document_runs_with_section_mode_on_and_off_for_both_providers(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, provider: str, sections: bool
+) -> None:
+    apps = []
+
+    def build_provider(app):
+        apps.append(app)
+        return WebSectionProvider(DRAFTS)
+
+    monkeypatch.setattr(runner, "build_provider", build_provider)
+    run_id = seed(outline=outline_of(TEXT), preserve_sections=sections, provider=provider)
+
+    complete(run_id)
+
+    [app] = apps
+    assert app.provider == provider
+    assert audit_of(run_id)["configuration"]["app"]["provider"] == provider
+    nodes = client.get(f"/api/v1/runs/{run_id}/tree").json()["nodes"]
+    assert any(node["section"] for node in nodes) is sections

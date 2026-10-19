@@ -178,6 +178,18 @@ def _listed_model(
     return None
 
 
+class ContextWindowTooLargeError(ProviderRequestError):
+    """An explicit context window exceeds the maximum OpenRouter lists."""
+
+    def __init__(self, requested: int, maximum: int) -> None:
+        self.requested = requested
+        self.maximum = maximum
+        super().__init__(
+            f"requested context window {requested} exceeds the model's "
+            f"listed maximum {maximum}"
+        )
+
+
 class OpenRouterProvider:
     """Generate through OpenRouter, optionally pinned to one upstream provider."""
 
@@ -235,10 +247,7 @@ class OpenRouterProvider:
             self._window_notice = None if requested is not None else problem
             return requested
         if requested is not None and requested > listed:
-            raise ProviderRequestError(
-                f"requested context window {requested} exceeds the model's "
-                f"listed maximum {listed}"
-            )
+            raise ContextWindowTooLargeError(requested, listed)
         if requested is not None:
             self._window_source, self._window_notice = "explicit", None
             return requested

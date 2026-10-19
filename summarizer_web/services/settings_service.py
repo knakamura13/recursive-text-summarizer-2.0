@@ -104,6 +104,10 @@ def normalize_ollama_host(value: str) -> str:
 def merge_run_config(current: RunConfig, patch: RunConfigPatch) -> RunConfig:
     """Merge a patch into a configuration; raise 422 when the result is invalid."""
     updates = patch.model_dump(exclude={"clear"}, exclude_none=True)
+    # A pinned upstream belongs to OpenRouter, so leaving it for another
+    # provider drops the pin rather than leaving an invalid pair behind.
+    if updates.get("provider", "openrouter") != "openrouter" and "openrouter_upstream" not in updates:
+        updates["openrouter_upstream"] = ""
     conflicting = sorted(set(updates) & set(patch.clear))
     if conflicting:
         raise ApiError(

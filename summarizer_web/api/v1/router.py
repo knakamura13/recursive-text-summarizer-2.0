@@ -6,6 +6,7 @@ from summarizer_web.api.v1 import (
     exports,
     health,
     ollama,
+    openrouter,
     preflight,
     run_views,
     runs,
@@ -17,6 +18,7 @@ api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(health.router)
 api_router.include_router(settings.router)
 api_router.include_router(ollama.router)
+api_router.include_router(openrouter.router)
 api_router.include_router(documents.router)
 api_router.include_router(sources.router)
 api_router.include_router(preflight.router)

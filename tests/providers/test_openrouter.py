@@ -8,6 +8,8 @@ traffic.
 """
 
 import json
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -568,20 +570,28 @@ def test_the_key_is_read_at_first_use_not_at_construction(
     assert requests[0].headers["authorization"] == f"Bearer {KEY}"
 
 
-def test_importing_the_module_does_not_read_the_key_or_build_a_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import importlib
+def test_importing_the_module_does_not_read_the_key_or_build_a_client() -> None:
+    # A subprocess, not `importlib.reload`: a reload rebinds the module's
+    # exception classes, which breaks `except` clauses in modules that already
+    # imported them.
+    program = (
+        "import os, httpx\n"
+        "os.environ.pop('OPENROUTER_API_KEY', None)\n"
+        "def fail(*args, **kwargs):\n"
+        "    raise AssertionError('client constructed during import')\n"
+        "httpx.Client = fail\n"
+        "import summarizer.providers.openrouter as module\n"
+        "module.OpenRouterProvider()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
-    import summarizer.providers.openrouter as module
-
-    def fail(*args: object, **kwargs: object) -> None:
-        raise AssertionError("client constructed during import")
-
-    monkeypatch.setattr(httpx, "Client", fail)
-    monkeypatch.delenv("OPENROUTER_API_KEY")
-
-    importlib.reload(module)
+    assert result.returncode == 0, result.stderr
 
 
 # --- concurrency and accounting -------------------------------------------------

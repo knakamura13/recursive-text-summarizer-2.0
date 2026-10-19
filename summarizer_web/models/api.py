@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from summarizer.config import normalize_openrouter_upstream
 
 
 class ApiModel(BaseModel):
@@ -60,17 +62,31 @@ class OllamaModelsResponse(ApiModel):
     models: list[OllamaModel]
 
 
+class OpenRouterStatusResponse(ApiModel):
+    """Whether the server can reach OpenRouter. The key itself is never reported."""
+
+    key_set: bool
+    message: str
+
+
 # --- Run configuration and settings -----------------------------------------
 
 StrategyName = Literal["auto", "direct", "hierarchical"]
 SelectedStrategy = Literal["direct", "hierarchical"]
+# The web app runs Ollama (the default, so stored Runs are unchanged) or
+# OpenRouter. The OpenRouter key is read from the server's environment and is
+# never part of a Run configuration, a setting or a response.
+ProviderChoice = Literal["ollama", "openrouter"]
 
 
 class RunConfig(ApiModel):
     """Run configuration. Validated on input; stored configs load with
     `RunConfig.model_construct` so older rows never fail to render."""
 
+    provider: ProviderChoice = "ollama"
     model: str = ""
+    # Pin every OpenRouter request to one upstream provider; empty means no pin.
+    openrouter_upstream: str = ""
     target_words: int = Field(300, ge=25, le=5000)
     strategy: StrategyName = "auto"
     verify: bool = True
@@ -92,10 +108,21 @@ class RunConfig(ApiModel):
     # its own verified prose beside the final summary. Costs extra requests.
     preserve_sections: bool = False
 
+    @field_validator("openrouter_upstream")
+    @classmethod
+    def _upstream_is_a_slug(cls, value: str) -> str:
+        return normalize_openrouter_upstream(value)
+
     @model_validator(mode="after")
     def _overlap_below_chunk(self) -> RunConfig:
         if self.chunk_tokens is not None and self.overlap_tokens >= self.chunk_tokens:
             raise ValueError("overlap_tokens must be smaller than chunk_tokens")
+        return self
+
+    @model_validator(mode="after")
+    def _upstream_needs_openrouter(self) -> RunConfig:
+        if self.openrouter_upstream and self.provider != "openrouter":
+            raise ValueError("openrouter_upstream is only valid for the openrouter provider")
         return self
 
 
@@ -103,7 +130,9 @@ class RunConfigPatch(ApiModel):
     """Partial update of the default run configuration; omitted fields keep
     their stored values."""
 
+    provider: ProviderChoice | None = None
     model: str | None = None
+    openrouter_upstream: str | None = None
     target_words: int | None = Field(None, ge=25, le=5000)
     strategy: StrategyName | None = None
     verify: bool | None = None
@@ -256,6 +285,9 @@ class PreflightResponse(ApiModel):
     selected_strategy: SelectedStrategy | None = None
     context_window_tokens: int | None = None
     context_window_source: Literal["configured", "model", "assumed"] | None = None
+    provider: ProviderChoice | None = None
+    # True when the token counts behind these estimates are not exact.
+    token_counts_estimated: bool | None = None
     usable_input_capacity: int | None = None
     document_tokens: int | None = None
     estimated_leaf_count: int | None = None
