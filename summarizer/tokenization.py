@@ -8,6 +8,7 @@ import struct
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
+from math import ceil, isfinite
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit
@@ -183,6 +184,75 @@ def _search_suffix(
         if count(text[candidate:end]) <= max_tokens:
             best = candidate
     return best
+
+
+# OpenRouter serves many model families and none of their tokenizers is
+# available locally. The base encoding is an OpenAI one, and a model with a
+# smaller vocabulary splits the same English text into more tokens, so the
+# base count is scaled up. A count below the model's own risks a request the
+# upstream rejects or truncates after most of a run has been paid for, while a
+# count above it only makes segments smaller. The factor is a stated
+# assumption, not a measurement: no OpenRouter model was measured. On this
+# repository's sample documents o200k_base yields 4.0 to 5.2 characters per
+# token; 1.5 puts the estimate near 3, where the byte counter's 1 character
+# per token is what #190 reported as shrinking and refusing work that fits.
+# Compare `usage.prompt_tokens`, which OpenRouter reports for each request and
+# the provider records, against these counts before relying on the factor.
+OPENROUTER_ESTIMATE_ENCODING = "o200k_base"
+OPENROUTER_ESTIMATE_FACTOR = 1.5
+
+
+@dataclass(frozen=True)
+class ScaledTiktokenCounter:
+    """Estimate tokens as a tiktoken count times a conservative factor.
+
+    Never exact: the model being counted for does not use this encoding.
+    """
+
+    encoding: Encoding
+    factor: float
+
+    def __post_init__(self) -> None:
+        if not isfinite(self.factor) or self.factor < 1:
+            raise TokenAccountingError("an estimate factor must be at least 1")
+
+    @property
+    def identity(self) -> str:
+        return f"estimate:{self.encoding.name}-x{self.factor:g}"
+
+    @property
+    def exact(self) -> bool:
+        return False
+
+    @property
+    def monotonic(self) -> bool:
+        return False
+
+    def count(self, text: str) -> int:
+        return ceil(len(self.encoding.encode_ordinary(text)) * self.factor)
+
+    def fitting_prefix(self, text: str, start: int, end: int, max_tokens: int) -> int:
+        """Same contract as `TiktokenCounter.fitting_prefix`."""
+        return _search_prefix(self.count, text, start, end, max_tokens)
+
+    def fitting_suffix(self, text: str, floor: int, end: int, max_tokens: int) -> int:
+        """Same contract as `TiktokenCounter.fitting_suffix`."""
+        return _search_suffix(self.count, text, floor, end, max_tokens)
+
+
+def estimate_notice(counter: TokenCounter) -> str | None:
+    """Return a user-facing notice when a counter's numbers are estimates.
+
+    Budgets, strategy choice and segment sizes all follow these counts, so a
+    run that depends on an estimate should say so wherever it reports them.
+    """
+    if counter.exact:
+        return None
+    return (
+        f"Token counts are estimates ({counter.identity}), not the model's own "
+        "tokenizer. Budgets are conservative, so segments may be smaller than "
+        "the context window requires."
+    )
 
 
 # GGUF tokenizers whose counts were checked against Ollama's prompt_eval_count:
@@ -389,6 +459,8 @@ def resolve_token_counter(
     """Resolve a counter without constructing or calling a model provider.
 
     Constructing a tiktoken counter may download an uncached vocabulary.
+    OpenRouter model names have no tokenizer mapping, so they get a labeled
+    estimate rather than an exact count.
     For an Ollama host on this machine, the model's own tokenizer is read from
     its local model file when that tokenizer has been checked against Ollama.
     Any other Ollama model or host falls back to the conservative byte count.
@@ -398,6 +470,19 @@ def resolve_token_counter(
         return TiktokenCounter.for_encoding(encoding_name)
     if provider.strip().lower() == "openai":
         return TiktokenCounter.for_model(model)
+    if provider.strip().lower() == "openrouter":
+        # Names such as `vendor/model` have no tiktoken mapping, so an
+        # estimate over a fixed encoding is the only local option. If even
+        # that encoding cannot be loaded (an uncached vocabulary and no
+        # network), fall back to bytes; the counter stays marked inexact, so
+        # `estimate_notice` still reports it.
+        try:
+            return ScaledTiktokenCounter(
+                tiktoken.get_encoding(OPENROUTER_ESTIMATE_ENCODING),
+                OPENROUTER_ESTIMATE_FACTOR,
+            )
+        except (OSError, ValueError):
+            return ConservativeUtf8TokenCounter()
     if provider.strip().lower() == "ollama" and ollama_host and _is_loopback(ollama_host):
         try:
             return GgufTokenCounter.for_ollama_model(model)

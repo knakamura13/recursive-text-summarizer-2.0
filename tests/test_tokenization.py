@@ -9,9 +9,11 @@ import pytest
 from summarizer.tokenization import (
     ConservativeUtf8TokenCounter,
     GgufTokenCounter,
+    ScaledTiktokenCounter,
     TiktokenCounter,
     TokenAccountingError,
     TokenCounter,
+    estimate_notice,
     resolve_token_counter,
 )
 
@@ -371,3 +373,144 @@ def test_tiktoken_prefix_search_is_bounded_near_the_budget() -> None:
     assert counter.fitting_prefix("x" * 5_000, 0, 5_000, 2_049) == 2_049
     assert encoding.calls < 50
     assert encoding.total_characters < 100_000
+
+
+class _FakeEncoding:
+    """One token per four characters, rounded up, like a coarse BPE."""
+
+    name = "o200k_base"
+
+    def encode_ordinary(self, text: str) -> list[int]:
+        return list(range((len(text) + 3) // 4))
+
+
+def _patch_encoding(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    import tiktoken
+
+    requested: list[str] = []
+
+    def get_encoding(name: str) -> _FakeEncoding:
+        requested.append(name)
+        return _FakeEncoding()
+
+    def encoding_for_model(model: str) -> None:
+        raise AssertionError(f"model-name lookup must not be used for {model!r}")
+
+    monkeypatch.setattr(tiktoken, "get_encoding", get_encoding)
+    monkeypatch.setattr(tiktoken, "encoding_for_model", encoding_for_model)
+    return requested
+
+
+def test_openrouter_counts_are_a_labeled_estimate_scaled_above_the_base_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = _patch_encoding(monkeypatch)
+
+    counter = resolve_token_counter(provider="openrouter", model="vendor/model-70b:free")
+
+    assert requested == ["o200k_base"]
+    assert isinstance(counter, ScaledTiktokenCounter)
+    assert counter.exact is False
+    assert counter.monotonic is False
+    assert counter.identity == "estimate:o200k_base-x1.5"
+    assert counter.count("x" * 40) == 15  # 10 base tokens, scaled and rounded up
+    assert counter.count("x" * 41) == 17  # 11 base tokens -> 16.5 -> 17
+    assert counter.count("") == 0
+
+
+def test_the_estimate_never_counts_below_the_base_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_encoding(monkeypatch)
+    counter = resolve_token_counter(provider="openrouter", model="vendor/model")
+    base = _FakeEncoding()
+
+    for length in (0, 1, 2, 3, 4, 5, 97, 1000):
+        text = "y" * length
+        assert counter.count(text) >= len(base.encode_ordinary(text))
+
+
+def test_the_estimate_identity_is_acceptable_to_the_cache_and_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+
+    from summarizer.cache import CacheDescriptor
+
+    _patch_encoding(monkeypatch)
+    counter = resolve_token_counter(provider="openrouter", model="vendor/model")
+
+    descriptor = CacheDescriptor(
+        source_id=hashlib.sha256(b"s").hexdigest(),
+        input_hash=hashlib.sha256(b"i").hexdigest(),
+        stage="leaf",
+        work_id="S000001",
+        prompt_version="leaf/1",
+        schema_version="summary/1",
+        provider="openrouter",
+        model="vendor/model",
+        ollama_host="",
+        counter_identity=counter.identity,
+        counter_exact=counter.exact,
+        context_window_tokens=32_768,
+        behavior={},
+    )
+    assert descriptor.counter_exact is False
+
+
+def test_estimate_prefix_and_suffix_searches_return_verified_fitting_slices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_encoding(monkeypatch)
+    counter = resolve_token_counter(provider="openrouter", model="vendor/model")
+    text = "word " * 400
+
+    end = counter.fitting_prefix(text, 0, len(text), 50)
+    start = counter.fitting_suffix(text, 0, len(text), 50)
+
+    assert 0 < end < len(text) and counter.count(text[:end]) <= 50
+    assert 0 < start < len(text) and counter.count(text[start:]) <= 50
+
+
+@pytest.mark.parametrize("failure", [OSError("offline"), ValueError("hash mismatch")])
+def test_an_unloadable_encoding_falls_back_to_bytes_and_still_says_estimate(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    import tiktoken
+
+    def fail(name: str) -> None:
+        raise failure
+
+    monkeypatch.setattr(tiktoken, "get_encoding", fail)
+
+    counter = resolve_token_counter(provider="openrouter", model="vendor/model")
+
+    assert isinstance(counter, ConservativeUtf8TokenCounter)
+    assert counter.exact is False
+    notice = estimate_notice(counter)
+    assert notice is not None and counter.identity in notice
+
+
+def test_provider_name_matching_ignores_case_and_whitespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_encoding(monkeypatch)
+
+    counter = resolve_token_counter(provider=" OpenRouter ", model="vendor/model")
+
+    assert isinstance(counter, ScaledTiktokenCounter)
+
+
+def test_estimate_notice_is_silent_for_exact_counters_and_names_inexact_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert estimate_notice(CharacterCounter()) is None
+    _patch_encoding(monkeypatch)
+    estimated = resolve_token_counter(provider="openrouter", model="vendor/model")
+
+    notice = estimate_notice(estimated)
+
+    assert notice is not None
+    assert "estimate" in notice
+    assert estimated.identity in notice
+    assert "tokenizer" in notice

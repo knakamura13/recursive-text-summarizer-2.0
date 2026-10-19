@@ -148,3 +148,19 @@ def test_rejects_a_non_positive_explicit_window() -> None:
 def test_context_window_rejects_a_non_positive_size() -> None:
     with pytest.raises(ValueError, match="positive"):
         ContextWindow(tokens=0, assumed=True)
+
+
+def test_openrouter_never_borrows_the_openai_table() -> None:
+    # `gpt-4o` is a 128k model under provider openai. Under OpenRouter the same
+    # string is not evidence of any window, so it must stay assumed.
+    window = resolve_context_window(provider="openrouter", model="gpt-4o")
+
+    assert window == ContextWindow(tokens=ASSUMED_CONTEXT_WINDOW, assumed=True)
+
+
+def test_openrouter_explicit_window_is_authoritative_and_not_assumed() -> None:
+    window = resolve_context_window(
+        provider="openrouter", model="vendor/model", explicit=131_072
+    )
+
+    assert window == ContextWindow(tokens=131_072, assumed=False)

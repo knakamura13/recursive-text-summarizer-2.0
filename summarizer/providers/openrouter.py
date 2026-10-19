@@ -156,6 +156,28 @@ def _translate_error(code: int, error: Mapping[str, Any] | None) -> ProviderErro
     return ProviderResponseError(f"OpenRouter returned unexpected status {code}")
 
 
+def _listed_model(
+    data: list[object], model: str
+) -> Mapping[str, Any] | None:
+    """Find a model's listing entry, retrying without a trailing `:variant`.
+
+    Routing shortcuts such as `:nitro` or `:online` are not listed models, but
+    they route to a listed one. A listed variant such as `:free` is matched
+    exactly first because its window can differ from the base model's.
+    """
+    candidates = [model]
+    if ":" in model:
+        candidates.append(model.rsplit(":", 1)[0])
+    for candidate in candidates:
+        for entry in data:
+            if isinstance(entry, Mapping) and candidate in (
+                entry.get("id"),
+                entry.get("canonical_slug"),
+            ):
+                return entry
+    return None
+
+
 class OpenRouterProvider:
     """Generate through OpenRouter, optionally pinned to one upstream provider."""
 
@@ -170,10 +192,104 @@ class OpenRouterProvider:
         self._client_lock = Lock()
         self._request_count = 0
         self._count_lock = Lock()
+        self._window_source: str | None = None
+        self._window_notice: str | None = None
 
     @property
     def upstream(self) -> str:
         return self._upstream
+
+    @property
+    def window_source(self) -> str | None:
+        """Where the last configured window came from, or None before that.
+
+        One of `explicit`, `model_listing` or `assumed`.
+        """
+        return self._window_source
+
+    @property
+    def window_notice(self) -> str | None:
+        """A caveat about the last configured window, if it has one."""
+        return self._window_notice
+
+    def configure_context_window(
+        self,
+        model: str,
+        requested: int | None,
+        *,
+        timeout_seconds: float,
+    ) -> int | None:
+        """Resolve the window from an explicit value, bounded by the listing.
+
+        An explicit value is authoritative, as for every provider, but cannot
+        exceed the length OpenRouter lists for the model. Without a listed
+        length the explicit value stands, and without either the result is
+        None so the caller's assumed window applies. The listing is read with
+        the same key and can fail without stopping a run, except for a
+        rejected key.
+        """
+        client = self._get_client()
+        listed, problem = self._listed_context_length(client, model, timeout_seconds)
+        if listed is None:
+            self._window_source = "explicit" if requested is not None else "assumed"
+            self._window_notice = None if requested is not None else problem
+            return requested
+        if requested is not None and requested > listed:
+            raise ProviderRequestError(
+                f"requested context window {requested} exceeds the model's "
+                f"listed maximum {listed}"
+            )
+        if requested is not None:
+            self._window_source, self._window_notice = "explicit", None
+            return requested
+        self._window_source = "model_listing"
+        self._window_notice = (
+            f"The context window is the model's listed maximum, not that of the "
+            f"pinned upstream {self._upstream}, which may be smaller; pass "
+            f"--context-window to set it."
+            if self._upstream
+            else None
+        )
+        return listed
+
+    def _listed_context_length(
+        self, client: httpx.Client, model: str, timeout_seconds: float
+    ) -> tuple[int | None, str]:
+        """Return the listed length, or None with a reason that is safe to show."""
+        try:
+            response = client.get("/models", timeout=timeout_seconds)
+        except httpx.TimeoutException:
+            return None, "OpenRouter's model listing timed out"
+        except httpx.RequestError:
+            return None, "OpenRouter's model listing could not be reached"
+        if response.status_code == 401:
+            raise _translate_error(401, None)
+        if response.status_code != 200:
+            return None, (
+                "OpenRouter's model listing could not be read "
+                f"(status {response.status_code})"
+            )
+        payload = _json_or_none(response)
+        data = payload.get("data") if isinstance(payload, Mapping) else None
+        if not isinstance(data, list):
+            return None, "OpenRouter's model listing was not in the expected form"
+        entry = _listed_model(data, model)
+        if entry is None:
+            return None, "OpenRouter's model listing does not include this model"
+        top = entry.get("top_provider")
+        lengths = [
+            value
+            for value in (
+                entry.get("context_length"),
+                top.get("context_length") if isinstance(top, Mapping) else None,
+            )
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0
+        ]
+        if not lengths:
+            return None, "OpenRouter's model listing gives no context length for this model"
+        # The model-wide and top-provider figures can differ; the smaller one
+        # is the safer bound for a request that may land on either.
+        return min(lengths), ""
 
     @property
     def request_count(self) -> int:

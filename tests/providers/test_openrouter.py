@@ -627,3 +627,140 @@ def test_request_count_includes_failed_attempts() -> None:
     provider.generate(REQUEST)
 
     assert provider.request_count == 2
+
+
+# --- context window from the model listing ---------------------------------------
+
+
+def listing_provider(
+    status: int = 200, name: str = "models_listing.json"
+) -> tuple[OpenRouterProvider, list[httpx.Request]]:
+    return provider_for(replying(status, name))
+
+
+def test_listing_request_is_an_authenticated_get_of_the_models_endpoint() -> None:
+    provider, requests = listing_provider()
+
+    provider.configure_context_window(MODEL, None, timeout_seconds=12)
+
+    (request,) = requests
+    assert request.method == "GET"
+    assert str(request.url) == "https://openrouter.ai/api/v1/models"
+    assert request.headers["authorization"] == f"Bearer {KEY}"
+    assert request.content == b""
+
+
+def test_the_listed_context_length_is_used_when_none_is_requested() -> None:
+    provider, _ = listing_provider()
+
+    assert provider.configure_context_window(MODEL, None, timeout_seconds=12) == 131_072
+    assert provider.window_source == "model_listing"
+    assert provider.window_notice is None
+
+
+def test_a_requested_window_within_the_listed_maximum_is_used_as_requested() -> None:
+    provider, _ = listing_provider()
+
+    assert provider.configure_context_window(MODEL, 50_000, timeout_seconds=12) == 50_000
+    assert provider.window_source == "explicit"
+
+
+def test_a_requested_window_above_the_listed_maximum_is_refused() -> None:
+    provider, _ = listing_provider()
+
+    with pytest.raises(ProviderRequestError, match=r"200000.*131072"):
+        provider.configure_context_window(MODEL, 200_000, timeout_seconds=12)
+
+
+def test_the_smaller_of_the_model_and_top_provider_length_is_used() -> None:
+    provider, _ = listing_provider()
+
+    window = provider.configure_context_window(
+        "vendor/free-small:free", None, timeout_seconds=12
+    )
+
+    assert window == 16_384
+
+
+def test_a_routing_suffix_that_is_not_listed_resolves_to_its_base_model() -> None:
+    provider, _ = listing_provider()
+
+    window = provider.configure_context_window(f"{MODEL}:nitro", None, timeout_seconds=12)
+
+    assert window == 131_072
+
+
+@pytest.mark.parametrize("model", ["vendor/no-length", "vendor/unlisted-model"])
+def test_a_model_without_a_listed_length_leaves_the_window_assumed(model: str) -> None:
+    provider, _ = listing_provider()
+
+    assert provider.configure_context_window(model, None, timeout_seconds=12) is None
+    assert provider.window_source == "assumed"
+    assert provider.window_notice is not None
+
+
+@pytest.mark.parametrize("model", ["vendor/no-length", "vendor/unlisted-model"])
+def test_an_explicit_window_is_kept_when_the_listing_has_no_length(model: str) -> None:
+    provider, _ = listing_provider()
+
+    assert provider.configure_context_window(model, 8_000, timeout_seconds=12) == 8_000
+    assert provider.window_source == "explicit"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(500, json={"error": {"code": 500, "message": "boom"}}),
+        httpx.Response(429, json={"error": {"code": 429, "message": "slow down"}}),
+        httpx.Response(200, text="<html>splash</html>"),
+        httpx.Response(200, json=["not", "a", "listing"]),
+        httpx.Response(200, json={"data": "nope"}),
+        httpx.Response(200, json={"data": [{"id": MODEL, "context_length": "131072"}]}),
+        httpx.Response(200, json={"data": [{"id": MODEL, "context_length": -5}]}),
+        httpx.Response(200, json={"data": [{"id": MODEL, "context_length": True}]}),
+    ],
+    ids=["500", "429", "html", "list", "data-not-list", "string-length", "negative", "bool"],
+)
+def test_an_unusable_listing_does_not_stop_the_run_and_is_reported(
+    response: httpx.Response,
+) -> None:
+    provider, _ = provider_for(lambda request: response)
+
+    assert provider.configure_context_window(MODEL, None, timeout_seconds=12) is None
+    assert provider.window_source == "assumed"
+    assert provider.window_notice is not None
+    assert KEY not in provider.window_notice
+
+
+def test_listing_transport_failures_are_reported_not_raised() -> None:
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    provider, _ = provider_for(fail)
+
+    assert provider.configure_context_window(MODEL, 4_096, timeout_seconds=12) == 4_096
+    assert provider.window_source == "explicit"
+
+
+def test_a_rejected_key_on_the_listing_is_an_authentication_error() -> None:
+    provider, _ = listing_provider(401, "error_401.json")
+
+    with pytest.raises(ProviderAuthenticationError):
+        provider.configure_context_window(MODEL, None, timeout_seconds=12)
+
+
+def test_the_listing_is_not_counted_as_a_chat_request() -> None:
+    provider, _ = listing_provider()
+
+    provider.configure_context_window(MODEL, None, timeout_seconds=12)
+
+    assert provider.request_count == 0
+
+
+def test_a_pinned_upstream_is_flagged_because_the_listing_is_model_wide() -> None:
+    provider, _ = provider_for(replying(200, "models_listing.json"), upstream="deepinfra")
+
+    provider.configure_context_window(MODEL, None, timeout_seconds=12)
+
+    assert provider.window_notice is not None
+    assert "deepinfra" in provider.window_notice
