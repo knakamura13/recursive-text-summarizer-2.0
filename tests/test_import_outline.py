@@ -117,15 +117,88 @@ def test_a_page_hint_is_searched_on_its_page_after_earlier_ligatures() -> None:
     assert (entry.page_start, entry.page_end) == (3, 3)
 
 
-def test_a_text_with_no_hints_is_not_folded(monkeypatch) -> None:
+def test_a_text_is_folded_only_when_a_title_is_not_found_as_written(monkeypatch) -> None:
     def fail(_text: str):
-        raise AssertionError("folded a text that has no headings to find")
+        raise AssertionError("folded a text whose titles are all found as written")
 
     monkeypatch.setattr(extract.FoldedText, "of", fail)
 
-    imported = assemble(Extraction("txt", text=LIGATURES + "Body."))
+    no_hints = assemble(Extraction("txt", text=LIGATURES + "Body."))
+    found = assemble(Extraction("txt", text="Intro\n\n" + LIGATURES, outline_hints=[OutlineHint("Intro", 1)]))
 
-    assert (imported.outline, imported.unplaced_headings) == ((), 0)
+    assert (no_hints.outline, no_hints.unplaced_headings) == ((), 0)
+    assert [entry.title for entry in found.outline] == ["Intro"]
+
+
+def test_a_title_found_as_written_is_placed_there_whatever_its_folded_form_matches() -> None:
+    # Folding turns the no-break space into a space, so the first line would be a whole-line match.
+    text = "Results \n\nThe Results\n\nResults\n\nBody"
+    pages = [
+        PageText(1, "Contents."),
+        PageText(2, "Getting Started with Kindle™\n\nCharge the device first."),
+        PageText(3, "Networks for Classiﬁcation\n\n4.1.1 Classification\nTo start, a simple problem."),
+    ]
+
+    by_text = assemble(Extraction("txt", text=text, outline_hints=[OutlineHint("Results", 1)]))
+    by_page = assemble(
+        Extraction(
+            "pdf",
+            pages=pages,
+            outline_hints=[
+                # "Kindle" ends where the trademark sign begins; folding would read it as "TM".
+                OutlineHint("Getting Started with Kindle", 1, page=2),
+                # The page header says the word with a ligature, ahead of the heading that does not.
+                OutlineHint("Classification", 3, page=3),
+            ],
+        )
+    )
+
+    assert [by_text.text[entry.start :] for entry in by_text.outline] == ["Results\n\nBody"]
+    assert by_page.unplaced_headings == 0
+    assert [by_page.text[entry.start :].split("\n")[0] for entry in by_page.outline] == [
+        "Getting Started with Kindle™",
+        "Classification",
+    ]
+
+
+def test_an_offset_hint_whose_title_begins_with_a_spacing_accent_is_placed() -> None:
+    text = "Intro text.\n\n# ´Twas the Night\n\nBody."
+    offset = text.index("´Twas")
+
+    imported = assemble(Extraction("md", text=text, outline_hints=[OutlineHint("´Twas the Night", 1, offset=offset)]))
+
+    assert [(entry.start, entry.title) for entry in imported.outline] == [(offset, "´Twas the Night")]
+
+
+def test_a_title_never_lands_on_part_of_a_character_it_folds_from() -> None:
+    text = "Add ½ cup of flour.\n\nThen Step 2 begins here."
+
+    # "½" folds to "1⁄2", but a "2" heading is not half of it.
+    only_the_half = assemble(Extraction("txt", text=text.split("\n")[0], outline_hints=[OutlineHint("2", 1)]))
+    step = assemble(Extraction("txt", text=text, outline_hints=[OutlineHint("2", 1)]))
+
+    assert only_the_half.unplaced_headings == 1
+    assert [step.text[entry.start :] for entry in step.outline] == ["2 begins here."]
+
+
+def test_a_ligature_at_the_start_of_a_hint_is_placed() -> None:
+    text = "ﬁnancial Results\n\nBody."
+    pages = [PageText(1, "Intro."), PageText(2, text)]
+
+    by_offset = assemble(Extraction("md", text=text, outline_hints=[OutlineHint("financial Results", 1, offset=0)]))
+    by_page = assemble(Extraction("pdf", pages=pages, outline_hints=[OutlineHint("financial Results", 1, page=2)]))
+
+    assert [(entry.start, entry.title) for entry in by_offset.outline] == [(0, "ﬁnancial Results")]
+    [entry] = by_page.outline
+    assert by_page.text[entry.start :] == text
+
+
+def test_a_title_matches_a_text_that_has_only_one_for_one_folds() -> None:
+    text = "Ｒｅｓｕｌｔｓ\n\nBody."
+
+    imported = assemble(Extraction("txt", text=text, outline_hints=[OutlineHint("Results", 1)]))
+
+    assert [imported.text[entry.start :] for entry in imported.outline] == [text]
 
 
 def test_a_title_matches_a_whole_heading_line_before_a_line_it_only_begins() -> None:

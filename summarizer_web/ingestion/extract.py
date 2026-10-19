@@ -18,6 +18,7 @@ import bisect
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 from summarizer.ingestion import ingest_text
@@ -119,15 +120,22 @@ class ImportedText:
     unplaced_headings: int = 0
 
 
-def _title_patterns(title: str) -> tuple[re.Pattern[str], ...] | None:
-    """Patterns for a title with any whitespace between its words, ignoring
-    case, from most to least likely a heading: the title as a whole line,
-    then at the start of a line, then anywhere. Each needs whole words, so
-    "Intro" does not match inside "Introduction". They match a compatibility-
-    folded text (`FoldedText`), so the title is folded too."""
-    words = compat_fold(clean_text(title)).split()
-    if not words:
-        return None
+_TitlePattern = tuple[re.Pattern[str], re.Pattern[str]]
+
+
+class _Haystack:
+    """The text a title is searched in. Its folded view is built the first time a title
+    is not found as written, so a text whose titles all match as written is never folded."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    @cached_property
+    def folded(self) -> FoldedText:
+        return FoldedText.of(self.text)
+
+
+def _tier_patterns(words: list[str]) -> tuple[re.Pattern[str], ...]:
     body = r"(?<!\w)" + r"\s+".join(re.escape(word) for word in words) + r"(?!\w)"
     return (
         re.compile(rf"^[ \t]*({body})[ \t]*$", re.IGNORECASE | re.MULTILINE),
@@ -136,17 +144,58 @@ def _title_patterns(title: str) -> tuple[re.Pattern[str], ...] | None:
     )
 
 
+def _title_patterns(title: str) -> tuple[_TitlePattern, ...] | None:
+    """Patterns for a title with any whitespace between its words, ignoring
+    case, from most to least likely a heading: the title as a whole line,
+    then at the start of a line, then anywhere. Each needs whole words, so
+    "Intro" does not match inside "Introduction".
+
+    Each comes as a pair: the title as written, for the text as written, and the
+    title folded (`compat_fold`), for the text's folded view. A title that folding
+    leaves alone has the same pattern object in both places.
+    """
+    words = clean_text(title).split()
+    if not words:
+        return None
+    as_written = _tier_patterns(words)
+    folded_words = compat_fold(" ".join(words)).split()
+    folded = as_written if folded_words == words else _tier_patterns(folded_words)
+    return tuple(zip(as_written, folded, strict=True))
+
+
+def _folds(pattern: _TitlePattern, haystack: _Haystack) -> bool:
+    """Whether the folded view can match what the title as written did not: not when
+    neither the title nor an ASCII text has anything to fold."""
+    as_written, folded = pattern
+    return folded is not as_written or not haystack.text.isascii()
+
+
 def _find_title(
-    patterns: tuple[re.Pattern[str], ...], folded: FoldedText, start: int, end: int
+    patterns: tuple[_TitlePattern, ...], haystack: _Haystack, start: int, end: int
 ) -> tuple[int, int] | None:
-    """The title's first occurrence in the source text's `[start:end]` under the most likely
-    pattern, as source offsets."""
-    folded_start, folded_end = folded.to_folded(start), folded.to_folded(end)
+    """The title's first occurrence in `haystack.text[start:end]`, as source offsets. Each pattern,
+    from most to least likely a heading, is tried on the text as written and then on its folded
+    view, so folding only adds matches: a title that matched as written is placed as before."""
     for pattern in patterns:
-        match = pattern.search(folded.text, folded_start, folded_end)
+        match = pattern[0].search(haystack.text, start, end)
         if match is not None:
-            return folded.span_to_source(*match.span(1))
+            return match.span(1)
+        if _folds(pattern, haystack):
+            found = haystack.folded.search(pattern[1], start, end)
+            if found is not None:
+                return found
     return None
+
+
+def _title_at(
+    patterns: tuple[_TitlePattern, ...], haystack: _Haystack, offset: int
+) -> tuple[int, int] | None:
+    """The title at exactly `offset` under the loosest pattern, as source offsets."""
+    pattern = patterns[-1]
+    match = pattern[0].match(haystack.text, offset)
+    if match is not None:
+        return match.span(1)
+    return haystack.folded.match(pattern[1], offset) if _folds(pattern, haystack) else None
 
 
 def anchor_outline(
@@ -163,7 +212,7 @@ def anchor_outline(
     if not hints:
         return (), 0
     by_page = {span.page: span for span in pages or () if not span.blank}
-    folded = FoldedText.of(text)
+    haystack = _Haystack(text)
     placed: dict[int, tuple[str, int]] = {}
     cursor = 0
     unplaced = 0
@@ -173,14 +222,13 @@ def anchor_outline(
         if patterns is not None:
             if hint.offset is not None:
                 # The extractor knows where the title is: place it there, never earlier.
-                match = patterns[-1].match(folded.text, folded.to_folded(hint.offset))
-                found = folded.span_to_source(*match.span(1)) if match is not None else None
+                found = _title_at(patterns, haystack, hint.offset)
             elif hint.page is None:
-                found = _find_title(patterns, folded, cursor, len(text))
+                found = _find_title(patterns, haystack, cursor, len(text))
             elif (span := by_page.get(hint.page)) is not None:
                 found = _find_title(
-                    patterns, folded, max(cursor, span.start), span.end
-                ) or _find_title(patterns, folded, span.start, span.end)
+                    patterns, haystack, max(cursor, span.start), span.end
+                ) or _find_title(patterns, haystack, span.start, span.end)
         if found is None or found[0] in placed:
             unplaced += 1
             continue

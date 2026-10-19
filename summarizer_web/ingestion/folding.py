@@ -16,6 +16,7 @@ from __future__ import annotations
 import bisect
 import re
 import unicodedata
+from array import array
 from dataclasses import dataclass
 
 
@@ -26,18 +27,19 @@ def compat_fold(text: str) -> str:
 
 @dataclass(frozen=True)
 class FoldedText:
-    """`text` folded, with where each source character that folding resized sits in it.
+    """`source` folded into `text`, with where each source character that folding resized sits.
 
-    The three lists run in step, one entry per source character whose folding is not one
+    The three arrays run in step, one entry per source character whose folding is not one
     character long, in source order: its source offset, the offset where its folding begins
     in `text`, and that folding's length. A character that folds to one character, itself
     or another, keeps its offset and needs no entry.
     """
 
+    source: str
     text: str
-    source_at: list[int]
-    folded_at: list[int]
-    folded_len: list[int]
+    source_at: array
+    folded_at: array
+    folded_len: array
 
     @classmethod
     def of(cls, source: str) -> FoldedText:
@@ -46,30 +48,21 @@ class FoldedText:
             for char in set(source)
             if (folded := unicodedata.normalize("NFKC", char)) != char
         }
-        resized = {char: folded for char, folded in changed.items() if len(folded) != 1}
-        # One-for-one folds (a no-break space becomes a space) are done in one pass in C.
-        text = source.translate({ord(char): folded for char, folded in changed.items() if char not in resized})
-        if not resized:
-            return cls(text, [], [], [])
-        pattern = re.compile("[" + re.escape("".join(resized)) + "]")
-        parts: list[str] = []
-        source_at: list[int] = []
-        folded_at: list[int] = []
-        folded_len: list[int] = []
-        taken = 0  # Source characters copied so far.
-        growth = 0  # Folded length minus source length over what was copied.
-        for match in pattern.finditer(text):
-            start = match.start()
-            folded = resized[match.group()]
-            parts.append(text[taken:start])
-            parts.append(folded)
-            source_at.append(start)
-            folded_at.append(start + growth)
-            folded_len.append(len(folded))
-            growth += len(folded) - 1
-            taken = start + 1
-        parts.append(text[taken:])
-        return cls("".join(parts), source_at, folded_at, folded_len)
+        source_at, folded_at, folded_len = array("q"), array("q"), array("q")
+        if not changed:
+            return cls(source, source, source_at, folded_at, folded_len)
+        resized = {char: len(folded) for char, folded in changed.items() if len(folded) != 1}
+        if resized:
+            pattern = re.compile("[" + re.escape("".join(resized)) + "]")
+            growth = 0  # Folded length minus source length over the characters passed.
+            for match in pattern.finditer(source):
+                start, length = match.start(), resized[match.group()]
+                source_at.append(start)
+                folded_at.append(start + growth)
+                folded_len.append(length)
+                growth += length - 1
+        text = source.translate({ord(char): folded for char, folded in changed.items()})
+        return cls(source, text, source_at, folded_at, folded_len)
 
     def to_folded(self, offset: int) -> int:
         """Where the source character at `offset` begins in the folded text."""
@@ -89,6 +82,31 @@ class FoldedText:
             return self.source_at[change]
         return self.source_at[change] + 1 + (offset - after_change)
 
-    def span_to_source(self, start: int, end: int) -> tuple[int, int]:
-        """The source span of the characters that a non-empty folded span `[start, end)` came from."""
+    def _inside_a_character(self, offset: int) -> bool:
+        """True when the folded `offset` falls between the folded characters of one source character."""
+        change = bisect.bisect_right(self.folded_at, offset) - 1
+        return (
+            change >= 0
+            and self.folded_at[change] < offset < self.folded_at[change] + self.folded_len[change]
+        )
+
+    def _source_span(self, start: int, end: int) -> tuple[int, int] | None:
+        """The source span of a non-empty folded span `[start, end)`, or None when it begins or
+        ends inside one source character's folding (a title "2" is not half of "½")."""
+        if self._inside_a_character(start) or self._inside_a_character(end):
+            return None
         return self.to_source(start), self.to_source(end - 1) + 1
+
+    def search(self, pattern: re.Pattern[str], start: int, end: int) -> tuple[int, int] | None:
+        """The first match of `pattern`'s first group in the folded view of the source's
+        `[start:end]` that does not cut a source character, as a source span."""
+        for match in pattern.finditer(self.text, self.to_folded(start), self.to_folded(end)):
+            span = self._source_span(*match.span(1))
+            if span is not None:
+                return span
+        return None
+
+    def match(self, pattern: re.Pattern[str], offset: int) -> tuple[int, int] | None:
+        """`pattern`'s first group matched in the folded view at the source `offset`, as a source span."""
+        match = pattern.match(self.text, self.to_folded(offset))
+        return self._source_span(*match.span(1)) if match is not None else None
