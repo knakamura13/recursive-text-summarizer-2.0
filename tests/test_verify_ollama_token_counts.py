@@ -1,7 +1,7 @@
 """The #190 verification script, against a scripted Ollama and a synthetic tokenizer.
 
 These tests prove the script's arithmetic and its refusals. They say nothing
-about a real server. The recorded run against one is in the experiment's README.
+about a real server. The recorded runs against one are in the experiment's README.
 """
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 
@@ -48,7 +47,11 @@ def models_dir(tmp_path: Path) -> Path:
 
 
 class ScriptedOllama:
-    """Answers /api/version and /api/chat; prompt_eval_count follows the counter plus `template`."""
+    """Answers /api/version and /api/chat; prompt_eval_count follows the counter plus `template`.
+
+    With `trim`, it counts each message as the real server may: with leading
+    and trailing whitespace removed.
+    """
 
     def __init__(
         self,
@@ -56,10 +59,12 @@ class ScriptedOllama:
         *,
         template: int = TEMPLATE,
         extra: dict[str, int | None] | None = None,
+        trim: bool = False,
     ) -> None:
         self.counter = counter
         self.template = template
         self.extra = extra or {}
+        self.trim = trim
         self.requests: list[tuple[str, dict | None]] = []
 
     def client(self) -> httpx.Client:
@@ -76,6 +81,8 @@ class ScriptedOllama:
         extra = self.extra.get(probe.name, 0)
         if extra is None:
             return httpx.Response(200, json={"message": {"content": "x"}})
+        if self.trim:
+            system, user = system.strip(), user.strip()
         count = self.counter.count(system) + self.counter.count(user) + self.template + extra
         return httpx.Response(200, json={"prompt_eval_count": count, "message": {"content": "x"}})
 
@@ -88,24 +95,27 @@ def _run(
     *,
     extra: dict[str, int | None] | None = None,
     template: int = TEMPLATE,
-    arguments: tuple[str, ...] = (),
+    trim: bool = False,
     output: Path | None = None,
 ) -> tuple[int, ScriptedOllama]:
     counter = TokenizerJsonCounter.for_ollama_model(
         "big:31b", models_dir=models_dir, allow_unverified=True
     )
-    ollama = ScriptedOllama(counter, template=template, extra=extra)
-    argv = ["--model", "big:31b", "--models-dir", str(models_dir), *arguments]
+    ollama = ScriptedOllama(counter, template=template, extra=extra, trim=trim)
+    argv = ["--model", "big:31b", "--models-dir", str(models_dir)]
     if output is not None:
         argv += ["--output", str(output)]
     return verify.main(argv, client=ollama.client()), ollama
+
+
+# --- the verdict -----------------------------------------------------------
 
 
 def test_a_counter_that_matches_ollama_passes_and_prints_the_fingerprint_to_add(
     models_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     report = tmp_path / "out" / "report.json"
-    code, ollama = _run(models_dir, output=report)
+    code, _ = _run(models_dir, output=report)
 
     out = capsys.readouterr().out
     fingerprint = TokenizerJsonCounter.for_ollama_model(
@@ -119,44 +129,66 @@ def test_a_counter_that_matches_ollama_passes_and_prints_the_fingerprint_to_add(
     assert {request["name"] for request in saved["requests"]} == {p.name for p in verify.probes()}
 
 
-def test_it_sends_one_warm_up_then_each_probe_once_with_one_generated_token(
-    models_dir: Path,
+def test_whitespace_at_a_message_edge_that_ollama_trims_passes_and_is_reported(
+    models_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _, ollama = _run(models_dir)
+    code, _ = _run(models_dir, trim=True)
 
-    chats = ollama.chats()
-    assert len(chats) == 1 + len(verify.probes())
-    assert chats[0]["messages"][1]["content"] == verify.WARM_UP.user
-    for body in chats:
-        assert body["stream"] is False
-        assert body["options"] == {"num_predict": 1, "temperature": 0, "seed": 0}
-        assert body["model"] == "big:31b"
-        assert [message["role"] for message in body["messages"]] == ["system", "user"]
-    assert [body.get("format") is not None for body in chats[1:]] == [
-        p.schema is not None for p in verify.probes()
-    ]
-    assert {path for path, _ in ollama.requests} == {"/api/version", "/api/chat"}
+    out = capsys.readouterr().out
+    assert code == verify.EXIT_PASSED
+    # Every boundary probe loses its one whitespace token, and the notes name them.
+    for probe in verify.probes():
+        if probe.kind == "boundary":
+            assert f"{probe.name}: Ollama counted 1 fewer" in out
 
 
-def test_one_probe_counted_higher_by_ollama_fails_the_run_and_names_it(
+def test_whitespace_at_a_message_edge_that_ollama_keeps_reports_no_difference(
+    models_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _ = _run(models_dir, trim=False)
+
+    out = capsys.readouterr().out
+    assert code == verify.EXIT_PASSED
+    assert "fewer" not in out and "counted the same as the counter" in out
+
+
+def test_a_boundary_probe_counted_higher_by_ollama_fails_and_names_it(
+    models_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _ = _run(models_dir, extra={"trailing-space": 2})
+
+    assert code == verify.EXIT_FAILED
+    out = capsys.readouterr().out
+    assert "trailing-space: Ollama counted 2 more" in out and "PASSED" not in out
+
+
+def test_one_clean_probe_off_by_a_token_fails_the_run(
     models_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     code, _ = _run(models_dir, extra={"unicode": 3})
 
     out = capsys.readouterr().out
     assert code == verify.EXIT_FAILED
-    assert "not constant" in out and "unicode" in out
-    assert "FAILED" in out and "PASSED" not in out
+    assert "not constant" in out and "unicode" in out and "FAILED" in out
 
 
-def test_a_counter_that_overcounts_every_plain_request_is_not_exact(
+def test_internal_whitespace_probes_must_agree_exactly_with_the_rest(
     models_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Template of -5: Ollama reports five fewer than the counter on every request.
+    # Only edge whitespace may differ. A server that collapses runs inside a message is a mismatch.
+    code, _ = _run(models_dir, extra={"whitespace-internal": -2})
+
+    assert code == verify.EXIT_FAILED
+    assert "whitespace-internal" in capsys.readouterr().out
+
+
+def test_a_counter_that_overcounts_every_clean_probe_is_not_exact(
+    models_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     code, _ = _run(models_dir, template=-5)
 
     assert code == verify.EXIT_FAILED
-    assert "more than Ollama on every plain request" in capsys.readouterr().out
+    assert "more than Ollama on every clean request" in capsys.readouterr().out
 
 
 def test_a_schema_that_counts_as_prompt_tokens_is_an_undercount(
@@ -175,7 +207,7 @@ def test_a_marker_read_as_fewer_tokens_than_its_pieces_is_safe(
     code, _ = _run(models_dir, extra={"special-markers": -6})
 
     assert code == verify.EXIT_PASSED
-    assert "counted 6 fewer" in capsys.readouterr().out
+    assert "special-markers: Ollama counted 6 fewer" in capsys.readouterr().out
 
 
 def test_a_marker_counted_higher_by_ollama_fails(
@@ -190,19 +222,43 @@ def test_a_marker_counted_higher_by_ollama_fails(
 def test_a_missing_prompt_eval_count_is_not_a_pass(
     models_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    code, _ = _run(models_dir, extra={"code": None})
+    code, _ = _run(models_dir, extra={"leading-tab": None})
 
     assert code == verify.EXIT_FAILED
-    assert "no prompt_eval_count for: code" in capsys.readouterr().out
+    assert "no prompt_eval_count for: leading-tab" in capsys.readouterr().out
 
 
 def test_a_different_template_overhead_is_reported_but_does_not_fail(
     models_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    code, _ = _run(models_dir, template=15)
+    code, _ = _run(models_dir, template=16)
 
     assert code == verify.EXIT_PASSED
-    assert "observed template overhead is 15" in capsys.readouterr().out
+    assert "observed template overhead is 16" in capsys.readouterr().out
+
+
+# --- the requests ----------------------------------------------------------
+
+
+def test_it_sends_one_warm_up_then_each_probe_once_in_the_summarizers_request_shape(
+    models_dir: Path,
+) -> None:
+    _, ollama = _run(models_dir)
+
+    chats = ollama.chats()
+    assert len(chats) == 1 + len(verify.probes())
+    assert chats[0]["messages"][1]["content"] == verify.WARM_UP.user
+    for body in chats:
+        assert body["stream"] is False
+        # The summarizer's OllamaProvider sends think false; omitting it changes the template.
+        assert body["think"] is False
+        assert body["options"] == {"num_predict": 1, "temperature": 0, "seed": 0}
+        assert body["model"] == "big:31b"
+        assert [message["role"] for message in body["messages"]] == ["system", "user"]
+    assert [body.get("format") is not None for body in chats[1:]] == [
+        p.schema is not None for p in verify.probes()
+    ]
+    assert {path for path, _ in ollama.requests} == {"/api/version", "/api/chat"}
 
 
 def test_a_dry_run_counts_the_probes_and_sends_nothing(
@@ -245,9 +301,7 @@ def test_a_model_without_a_tokenizer_layer_is_incomplete_not_a_pass(
         raise AssertionError(f"sent {request.url}")
 
     client = httpx.Client(base_url="http://localhost:11434", transport=httpx.MockTransport(refuse))
-    code = verify.main(
-        ["--model", "absent:1b", "--models-dir", str(tmp_path)], client=client
-    )
+    code = verify.main(["--model", "absent:1b", "--models-dir", str(tmp_path)], client=client)
 
     assert code == verify.EXIT_INCOMPLETE
     assert "No tokenizer.json counter for absent:1b" in capsys.readouterr().err
@@ -267,11 +321,22 @@ def test_an_unreachable_server_is_incomplete(models_dir: Path, capsys: pytest.Ca
 # --- the fixed set ---------------------------------------------------------
 
 
+def _edge_whitespace(text: str) -> list[tuple[str, str]]:
+    """The (position, character) of each run of whitespace at the edges of a message."""
+    found = []
+    if text != text.lstrip():
+        found.append(("leading", text[: len(text) - len(text.lstrip())]))
+    if text != text.rstrip():
+        found.append(("trailing", text[len(text.rstrip()) :]))
+    return found
+
+
 def test_the_fixed_set_is_small_varied_and_distinguishable() -> None:
     fixed = verify.probes()
     kinds = [probe.kind for probe in fixed]
 
-    assert kinds.count("plain") >= 8 and kinds.count("marker") == 1
+    assert kinds.count("clean") >= 8 and kinds.count("boundary") == 7 and kinds.count("marker") == 1
+    assert set(kinds) == {"clean", "boundary", "marker"}
     assert sum(probe.schema is not None for probe in fixed) == 2
     # Different opening words keep a reused cache prefix to the chat template header.
     openings = [probe.system.split(":")[0] for probe in [verify.WARM_UP, *fixed]]
@@ -279,14 +344,55 @@ def test_the_fixed_set_is_small_varied_and_distinguishable() -> None:
     assert len({probe.name for probe in fixed}) == len(fixed)
     # Short requests: one generated token each, a few hundred prompt tokens at most.
     assert all(len(probe.system) + len(probe.user) < 2_500 for probe in fixed)
-    # The set exercises what a byte count gets wrong: non-ASCII, whitespace, code, markup.
+    # The set exercises what a byte count gets wrong: non-ASCII, internal whitespace, code, markup.
     names = {probe.name for probe in fixed}
-    assert {"unicode", "non-ascii-long", "whitespace", "code", "markup"} <= names
+    assert {"unicode", "non-ascii-long", "whitespace-internal", "code-internal", "markup"} <= names
     assert any(ord(character) > 0x2FFF for probe in fixed for character in probe.user)
 
 
-def test_judge_needs_enough_plain_measurements() -> None:
-    few = [verify.Measurement("a", "plain", False, 5, 19), verify.Measurement("b", "plain", False, 6, 20)]
+def test_clean_and_marker_probes_have_no_whitespace_at_a_message_edge() -> None:
+    for probe in verify.probes():
+        if probe.kind in ("clean", "marker"):
+            assert _edge_whitespace(probe.system) == [] and _edge_whitespace(probe.user) == [], probe.name
+    # The internal-whitespace probes keep their runs, tabs, newlines and indentation inside.
+    internal = {p.name: p for p in verify.probes()}
+    assert "\t\t" in internal["whitespace-internal"].user and "\n\n\n" in internal["whitespace-internal"].user
+    assert "  " in internal["whitespace-internal"].user and "\n    " in internal["code-internal"].user
+
+
+def test_each_boundary_probe_adds_exactly_one_run_of_one_kind_of_whitespace() -> None:
+    triples = set()
+    for probe in verify.probes():
+        if probe.kind != "boundary":
+            continue
+        found = _edge_whitespace(probe.system) + _edge_whitespace(probe.user)
+        assert len(found) == 1, probe.name
+        side = "system" if _edge_whitespace(probe.system) else "user"
+        [(position, run)] = found
+        assert len(set(run)) == 1, probe.name
+        # Stripped, the user text is the shared base, so the whitespace is the only change.
+        assert probe.user.strip() == verify.BASE_USER, probe.name
+        triples.add((side, position, run[0]))
+    assert triples == {
+        ("user", "trailing", "\n"),
+        ("user", "trailing", " "),
+        ("user", "trailing", "\t"),
+        ("user", "leading", "\n"),
+        ("user", "leading", " "),
+        ("user", "leading", "\t"),
+        ("system", "trailing", "\n"),
+    }
+
+
+# --- judge -----------------------------------------------------------------
+
+
+def _m(name: str, kind: str, counted: int, reported: int | None) -> object:
+    return verify.Measurement(name, kind, False, counted, reported)
+
+
+def test_judge_needs_enough_clean_measurements() -> None:
+    few = [_m("a", "clean", 5, 19), _m("b", "clean", 6, 20)]
 
     verdict = verify.judge(few)
 
@@ -295,8 +401,29 @@ def test_judge_needs_enough_plain_measurements() -> None:
 
 
 def test_judge_passes_an_exact_constant_overhead() -> None:
-    measurements = [verify.Measurement(name, "plain", False, 5 + i, 19 + i) for i, name in enumerate("abc")]
+    measurements = [_m(name, "clean", 5 + i, 19 + i) for i, name in enumerate("abc")]
 
     verdict = verify.judge(measurements)
 
     assert verdict.passed is True and verdict.overhead == 14 and verdict.notes == []
+
+
+def test_judge_sets_the_overhead_from_clean_probes_only() -> None:
+    measurements = [_m(name, "clean", 5 + i, 19 + i) for i, name in enumerate("abc")]
+    measurements.append(_m("edge", "boundary", 9, 22))  # one fewer than counter + 14
+
+    verdict = verify.judge(measurements)
+
+    assert verdict.passed is True and verdict.overhead == 14
+    assert verdict.notes == ["edge: Ollama counted 1 fewer, so it reads this input as fewer tokens than "
+                             "the counter; the counter overcounts, which is safe"]
+
+
+def test_judge_fails_a_boundary_probe_above_counter_plus_overhead() -> None:
+    measurements = [_m(name, "clean", 5 + i, 19 + i) for i, name in enumerate("abc")]
+    measurements.append(_m("edge", "boundary", 9, 24))
+
+    verdict = verify.judge(measurements)
+
+    assert verdict.passed is False
+    assert verdict.problems == ["edge: Ollama counted 1 more than the counter plus overhead"]

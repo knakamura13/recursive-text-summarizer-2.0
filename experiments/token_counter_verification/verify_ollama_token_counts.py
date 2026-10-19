@@ -5,16 +5,24 @@ summarizer. It sends a small fixed set of short chat requests to an Ollama
 server on this machine, each limited to one generated token, and compares what
 the counter says each prompt costs with the ``prompt_eval_count`` Ollama
 returns, the method of #120: counted system and user tokens plus a fixed chat
-template. This is real model inference, so run it deliberately.
+template. This is real model inference, so run it deliberately. Requests have
+the shape of the summarizer's own, including ``think: false``, because the
+thinking marker changes the template and so the overhead.
 
-The counter must never count fewer tokens than Ollama processes, so the verdict
-fails on any request that Ollama counted higher than the counter plus the
-template overhead. The overhead is not assumed: it is the one value that every
-plain request must share, and the run fails if the plain requests disagree.
-Requests that carry a format schema are checked the same way, which also tests
-that the schema is not part of the prompt count. Requests that carry special-token
-markers may count lower than Ollama (the counter splits a marker into pieces,
-which can only count more), never higher.
+The counter must never count fewer tokens than Ollama processes. Probes come in
+three kinds:
+
+- ``clean``: no whitespace at either edge of either message. They set the
+  template overhead, which is observed, not assumed: every clean probe must
+  share one value, and the run fails if they disagree. They include internal
+  runs of spaces, tabs, newlines and indentation, and two probes that carry a
+  format schema, which also tests that the schema is not part of the prompt
+  count.
+- ``boundary``: one run of one kind of whitespace at one edge of one message,
+  each alone. A server may trim it, so Ollama may count fewer than the counter,
+  never more.
+- ``marker``: special-token markers in text. The counter splits a marker into
+  pieces, which can only count more, so Ollama may count fewer, never more.
 
 A pass prints the counting fingerprint to add to
 ``_VERIFIED_TOKENIZER_JSON_FINGERPRINTS`` in ``summarizer/tokenization.py``. The
@@ -49,11 +57,11 @@ from summarizer.tokenization import (  # noqa: E402
 )
 
 DEFAULT_HOST = "http://localhost:11434"
-# The chat template overhead #120 measured for gemma4 on its GGUF path. It is a
+# The chat template overhead #120 measured for gemma4 with think false. It is a
 # reference to compare the observed value with, not an input to the verdict.
 REFERENCE_OVERHEAD = 14
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-_MINIMUM_PLAIN_PROBES = 3
+_MINIMUM_CLEAN_PROBES = 3
 EXIT_PASSED, EXIT_FAILED, EXIT_INCOMPLETE = 0, 1, 2
 
 _SCHEMA = {
@@ -65,7 +73,7 @@ _SCHEMA = {
 
 @dataclass(frozen=True)
 class Probe:
-    """One fixed chat request. `kind` is "plain" or "marker"."""
+    """One fixed chat request. `kind` is "clean", "boundary" or "marker"."""
 
     name: str
     kind: str
@@ -88,32 +96,43 @@ def _long_non_ascii() -> str:
     )
 
 
+# The text every boundary probe wraps in one run of whitespace.
+BASE_USER = "Count these words."
+
+
 def probes() -> list[Probe]:
     """The fixed set. Each system message opens with a different word, so
     consecutive prompts share only the chat template header and a reused cache
     prefix cannot differ from request to request."""
     return [
-        Probe("ascii-short", "plain", "Alpha: you summarize text.", "The harbor moved 24 tonnes of cargo in 1998."),
-        Probe("ascii-tiny", "plain", "Bravo: answer briefly.", "Hi."),
-        Probe("digits-punctuation", "plain", "Charlie: you check numbers.", "3.14159; 2,718,281; 1e-9; 0xFF; 2026-10-19; $1,234.56 (50%)!"),
-        Probe("unicode", "plain", "Delta: you read many scripts.", "Café naïve résumé — “quotes” … 東京タワー 한국어 العربية Ελληνικά 🙂🚀"),
-        Probe("whitespace", "plain", "Echo: you keep layout.", "a  b   c\t\td\n\n\ne        f \n g\n"),
-        Probe("code", "plain", "Foxtrot: you read code.", "def f(x):\n    return {'a': [1, 2, 3], \"b\": x**2}  # comment\n"),
-        Probe("markup", "plain", "Golf: you read markup.", "<table><tr><td>cell</td></tr></table> <b>bold</b> &amp; [link](http://example.test/a?b=c)"),
-        Probe("ascii-long", "plain", "Hotel: you summarize reports.", _long_ascii()),
-        Probe("non-ascii-long", "plain", "India: you summarize reports.", _long_non_ascii()),
-        Probe("schema-ascii", "plain", "Juliet: reply as JSON.", "The harbor moved 24 tonnes of cargo in 1998.", _SCHEMA),
-        Probe("schema-unicode", "plain", "Kilo: reply as JSON.", "Café naïve résumé — 東京タワー 🙂", _SCHEMA),
+        Probe("ascii-short", "clean", "Alpha: you summarize text.", "The harbor moved 24 tonnes of cargo in 1998."),
+        Probe("ascii-tiny", "clean", "Bravo: answer briefly.", "Hi."),
+        Probe("digits-punctuation", "clean", "Charlie: you check numbers.", "3.14159; 2,718,281; 1e-9; 0xFF; 2026-10-19; $1,234.56 (50%)!"),
+        Probe("unicode", "clean", "Delta: you read many scripts.", "Café naïve résumé — “quotes” … 東京タワー 한국어 العربية Ελληνικά 🙂🚀"),
+        Probe("whitespace-internal", "clean", "Echo: you keep layout.", "a  b   c\t\td\n\n\ne        f \n g"),
+        Probe("code-internal", "clean", "Foxtrot: you read code.", "def f(x):\n    return {'a': [1, 2, 3], \"b\": x**2}  # comment"),
+        Probe("markup", "clean", "Golf: you read markup.", "<table><tr><td>cell</td></tr></table> <b>bold</b> &amp; [link](http://example.test/a?b=c)"),
+        Probe("ascii-long", "clean", "Hotel: you summarize reports.", _long_ascii()),
+        Probe("non-ascii-long", "clean", "India: you summarize reports.", _long_non_ascii()),
+        Probe("schema-ascii", "clean", "Juliet: reply as JSON.", "The harbor moved 24 tonnes of cargo in 1998.", _SCHEMA),
+        Probe("schema-unicode", "clean", "Kilo: reply as JSON.", "Café naïve résumé — 東京タワー 🙂", _SCHEMA),
+        Probe("trailing-newline", "boundary", "Lima: answer briefly.", BASE_USER + "\n"),
+        Probe("trailing-space", "boundary", "Mike: answer briefly.", BASE_USER + " "),
+        Probe("trailing-tab", "boundary", "November: answer briefly.", BASE_USER + "\t"),
+        Probe("leading-newline", "boundary", "Oscar: answer briefly.", "\n" + BASE_USER),
+        Probe("leading-space", "boundary", "Papa: answer briefly.", " " + BASE_USER),
+        Probe("leading-tab", "boundary", "Quebec: answer briefly.", "\t" + BASE_USER),
+        Probe("system-trailing-newline", "boundary", "Romeo: answer briefly.\n", BASE_USER),
         Probe(
             "special-markers",
             "marker",
-            "Lima: you quote text.",
+            "Sierra: you quote text.",
             "Quote this literally: <bos> <eos> <pad> <start_of_turn>user <end_of_turn> <|turn> <|video|>",
         ),
     ]
 
 
-WARM_UP = Probe("warm-up", "plain", "Zulu: warm up.", "Ready.")
+WARM_UP = Probe("warm-up", "clean", "Zulu: warm up.", "Ready.")
 
 
 @dataclass(frozen=True)
@@ -146,6 +165,8 @@ def request_body(model: str, probe: Probe) -> dict[str, Any]:
     body: dict[str, Any] = {
         "model": model,
         "stream": False,
+        # OllamaProvider sends think false on every request; leaving it out changes the template.
+        "think": False,
         "messages": [
             {"role": "system", "content": probe.system},
             {"role": "user", "content": probe.user},
@@ -166,29 +187,33 @@ def ask(client: httpx.Client, model: str, probe: Probe) -> int | None:
 
 
 def judge(measurements: Sequence[Measurement], *, reference_overhead: int = REFERENCE_OVERHEAD) -> Verdict:
-    """Decide whether the counter never counts fewer tokens than Ollama processed."""
+    """Decide whether the counter never counts fewer tokens than Ollama processed.
+
+    Clean probes set the overhead and must agree exactly. Boundary and marker
+    probes only need ``reported <= counted + overhead``.
+    """
     problems: list[str] = []
     notes: list[str] = []
     missing = [m.name for m in measurements if m.reported is None]
     if missing:
         problems.append(f"Ollama reported no prompt_eval_count for: {', '.join(missing)}")
-    plain = [m for m in measurements if m.kind == "plain" and m.reported is not None]
-    if len(plain) < _MINIMUM_PLAIN_PROBES:
-        problems.append(f"only {len(plain)} plain requests were measured; at least {_MINIMUM_PLAIN_PROBES} are needed")
+    clean = [m for m in measurements if m.kind == "clean" and m.reported is not None]
+    if len(clean) < _MINIMUM_CLEAN_PROBES:
+        problems.append(f"only {len(clean)} clean requests were measured; at least {_MINIMUM_CLEAN_PROBES} are needed")
     by_overhead: dict[int, list[str]] = {}
-    for measurement in plain:
+    for measurement in clean:
         assert measurement.reported is not None
         by_overhead.setdefault(measurement.reported - measurement.counted, []).append(measurement.name)
     overhead: int | None = None
     if len(by_overhead) == 1:
         [overhead] = by_overhead
         if overhead < 0:
-            problems.append(f"the counter counts {-overhead} more than Ollama on every plain request, so it is not exact")
+            problems.append(f"the counter counts {-overhead} more than Ollama on every clean request, so it is not exact")
             overhead = None
     elif by_overhead:
         detail = "; ".join(f"{value:+d}: {', '.join(names)}" for value, names in sorted(by_overhead.items()))
         problems.append(
-            "the template overhead is not constant across plain requests "
+            "the template overhead is not constant across clean requests "
             f"(reported minus counted: {detail}). The counter does not match Ollama's "
             "tokenization on the requests that differ, or a reused prompt cache changed the count"
         )
@@ -199,18 +224,18 @@ def judge(measurements: Sequence[Measurement], *, reference_overhead: int = REFE
                 "the counter's counts are unaffected, but anything that assumes 14 should be checked"
             )
         for measurement in measurements:
-            if measurement.kind != "marker" or measurement.reported is None:
+            if measurement.kind == "clean" or measurement.reported is None:
                 continue
             gap = measurement.reported - measurement.counted - overhead
             if gap > 0:
                 problems.append(f"{measurement.name}: Ollama counted {gap} more than the counter plus overhead")
             elif gap < 0:
                 notes.append(
-                    f"{measurement.name}: Ollama counted {-gap} fewer, so it reads a marker as fewer tokens than "
-                    "its pieces; the counter overcounts, which is safe"
+                    f"{measurement.name}: Ollama counted {-gap} fewer, so it reads this input as fewer tokens than "
+                    "the counter; the counter overcounts, which is safe"
                 )
             else:
-                notes.append(f"{measurement.name}: counted the same as the counter, as pieces")
+                notes.append(f"{measurement.name}: counted the same as the counter plus overhead")
     return Verdict(passed=not problems, overhead=overhead, problems=problems, notes=notes)
 
 
@@ -299,7 +324,7 @@ def main(argv: Sequence[str] | None = None, *, client: httpx.Client | None = Non
     if verdict.passed:
         print(
             f"PASSED: counted tokens plus {verdict.overhead} template tokens equal Ollama's count on every "
-            "plain request and never undercount.\n"
+            "clean request, and no boundary or marker request was undercounted.\n"
             f"Add to _VERIFIED_TOKENIZER_JSON_FINGERPRINTS: {counter.fingerprint}"
         )
     else:

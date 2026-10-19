@@ -2,7 +2,7 @@
 
 Ollama models pulled in the newer tensor layout (for example `gemma4:31b` and `gemma4:31b-mlx`) have no GGUF file, so the exact counter of #120 cannot read them. `TokenizerJsonCounter` reads the model's Hugging Face `tokenizer.json` layer instead, but it is refused until its counts have been checked against Ollama's `prompt_eval_count`. Until then the summarizer uses the byte counter and says so in preflight, in the Run and on the command line.
 
-`verify_ollama_token_counts.py` makes that check. **It runs real model inference**: one warm-up request and 12 fixed probes to an Ollama server on this machine, each limited to one generated token. Nothing in the repository runs it. Its tests use a scripted server and a synthetic tokenizer. Its one run against a real server is recorded at the end of this file.
+`verify_ollama_token_counts.py` makes that check. **It runs real model inference**: one warm-up request and 19 fixed probes to an Ollama server on this machine, each limited to one generated token and sent in the summarizer's own request shape (`think: false`). Nothing in the repository runs it. Its tests use a scripted server and a synthetic tokenizer. Its runs against a real server are recorded at the end of this file.
 
 ## Run it
 
@@ -22,13 +22,15 @@ uv run --with-requirements requirements.txt python experiments/token_counter_ver
 
 ## What it checks
 
-For each probe, the counter counts the system message and the user message. Ollama wraps both in the model's chat template, so the check is `counted + template overhead == prompt_eval_count`, the method of #120 (14 template tokens for gemma4 on its GGUF path).
+For each probe, the counter counts the system message and the user message. Ollama wraps both in the model's chat template, so the check is `counted + template overhead == prompt_eval_count`, the method of #120 (14 template tokens for gemma4 with `think` false). The requests carry `think: false` because `OllamaProvider` does; the first run left it out and measured a different template.
 
-- **The overhead is observed, not assumed.** Every plain probe must show the same `reported - counted`. If they differ, the run fails and names the probes in each group. Two causes are likely: the counter does not match Ollama's tokenization on those texts, or a reused prompt cache lowered a count. Each system message opens with a different word so a reused prefix is only the template header, and a throwaway warm-up request goes first so that header is cached the same way for every probe.
-- **Never fewer.** Any probe that Ollama counts higher than counter plus overhead fails the run.
-- **Schema is not prompt text.** Two probes carry a `format` schema as the summarizer's requests do. They share the plain overhead only if Ollama does not count the schema as prompt tokens, as #120 found for gemma4 on its GGUF path. If it does, the run fails.
-- **Special-token markers.** One probe quotes markers such as `<bos>` and `<|turn>`. The counter splits a marker into pieces, which can only count more than Ollama does, so Ollama may count fewer here and never more.
-- A missing `prompt_eval_count` is a failure, not a pass.
+Probes come in three kinds, so that edge whitespace, which a server may trim, cannot hide a real mismatch or fail an exact one:
+
+- **Clean** (11): no whitespace at either edge of either message. They set the overhead, which is observed, not assumed: every clean probe must show the same `reported - counted`, or the run fails and names the probes in each group. They include internal runs of spaces, tabs, newlines and indentation, non-ASCII text, markup, long text, and two probes with a `format` schema as the summarizer's requests have. The schema probes share the overhead only if Ollama does not count the schema as prompt tokens, as #120 found on the GGUF path.
+- **Boundary** (7): `Count these words.` with one run of one kind of whitespace at one edge, each alone: trailing and leading newline, space and tab in the user message, and a trailing newline in the system message. They only need `reported <= counted + overhead`. A probe Ollama counts lower is reported with its gap, which is how the run shows whether a server trims and which characters.
+- **Marker** (1): special-token markers such as `<bos>` and `<|turn>`. The counter splits a marker into pieces, which can only count more than Ollama, so Ollama may count fewer here and never more.
+
+Any probe that Ollama counts higher than counter plus overhead fails the run, and a missing `prompt_eval_count` is a failure. Each system message opens with a different word so a reused prefix is only the template header, and a throwaway warm-up request goes first so that header is cached the same way for every probe.
 
 Output has no document text: probe names, counts and the verdict. The JSON report adds the Ollama version, the counter identity and the counting fingerprint.
 
@@ -48,6 +50,15 @@ Offline follow-up on the same counts, using the real tokenizer, the model files 
 - **The one-token difference.** `whitespace` and `code` are the only probes with a trailing newline, and also the only ones with runs of spaces and internal newlines. Removing the trailing newline changes both counts by exactly one and no other probe. No internal construct fits: collapsing space runs gives -3 and -2, collapsing newline runs and replacing tabs give 0, and removing the space before a newline or the indent after one give -1/0 and 0/-1. A merge of the trailing newline with a newline in the template is ruled out if the skeleton above is right, because user text is followed by the special token `<turn|>`. What remains is Ollama trimming trailing whitespace from message text (the Gemma 3 chat template does so with `trim`; not checked for gemma4's built-in renderer) or a tokenizer quirk in the MLX runner. Both leave the counter counting one more, the observed direction. They differ on trailing spaces: a user text of `Count these words.  ` (two trailing spaces) would report 15 more than counted if whitespace is trimmed and 16 more if only newlines behave differently.
 - **Markers.** The marker probe equals the counter's count with `<bos>`, `<eos>`, `<pad>`, `<|turn>` and `<|video|>` each matched as one special token, so Ollama reads such text as special tokens. The counter counts their pieces, which is more, so this is safe. The two schema probes matched the plain ones exactly, so the schema was not part of the prompt count on this runner.
 - **What to change.** The tokenization of message text matched on every probe except by that one token, so the constant-overhead rule is the likelier thing to change, not the counter: probes with no leading or trailing whitespace would set the overhead and agree exactly, and probes with boundary whitespace and markers would only need `reported <= counted + overhead`. That reading was found after the run, so a run on probes written beforehand (trailing and leading newline, space and tab, each alone, with `think: false`) comes before the rule is changed or the fingerprint is added. Not checked: the renderer's source, leading whitespace, the system-message boundary, long recorded requests, and the cause of the 14-to-16 step.
+
+## Second run: predictions written before it, with `think: false` and the grouped probes
+
+Reading of the first run (above) predicts:
+
+- Clean probes: `reported - counted` is 14 for all eleven, the figure of #120, because `think: false` removes the two thinking tokens. If it is 16 again, the thinking marker is not the cause and the step from 14 stays unexplained. If clean probes disagree, internal whitespace or content is the cause and the counter is not yet exact.
+- Boundary probes: `trailing-newline` is 1 lower than the overhead, as in the first run. If the renderer trims message whitespace, every other boundary probe is also 1 lower, including `system-trailing-newline`. If only trailing newlines behave differently, the others are 0.
+- `special-markers`: 7 lower than the overhead.
+- Verdict: pass if no gap is positive.
 
 ## Not covered
 
