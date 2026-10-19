@@ -15,6 +15,7 @@ from types import ModuleType
 import httpx
 import pytest
 
+from summarizer.summaries import leaf_summary_schema
 from summarizer.tokenization import TokenizerJsonCounter
 from tests.test_tokenizer_json_counter import _tensor_model
 
@@ -60,7 +61,9 @@ class ScriptedOllama:
         template: int = TEMPLATE,
         extra: dict[str, int | None] | None = None,
         trim: bool = False,
+        known: list | None = None,
     ) -> None:
+        self.known = [verify.WARM_UP, *(known if known is not None else verify.probes())]
         self.counter = counter
         self.template = template
         self.extra = extra or {}
@@ -77,7 +80,7 @@ class ScriptedOllama:
             return httpx.Response(200, json={"version": "0.40.6"})
         assert request.url.path == "/api/chat" and body is not None
         system, user = (message["content"] for message in body["messages"])
-        [probe] = [p for p in [verify.WARM_UP, *verify.probes()] if p.system == system]
+        [probe] = [p for p in self.known if (p.system, p.user) == (system, user)]
         extra = self.extra.get(probe.name, 0)
         if extra is None:
             return httpx.Response(200, json={"message": {"content": "x"}})
@@ -90,6 +93,10 @@ class ScriptedOllama:
         return [body for path, body in self.requests if path == "/api/chat" and body is not None]
 
 
+def _counter(models_dir: Path) -> TokenizerJsonCounter:
+    return TokenizerJsonCounter.for_ollama_model("big:31b", models_dir=models_dir, allow_unverified=True)
+
+
 def _run(
     models_dir: Path,
     *,
@@ -97,12 +104,14 @@ def _run(
     template: int = TEMPLATE,
     trim: bool = False,
     output: Path | None = None,
+    long: bool = False,
 ) -> tuple[int, ScriptedOllama]:
-    counter = TokenizerJsonCounter.for_ollama_model(
-        "big:31b", models_dir=models_dir, allow_unverified=True
-    )
-    ollama = ScriptedOllama(counter, template=template, extra=extra, trim=trim)
+    counter = _counter(models_dir)
+    known = verify.long_probes(counter, "big:31b") if long else None
+    ollama = ScriptedOllama(counter, template=template, extra=extra, trim=trim, known=known)
     argv = ["--model", "big:31b", "--models-dir", str(models_dir)]
+    if long:
+        argv += ["--set", "long"]
     if output is not None:
         argv += ["--output", str(output)]
     return verify.main(argv, client=ollama.client()), ollama
@@ -434,3 +443,201 @@ def test_judge_fails_a_boundary_probe_above_counter_plus_overhead() -> None:
 
     assert verdict.passed is False
     assert verdict.problems == ["edge: Ollama counted 1 more than the counter plus overhead"]
+
+
+# --- the long set ----------------------------------------------------------
+
+LONG_TARGETS = {"leaf-2k": 2_000, "leaf-4k": 4_000, "leaf-6k": 6_000}
+
+
+def test_the_long_set_has_a_clean_core_boundary_and_marker_probes(models_dir: Path) -> None:
+    long = verify.long_probes(_counter(models_dir), "big:31b")
+    kinds = [probe.kind for probe in long]
+
+    assert kinds.count("clean") >= 5 and kinds.count("boundary") == 2 and kinds.count("marker") == 1
+    assert len({probe.name for probe in long}) == len(long)
+    assert [probe.name for probe in long if probe.name.startswith("long-leaf")] == [
+        "long-leaf-2k",
+        "long-leaf-4k",
+        "long-leaf-6k",
+    ]
+    assert any(ord(character) > 0x2FFF for probe in long for character in probe.user)
+
+
+def test_long_probe_sizes_are_close_to_the_summarizers_segment_sizes(models_dir: Path) -> None:
+    counter = _counter(models_dir)
+    long = {probe.name: probe for probe in verify.long_probes(counter, "big:31b")}
+
+    for name, target in LONG_TARGETS.items():
+        counted = counter.count(long[f"long-{name}"].user)
+        # The user message is the app's fenced segment, so a little over the passage itself.
+        assert 0.8 * target <= counted <= 1.05 * target, (name, counted)
+    # Every user message is a few thousand tokens, up to the size of a real leaf segment
+    # (a quarter of the usable input capacity, about 5,000 to 6,000 at a 32,768 window).
+    users = [counter.count(p.user) for p in long.values()]
+    assert 1_500 <= min(users) and max(users) <= 6_300
+
+
+def test_the_long_set_is_deterministic(models_dir: Path) -> None:
+    counter = _counter(models_dir)
+
+    first = verify.long_probes(counter, "big:31b")
+    second = verify.long_probes(counter, "big:31b")
+
+    assert first == second
+
+
+def test_long_leaf_probes_are_the_apps_own_leaf_requests(models_dir: Path) -> None:
+    long = {probe.name: probe for probe in verify.long_probes(_counter(models_dir), "big:31b")}
+
+    for name in ("long-leaf-2k", "long-leaf-4k", "long-leaf-6k"):
+        probe = long[name]
+        assert "You extract structured information from one region of a longer document" in probe.system
+        assert "BEGIN" in probe.user and "END" in probe.user
+        # The Ollama wire schema the app sends, not the shared hosted one: it adds
+        # constraints the hosted subset cannot carry.
+        assert probe.schema is not None and "properties" in probe.schema
+        assert set(probe.schema["properties"]) >= {"summary", "provenance", "quotations"}
+        assert probe.schema["properties"]["summary"]["minLength"] == 1
+        assert probe.schema["properties"]["provenance"]["minItems"] == 1
+        assert probe.schema != leaf_summary_schema()
+    assert [p.schema is not None for p in long.values()].count(True) == 3
+
+
+def test_long_clean_and_marker_probes_have_no_whitespace_at_a_message_edge(models_dir: Path) -> None:
+    for probe in verify.long_probes(_counter(models_dir), "big:31b"):
+        if probe.kind in ("clean", "marker"):
+            assert _edge_whitespace(probe.system) == [] and _edge_whitespace(probe.user) == [], probe.name
+
+
+def test_the_long_boundary_probes_add_one_blank_line_run_to_one_edge_of_the_same_passage(
+    models_dir: Path,
+) -> None:
+    long = {probe.name: probe for probe in verify.long_probes(_counter(models_dir), "big:31b")}
+
+    trailing, leading = long["long-trailing-blank-lines"], long["long-leading-blank-lines"]
+
+    assert _edge_whitespace(trailing.user) == [("trailing", "\n\n")] and _edge_whitespace(trailing.system) == []
+    assert _edge_whitespace(leading.user) == [("leading", "\n\n")] and _edge_whitespace(leading.system) == []
+    assert trailing.user.strip() == leading.user.strip()
+
+
+def test_the_long_marker_probe_carries_markers_inside_a_passage(models_dir: Path) -> None:
+    marker = next(p for p in verify.long_probes(_counter(models_dir), "big:31b") if p.kind == "marker")
+
+    assert all(token in marker.user for token in ("<bos>", "<|turn>", "<eos>"))
+    assert len(marker.user) > 1_000
+
+
+def test_no_two_long_leaf_probes_are_adjacent(models_dir: Path) -> None:
+    # Neighbouring requests with the same instructions would share a cached prefix.
+    long = verify.long_probes(_counter(models_dir), "big:31b")
+    names = [probe.name for probe in long]
+
+    for first, second in zip(names, names[1:], strict=False):
+        assert not (first.startswith("long-leaf") and second.startswith("long-leaf"))
+    assert not (verify.WARM_UP.system.split(":")[0] == long[0].system.split(":")[0])
+
+
+def test_the_long_mode_sends_the_summarizers_request_shape(models_dir: Path) -> None:
+    code, ollama = _run(models_dir, long=True)
+
+    chats = ollama.chats()
+    long = verify.long_probes(_counter(models_dir), "big:31b")
+    assert code == verify.EXIT_PASSED
+    assert len(chats) == 1 + len(long)
+    for body in chats:
+        assert body["stream"] is False and body["think"] is False
+        assert body["options"] == {"num_predict": 1, "temperature": 0, "seed": 0}
+        assert [message["role"] for message in body["messages"]] == ["system", "user"]
+    assert [body.get("format") is not None for body in chats[1:]] == [p.schema is not None for p in long]
+    assert [body["messages"][1]["content"] for body in chats[1:]] == [p.user for p in long]
+
+
+def test_the_long_mode_passes_when_ollama_trims_the_blank_lines(
+    models_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _ = _run(models_dir, long=True, trim=True)
+
+    out = capsys.readouterr().out
+    assert code == verify.EXIT_PASSED
+    assert "long-trailing-blank-lines: Ollama counted" in out and "long-leading-blank-lines: Ollama counted" in out
+
+
+def test_the_long_mode_fails_a_clean_probe_that_disagrees(
+    models_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A reused cache prefix that lowered one count would show up here.
+    code, _ = _run(models_dir, long=True, extra={"long-leaf-4k": -300})
+
+    out = capsys.readouterr().out
+    assert code == verify.EXIT_FAILED
+    assert "not constant" in out and "long-leaf-4k" in out
+
+
+def test_the_long_mode_fails_a_boundary_probe_counted_higher(
+    models_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _ = _run(models_dir, long=True, extra={"long-trailing-blank-lines": 3})
+
+    assert code == verify.EXIT_FAILED
+    assert "long-trailing-blank-lines: Ollama counted 3 more" in capsys.readouterr().out
+
+
+def test_the_long_mode_marker_probe_may_count_fewer_never_more(
+    models_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fewer, _ = _run(models_dir, long=True, extra={"long-markers": -5})
+    more, _ = _run(models_dir, long=True, extra={"long-markers": 2})
+
+    assert (fewer, more) == (verify.EXIT_PASSED, verify.EXIT_FAILED)
+
+
+def test_a_long_dry_run_prints_the_sizes_and_sends_nothing(
+    models_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"dry run sent {request.url}")
+
+    client = httpx.Client(base_url="http://localhost:11434", transport=httpx.MockTransport(refuse))
+    code = verify.main(
+        ["--model", "big:31b", "--models-dir", str(models_dir), "--set", "long", "--dry-run"],
+        client=client,
+    )
+
+    out = capsys.readouterr().out
+    assert code == verify.EXIT_PASSED
+    assert "long-leaf-6k" in out and "Dry run: nothing was sent to Ollama." in out
+
+
+def test_missing_sample_documents_make_the_long_mode_incomplete(
+    models_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"sent {request.url}")
+
+    client = httpx.Client(base_url="http://localhost:11434", transport=httpx.MockTransport(refuse))
+    empty = tmp_path / "no-documents"
+    empty.mkdir()
+    code = verify.main(
+        ["--model", "big:31b", "--models-dir", str(models_dir), "--set", "long", "--documents-dir", str(empty)],
+        client=client,
+    )
+
+    assert code == verify.EXIT_INCOMPLETE
+    assert "sample document" in capsys.readouterr().err
+
+
+def test_the_default_set_is_still_the_short_one(models_dir: Path) -> None:
+    _, ollama = _run(models_dir)
+
+    assert len(ollama.chats()) == 1 + len(verify.probes())
+
+
+def test_long_passages_end_at_a_sentence_and_start_at_a_paragraph(models_dir: Path) -> None:
+    long = {probe.name: probe for probe in verify.long_probes(_counter(models_dir), "big:31b")}
+
+    for name in ("long-plain-4k", "long-trailing-blank-lines", "long-leading-blank-lines"):
+        text = long[name].user.strip()
+        assert text[-1] in ".!?\"”’)", (name, text[-40:])
+        assert text[0].isupper() or text[0] in "\"“‘(", (name, text[:40])

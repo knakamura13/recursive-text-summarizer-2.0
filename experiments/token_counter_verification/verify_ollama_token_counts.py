@@ -24,6 +24,13 @@ three kinds:
 - ``marker``: special-token markers in text. The counter splits a marker into
   pieces, which can only count more, so Ollama may count fewer, never more.
 
+``--set long`` swaps the short probes for a few long requests of a few thousand
+tokens, the size of the summarizer's own leaf segments (a quarter of the usable
+input capacity, about 5,000 to 6,000 tokens at a 32,768-token window). Three are
+the app's real leaf requests, built with ``build_leaf_request`` from passages of
+committed public-domain novels and sent with the Ollama wire schema, so the large
+schema is tested against the prompt count too. The same three kinds apply.
+
 A pass prints the counting fingerprint to add to
 ``_VERIFIED_TOKENIZER_JSON_FINGERPRINTS`` in ``summarizer/tokenization.py``. The
 fixed set is a smoke check on a few dozen tokens each, so say in the commit that
@@ -37,7 +44,9 @@ probes' names, counts and the verdict.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -50,6 +59,9 @@ import httpx
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT))
 
+from summarizer.leaf import build_leaf_request  # noqa: E402
+from summarizer.providers.ollama import _local_response_schema  # noqa: E402
+from summarizer.segmentation import BoundaryKind, SourceSegment  # noqa: E402
 from summarizer.tokenization import (  # noqa: E402
     TokenAccountingError,
     TokenCounter,
@@ -57,6 +69,7 @@ from summarizer.tokenization import (  # noqa: E402
 )
 
 DEFAULT_HOST = "http://localhost:11434"
+DEFAULT_DOCUMENTS = _REPO_ROOT / "sample-documents"
 # The chat template overhead #120 measured for gemma4 with think false. It is a
 # reference to compare the observed value with, not an input to the verdict.
 REFERENCE_OVERHEAD = 14
@@ -131,6 +144,88 @@ def probes() -> list[Probe]:
             "Sierra: you quote text.",
             "Quote this literally: <bos> <eos> <pad> <start_of_turn>user <end_of_turn> <|turn> <|video|>",
         ),
+    ]
+
+
+class MissingSampleDocument(Exception):
+    """A committed sample document the long set needs could not be read."""
+
+
+# Public-domain novels committed under sample-documents/, and where in each to start.
+_NOVELS = {
+    "alice": ("novel_Alice's Adventures in Wonderland.txt", 0.15),
+    "frankenstein": ("novel_Frankenstein - or, the Modern Prometheus.txt", 0.30),
+    "moby": ("novel_Moby Dick - Or, The Whale.txt", 0.40),
+}
+_LONG_NON_ASCII_SENTENCE = "Café número {i}: «naïve» façade, 東京タワー ({i}), 한국어 문장, Ελληνικά — 🙂."
+_BLANK_LINES = "\n\n"
+
+
+def _passage(
+    documents: Path, novel: str, counter: TokenCounter, target_tokens: int, *, fraction: float | None = None
+) -> str:
+    """A whole-sentence passage of at most `target_tokens`, starting at a paragraph."""
+    filename, default_fraction = _NOVELS[novel]
+    try:
+        text = (documents / filename).read_text(encoding="utf-8")
+    except OSError as error:
+        raise MissingSampleDocument(f"sample document {filename!r} cannot be read in {documents}") from error
+    text = text.replace("\r\n", "\n")
+    start = text.find("\n\n", int(len(text) * (default_fraction if fraction is None else fraction)))
+    window = text[max(start, 0) + 2 :][: target_tokens * 12]
+    piece = window[: counter.fitting_prefix(window, 0, len(window), target_tokens)]
+    sentences = list(re.finditer(r"[.!?][\"”’)]*(?=\s)", piece))
+    return (piece[: sentences[-1].end()] if sentences else piece).strip()
+
+
+def _non_ascii_passage(counter: TokenCounter, target_tokens: int) -> str:
+    sentences: list[str] = []
+    while True:
+        sentences.append(_LONG_NON_ASCII_SENTENCE.format(i=len(sentences) + 1))
+        if counter.count(" ".join(sentences)) > target_tokens:
+            sentences.pop()
+            return " ".join(sentences)
+
+
+def _leaf_probe(name: str, segment_id: str, passage: str, counter: TokenCounter, model: str) -> Probe:
+    """The request the summarizer sends for one leaf segment, with the schema Ollama is sent."""
+    segment = SourceSegment(
+        segment_id=segment_id,
+        source_id=hashlib.sha256(passage.encode("utf-8")).hexdigest(),
+        order=0,
+        text=passage,
+        core_start=0,
+        core_end=len(passage),
+        context_start=0,
+        context_end=len(passage),
+        core_token_count=counter.count(passage),
+        token_count=counter.count(passage),
+        leading_overlap_tokens=0,
+        trailing_overlap_tokens=0,
+        boundary_kind=BoundaryKind.PARAGRAPH,
+    )
+    request = build_leaf_request(segment, model=model, timeout_seconds=1)
+    return Probe(name, "clean", request.instructions, request.input_text, _local_response_schema(request))
+
+
+def long_probes(counter: TokenCounter, model: str, documents: Path = DEFAULT_DOCUMENTS) -> list[Probe]:
+    """The long set. No two leaf probes are adjacent, so consecutive requests never
+    share the leaf instructions as a cached prefix."""
+    marker_passage = _passage(documents, "alice", counter, 2_000, fraction=0.6)
+    paragraphs = marker_passage.split("\n\n")
+    for position, marker in zip((1, 3, 5, 7), ("<bos>", "<|turn>", "<eos>", "<|video|>"), strict=False):
+        if position < len(paragraphs):
+            paragraphs.insert(position, marker)
+    edge_passage = _passage(documents, "alice", counter, 2_000, fraction=0.5)
+    return [
+        _leaf_probe("long-leaf-2k", "S000001", _passage(documents, "alice", counter, 2_000), counter, model),
+        Probe("long-plain-4k", "clean", "Tango: you summarize passages.", _passage(documents, "moby", counter, 4_000, fraction=0.7)),
+        _leaf_probe("long-leaf-4k", "S000002", _passage(documents, "frankenstein", counter, 4_000), counter, model),
+        Probe("long-non-ascii-3k", "clean", "Uniform: you read many scripts.", _non_ascii_passage(counter, 3_000)),
+        _leaf_probe("long-leaf-6k", "S000003", _passage(documents, "moby", counter, 6_000), counter, model),
+        Probe("long-trailing-blank-lines", "boundary", "Victor: answer briefly.", edge_passage + _BLANK_LINES),
+        Probe("long-leading-blank-lines", "boundary", "Whiskey: answer briefly.", _BLANK_LINES + edge_passage),
+        Probe("long-markers", "marker", "Xray: you quote text.", "\n\n".join(paragraphs)),
     ]
 
 
@@ -222,8 +317,9 @@ def judge(measurements: Sequence[Measurement], *, reference_overhead: int = REFE
     if overhead is not None:
         if overhead != reference_overhead:
             notes.append(
-                f"observed template overhead is {overhead}, not the {reference_overhead} #120 measured for gemma4; "
-                "the counter's counts are unaffected, but anything that assumes 14 should be checked"
+                f"observed template overhead is {overhead}, not the {reference_overhead} #120 measured for gemma4 "
+                "on Ollama 0.34.4; the counter's counts are unaffected. No summarizer budget charges the template "
+                "by name, so it matters only if it exceeds the slack in the schema term and the safety margin"
             )
         for measurement in measurements:
             if measurement.kind == "clean" or measurement.reported is None:
@@ -241,7 +337,9 @@ def judge(measurements: Sequence[Measurement], *, reference_overhead: int = REFE
     return Verdict(passed=not problems, overhead=overhead, problems=problems, notes=notes)
 
 
-def measure(client: httpx.Client | None, counter: TokenCounter, model: str) -> list[Measurement]:
+def measure(
+    client: httpx.Client | None, counter: TokenCounter, model: str, selected: Sequence[Probe] | None = None
+) -> list[Measurement]:
     """Count every probe; when a client is given, also ask Ollama (after one throwaway warm-up)."""
     if client is not None:
         ask(client, model, WARM_UP)
@@ -253,7 +351,7 @@ def measure(client: httpx.Client | None, counter: TokenCounter, model: str) -> l
             counted=counted_tokens(counter, probe),
             reported=None if client is None else ask(client, model, probe),
         )
-        for probe in probes()
+        for probe in (probes() if selected is None else selected)
     ]
 
 
@@ -262,11 +360,11 @@ def _is_this_machine(host: str) -> bool:
 
 
 def _print_table(measurements: Sequence[Measurement]) -> None:
-    print(f"{'probe':22} {'kind':7} {'schema':6} {'counted':>8} {'reported':>9} {'reported-counted':>17}")
+    print(f"{'probe':26} {'kind':8} {'schema':6} {'counted':>8} {'reported':>9} {'reported-counted':>17}")
     for m in measurements:
         reported = "-" if m.reported is None else str(m.reported)
         overhead = "-" if m.overhead is None else f"{m.overhead:+d}"
-        print(f"{m.name:22} {m.kind:7} {'yes' if m.schema else 'no':6} {m.counted:8d} {reported:>9} {overhead:>17}")
+        print(f"{m.name:26} {m.kind:8} {'yes' if m.schema else 'no':6} {m.counted:8d} {reported:>9} {overhead:>17}")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -276,6 +374,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--models-dir", type=Path, default=None, help="Ollama model store (default: OLLAMA_MODELS or ~/.ollama/models)")
     parser.add_argument("--timeout", type=float, default=900, help="seconds per request; a cold 31B load is slow")
     parser.add_argument("--output", type=Path, default=None, help="write the JSON report here")
+    parser.add_argument(
+        "--set",
+        choices=("short", "long"),
+        default="short",
+        help="short probes (default), or long requests of a few thousand tokens built from committed novels",
+    )
+    parser.add_argument("--documents-dir", type=Path, default=DEFAULT_DOCUMENTS, help="committed sample documents for --set long")
     parser.add_argument("--dry-run", action="store_true", help="count the probes only; send nothing to Ollama")
     return parser
 
@@ -297,9 +402,15 @@ def main(argv: Sequence[str] | None = None, *, client: httpx.Client | None = Non
         print(f"No tokenizer.json counter for {args.model}: {error}", file=sys.stderr)
         return EXIT_INCOMPLETE
 
-    print(f"model {args.model}, counter {counter.identity}, counting fingerprint {counter.fingerprint}")
+    try:
+        selected = long_probes(counter, args.model, args.documents_dir) if args.set == "long" else probes()
+    except MissingSampleDocument as error:
+        print(f"Cannot build the long set: {error}", file=sys.stderr)
+        return EXIT_INCOMPLETE
+
+    print(f"model {args.model}, {args.set} set, counter {counter.identity}, counting fingerprint {counter.fingerprint}")
     if args.dry_run:
-        measurements = measure(None, counter, args.model)
+        measurements = measure(None, counter, args.model, selected)
         _print_table(measurements)
         print("Dry run: nothing was sent to Ollama.")
         return EXIT_PASSED
@@ -309,7 +420,7 @@ def main(argv: Sequence[str] | None = None, *, client: httpx.Client | None = Non
     try:
         version = http.get("/api/version").json().get("version")
         print(f"Ollama {version}")
-        measurements = measure(http, counter, args.model)
+        measurements = measure(http, counter, args.model, selected)
     except (httpx.HTTPError, ValueError) as error:
         print(f"Ollama request failed: {error}", file=sys.stderr)
         return EXIT_INCOMPLETE
@@ -334,6 +445,7 @@ def main(argv: Sequence[str] | None = None, *, client: httpx.Client | None = Non
     if args.output is not None:
         report = {
             "model": args.model,
+            "set": args.set,
             "ollama_version": version,
             "counter": counter.identity,
             "fingerprint": counter.fingerprint,

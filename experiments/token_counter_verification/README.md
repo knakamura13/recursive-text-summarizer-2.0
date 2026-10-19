@@ -20,6 +20,31 @@ uv run --with-requirements requirements.txt python experiments/token_counter_ver
 
 `--host` defaults to `http://localhost:11434` and must be this machine, because the tokenizer is read from the local model files. A cold 31B load can take minutes; `--timeout` is per request (default 900 seconds). Exit status is 0 for a pass, 1 for a failed comparison and 2 when the check could not be made (no tokenizer layer, host not this machine, server unreachable).
 
+## Long requests (`--set long`)
+
+The short probes are a few dozen tokens each. `--set long` swaps them for requests of a few thousand tokens, the size of the summarizer's own leaf segments: each is a quarter of the usable input capacity, about 5,000 to 6,000 tokens at a 32,768-token window. It makes **9 requests**: the short warm-up and eight probes, about 26,300 counted prompt tokens in all (counted with the `gemma4:31b` tokenizer, before the template). Passages come from the public-domain novels committed under `sample-documents/` (Alice, Frankenstein, Moby Dick) and from synthetic non-ASCII text, so nothing private is read, and no text is written to the report. `--documents-dir` points elsewhere if they move.
+
+| Probe | Kind | What it is | Counted tokens |
+| --- | --- | --- | --- |
+| `long-leaf-2k` | clean | the app's leaf request (`build_leaf_request`) for a 2,000-token passage, with the Ollama wire schema | 2,454 |
+| `long-plain-4k` | clean | a 4,000-token passage, no schema | 4,004 |
+| `long-leaf-4k` | clean | leaf request, 4,000-token passage, schema | 4,409 |
+| `long-non-ascii-3k` | clean | synthetic text in Latin accents, CJK, Hangul and Greek | 2,997 |
+| `long-leaf-6k` | clean | leaf request, 6,000-token passage, schema | 6,445 |
+| `long-trailing-blank-lines` | boundary | a 2,000-token passage plus `\n\n` at the end | 1,992 |
+| `long-leading-blank-lines` | boundary | the same passage with `\n\n` first | 1,993 |
+| `long-markers` | marker | a 2,000-token passage with `<bos>`, `<|turn>`, `<eos>` and `<|video|>` between paragraphs | 1,997 |
+
+The leaf probes carry the app's real instructions (about 420 tokens) and the schema the app sends Ollama (about 600 tokens as JSON, a term the budget charges as prompt tokens), so they test at scale that the schema is not in the prompt count. Requests have the same shape as the summarizer's (`think: false`, `format` when a schema is set, one generated token) and the same clean, boundary and marker rules apply. The overhead is re-measured from the five clean probes, which must agree exactly. No two leaf probes are adjacent, so neighbours never share the leaf instructions as a cached prefix; the app's own back-to-back leaf requests do share it, and that case is not measured here.
+
+Predictions, written before the run, from the second short run: the five clean probes agree exactly (at 18 if the overhead is unchanged); both boundary probes are 1 lower (`\n\n` is one token under the counter and Ollama trims message edges); `long-markers` is 10 lower (the four markers are 2, 3, 2 and 3 tokens as pieces and one token each as special tokens). A clean probe that disagrees, above all one of the later leaf probes by hundreds of tokens, would point to a reused prompt cache lowering `prompt_eval_count`, or to a long-input effect the short probes could not show. Run time was not measured; it is the prefill of about 26,300 tokens plus a possible cold load.
+
+```sh
+uv run --with-requirements requirements.txt python experiments/token_counter_verification/verify_ollama_token_counts.py --model gemma4:31b --set long --output /private/tmp/rts-token-verification/gemma4-31b-long.json
+```
+
+`--set long --dry-run` counts the eight probes and sends nothing.
+
 ## What it checks
 
 For each probe, the counter counts the system message and the user message. Ollama wraps both in the model's chat template, so the check is `counted + template overhead == prompt_eval_count`, the method of #120. #120 measured 14 template tokens for gemma4 on Ollama 0.34.4; the overhead is re-measured on every run, never assumed, and 14 is only a reference the script reports a difference from. The requests carry `think: false` because `OllamaProvider` does; the first run left it out and measured a different template.
