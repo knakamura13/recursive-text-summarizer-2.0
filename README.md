@@ -12,7 +12,7 @@ Source text is treated as untrusted data. Instructions inside the source cannot 
 
 ## Installation and provider configuration
 
-Requirements are Python 3.10 or newer and either an OpenAI API key or a running Ollama service.
+Requirements are Python 3.10 or newer and one of an OpenAI API key, an OpenRouter API key, or a running Ollama service.
 
 ```sh
 python -m venv .venv
@@ -37,6 +37,14 @@ ollama pull gemma3:4b
 
 The default Ollama endpoint is `http://localhost:11434`. Use `--ollama-host` for another endpoint. The application does not pull models automatically. A missing model and an unavailable service produce actionable provider errors.
 
+For OpenRouter, export its key before a run. The key is read from `OPENROUTER_API_KEY` only, when the provider is first used:
+
+```sh
+export OPENROUTER_API_KEY="your-api-key"
+```
+
+OpenRouter sends document text to a third party and bills per request, so use only documents that may leave the machine and give the key a spend cap. The provider uses OpenRouter's chat-completions endpoint with strict JSON-schema output and `require_parameters`, so a request never routes to an endpoint that ignores the schema. It does not use the OpenAI client, so `OPENAI_BASE_URL` and the other `OPENAI_*` variables have no effect on it.
+
 ## Basic usage
 
 With no arguments, the CLI reads `input.txt` and writes `output.txt` in the current directory:
@@ -58,6 +66,15 @@ python main.py --provider ollama --model gemma3:4b
 python main.py --provider ollama --model qwen3.8 --ollama-host http://localhost:11434
 ```
 
+Use OpenRouter with a vendor-qualified model name. `--model` is required, because the default name belongs to OpenAI:
+
+```sh
+python main.py --provider openrouter --model meta-llama/llama-3.3-70b-instruct
+python main.py --provider openrouter --model meta-llama/llama-3.3-70b-instruct --openrouter-upstream deepinfra
+```
+
+An OpenRouter run differs from a local one by design. Hosted adapters do not enforce the quote-candidate and segment-identifier constraints that the Ollama path sends to its decoder, so results from the two are not directly comparable. Token counts are an estimate (an `o200k_base` count scaled by 1.5), because OpenRouter models have no tokenizer available locally; the run says so on stderr and the audit records `counter_exact: false`. The context window is read from OpenRouter's model listing, bounded by an explicit `--context-window`; a model with no listed length falls back to the assumed window. The run logs its chat request count when it ends.
+
 A successful run publishes one final editorial summary only after all required stages succeed. Provider failures, invalid configuration, missing input, and exhausted retries return a nonzero exit status and do not replace the final output with an error message.
 
 ### Dry run
@@ -67,6 +84,8 @@ A successful run publishes one final editorial summary only after all required s
 ```sh
 python main.py --dry-run
 ```
+
+For `--provider openrouter` the dry run also prints the provider, model, pinned upstream, where the context window came from, and whether token counts are estimates. It stays offline, so the window is the explicit `--context-window` or an assumed value; only a real run reads OpenRouter's model listing.
 
 An explicit-source example is:
 
@@ -98,9 +117,10 @@ Run `python main.py --help` for parser-generated help. The complete options are:
 | --------------------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
 | `--input PATH`                          | `input.txt`              | UTF-8 source text or Markdown file.                                                                                                    |
 | `--output PATH`                         | `output.txt`             | Final plain-text summary path.                                                                                                         |
-| `--provider {openai,ollama}`            | `openai`                 | Provider adapter.                                                                                                                      |
-| `--model MODEL`                         | `gpt-4o-mini`            | Provider model identifier.                                                                                                             |
+| `--provider {openai,ollama,openrouter}` | `openai`                 | Provider adapter.                                                                                                                      |
+| `--model MODEL`                         | `gpt-4o-mini`            | Provider model identifier; required for `openrouter`.                                                                                  |
 | `--ollama-host URL`                     | `http://localhost:11434` | Ollama service endpoint.                                                                                                               |
+| `--openrouter-upstream NAME`            | unset                    | Pin every OpenRouter request to one upstream provider, with fallbacks off.                                                             |
 | `--timeout SECONDS`                     | `180`                    | Per-provider request timeout.                                                                                                          |
 | `--max-retries N`                       | `5`                      | Maximum attempts for retryable provider failures.                                                                                      |
 | `--strategy {auto,direct,hierarchical}` | `auto`                   | Execution strategy.                                                                                                                    |

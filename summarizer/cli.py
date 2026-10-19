@@ -24,11 +24,12 @@ from summarizer.pipeline import PipelineConfig, run_pipeline
 from summarizer.providers.base import ContextWindowProvider, ModelProvider, ProviderError
 from summarizer.providers.openai import OpenAIProvider
 from summarizer.providers.ollama import OllamaProvider
+from summarizer.providers.openrouter import OpenRouterProvider
 from summarizer.providers.retrying import RetryingProvider
 from summarizer.runtime.observers import ItemFailedError
 from summarizer.sections import SectionOutline, build_section_tree
 from summarizer.segmentation import SegmentationConfig, detect_markdown_headings
-from summarizer.tokenization import TokenCounter, resolve_token_counter
+from summarizer.tokenization import TokenCounter, estimate_notice, resolve_token_counter
 from summarizer.verification import VerificationConfig
 
 
@@ -42,6 +43,8 @@ class ParsedConfig:
     preserve_sections: bool = False
 
 
+DEFAULT_MODEL = "gpt-4o-mini"
+
 NO_HEADINGS_NOTICE = (
     "This document has no headings, so it was summarized without preserving sections."
 )
@@ -52,9 +55,12 @@ def build_provider(
     *,
     openai_factory: Callable[..., ModelProvider] = OpenAIProvider,
     ollama_factory: Callable[..., ModelProvider] = OllamaProvider,
+    openrouter_factory: Callable[..., ModelProvider] = OpenRouterProvider,
 ) -> ModelProvider:
     if config.provider == "ollama":
         return ollama_factory(host=config.ollama_host)
+    if config.provider == "openrouter":
+        return openrouter_factory(upstream=config.openrouter_upstream)
     return openai_factory()
 
 
@@ -69,11 +75,26 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Summarize a UTF-8 text file")
     parser.add_argument("--input", type=Path, default=Path("input.txt"))
     parser.add_argument("--output", type=Path, default=Path("output.txt"))
-    parser.add_argument("--model", default="gpt-4o-mini")
     parser.add_argument(
-        "--provider", choices=("openai", "ollama"), default="openai"
+        "--model",
+        default=None,
+        help=(
+            f"model name; defaults to {DEFAULT_MODEL}, and is required for "
+            "--provider openrouter, whose names look like vendor/model"
+        ),
+    )
+    parser.add_argument(
+        "--provider", choices=("openai", "ollama", "openrouter"), default="openai"
     )
     parser.add_argument("--ollama-host", default="http://localhost:11434")
+    parser.add_argument(
+        "--openrouter-upstream",
+        default="",
+        help=(
+            "with --provider openrouter, send every request only to this "
+            "upstream provider (for example deepinfra) and never fall back"
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--max-retries", type=int, default=5)
     parser.add_argument("--dry-run", action="store_true")
@@ -163,13 +184,22 @@ def parse_args(argv: list[str] | None = None) -> ParsedConfig:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
+        if args.model is None:
+            if args.provider == "openrouter":
+                # The default is an OpenAI name, which OpenRouter would take
+                # for a different model or reject.
+                raise ValueError("--model is required with --provider openrouter")
+            args.model = DEFAULT_MODEL
         app = AppConfig(
             input_path=args.input,
             output_path=args.output,
             model=args.model,
             provider=args.provider,
-            ollama_host=args.ollama_host,
+            # The Ollama default must not follow an OpenRouter run into the
+            # cache identity, which rejects a host for any other provider.
+            ollama_host="" if args.provider == "openrouter" else args.ollama_host,
             timeout_seconds=args.timeout,
+            openrouter_upstream=args.openrouter_upstream,
         )
         retry = RetryPolicy(max_attempts=args.max_retries)
         strategy = StrategyConfig(
@@ -257,6 +287,72 @@ def _report_dry_run(report: BudgetReport) -> None:
     print(f"Usable input capacity: {report.usable_input_capacity} tokens")
 
 
+def _describe_upstream(app: AppConfig) -> str:
+    return f"{app.openrouter_upstream} (pinned)" if app.openrouter_upstream else "not pinned"
+
+
+def _report_openrouter_dry_run(
+    app: AppConfig, report: BudgetReport, counter: TokenCounter, *, explicit_window: bool
+) -> None:
+    """Say what a dry run could not establish offline about an OpenRouter run.
+
+    A dry run never contacts a provider, so the window is the explicit value or
+    an assumed one; the listing is read only by a real run.
+    """
+    print(f"Provider: {app.provider}")
+    print(f"Model: {app.model}")
+    print(f"Upstream: {_describe_upstream(app)}")
+    if explicit_window:
+        print("Context window source: explicit")
+    else:
+        print(
+            "Context window source: assumed; pass --context-window, or run "
+            "without --dry-run to read it from OpenRouter's model listing"
+        )
+    kind = "exact" if counter.exact else "estimate"
+    print(f"Token counts: {kind} ({counter.identity})")
+    notice = estimate_notice(counter)
+    if notice is not None:
+        print(notice, file=sys.stderr)
+
+
+_WINDOW_SOURCE_LABELS = {
+    "explicit": "from --context-window",
+    "model_listing": "OpenRouter model listing",
+    "assumed": "assumed",
+}
+
+
+def _report_openrouter_run(
+    app: AppConfig, provider: object, counter: TokenCounter, window: int | None
+) -> None:
+    source = getattr(provider, "window_source", None)
+    if window is not None and source in _WINDOW_SOURCE_LABELS:
+        print(
+            f"Context window: {window} tokens ({_WINDOW_SOURCE_LABELS[source]})",
+            file=sys.stderr,
+        )
+    elif window is None:
+        print(
+            "Context window is assumed; pass --context-window to set it.",
+            file=sys.stderr,
+        )
+    caveat = getattr(provider, "window_notice", None)
+    if caveat:
+        print(caveat, file=sys.stderr)
+    print(f"Upstream: {_describe_upstream(app)}", file=sys.stderr)
+    notice = estimate_notice(counter)
+    if notice is not None:
+        print(notice, file=sys.stderr)
+
+
+def _report_request_count(provider: object) -> None:
+    """Log how many chat requests were sent, since each one is billed."""
+    count = getattr(provider, "request_count", None)
+    if isinstance(count, int):
+        print(f"OpenRouter chat requests: {count}", file=sys.stderr)
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -264,6 +360,7 @@ def main(
     counter_factory: Callable[[AppConfig], TokenCounter] = build_counter,
 ) -> int:
     config = parse_args(argv)
+    raw_provider: ModelProvider | None = None
     try:
         document = read_source(config.app.input_path)
         counter = counter_factory(config.app)
@@ -285,6 +382,13 @@ def main(
                 config=config.strategy,
             )
             _report_dry_run(report)
+            if config.app.provider == "openrouter":
+                _report_openrouter_dry_run(
+                    config.app,
+                    report,
+                    counter,
+                    explicit_window=config.strategy.context_window is not None,
+                )
             if outline is not None:
                 tree = build_section_tree(
                     document.text,
@@ -303,6 +407,8 @@ def main(
             )
             if context_window is not None:
                 strategy = replace(strategy, context_window=context_window)
+            if config.app.provider == "openrouter":
+                _report_openrouter_run(config.app, raw_provider, counter, context_window)
         provider = RetryingProvider(raw_provider, config.retry)
         result = run_pipeline(
             document,
@@ -316,6 +422,8 @@ def main(
         # pipeline. The ordinary audit remains an independent atomic file.
         if not config.pipeline.cache.enabled:
             _atomic_replace(config.app.output_path, result.final.text.encode("utf-8"))
+        if config.app.provider == "openrouter":
+            _report_request_count(raw_provider)
         return 0
     except (
         OSError,
@@ -326,4 +434,6 @@ def main(
         PublicationError,
     ) as error:
         print(f"Summarization failed: {error}", file=sys.stderr)
+        if config.app.provider == "openrouter" and raw_provider is not None:
+            _report_request_count(raw_provider)
         return 1
