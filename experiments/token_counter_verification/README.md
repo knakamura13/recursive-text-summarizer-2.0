@@ -92,6 +92,26 @@ Result, from `/private/tmp/rts-token-verification/gemma4-31b-run2.{log,json}`. T
 - **Markers: 7 lower**, as predicted. Ollama reads `<bos>`, `<eos>`, `<pad>`, `<|turn>` and `<|video|>` as special tokens. The schema probes matched the other clean probes, so the schema is not in the prompt count on this runner.
 - **What this does not show.** The probes are a smoke check of a few dozen tokens each. Long recorded requests (#120 compared 1,742), other Ollama versions or runners, and edge whitespace of mixed kinds were not compared. The budget code's comment that the template is 14 tokens (`GgufTokenCounter`) describes the llama runner; on this runner it is 18, and the margin that relied on the schema count exceeding the template by at least 19 tokens was not rechecked here.
 
+## Long run (`--set long`, 2026-10-19, `gemma4:31b`, Ollama 0.40.6): passed, every prediction held
+
+One run, 9 requests (`/private/tmp/rts-token-verification/gemma4-31b-long.{json,log}`). The script took 264 seconds; the server log shows 20 to 51 seconds per long request (about 120 prompt tokens per second) after a cold load that the warm-up absorbed.
+
+| Probe | Kind | Counted | Reported | Reported minus counted |
+| --- | --- | --- | --- | --- |
+| `long-leaf-2k` | clean | 2,454 | 2,472 | +18 |
+| `long-plain-4k` | clean | 4,004 | 4,022 | +18 |
+| `long-leaf-4k` | clean | 4,409 | 4,427 | +18 |
+| `long-non-ascii-3k` | clean | 2,997 | 3,015 | +18 |
+| `long-leaf-6k` | clean | 6,445 | 6,463 | +18 |
+| `long-trailing-blank-lines` | boundary | 1,992 | 2,009 | +17 |
+| `long-leading-blank-lines` | boundary | 1,993 | 2,010 | +17 |
+| `long-markers` | marker | 1,997 | 2,005 | +8 |
+
+- The five clean probes agree exactly at an overhead of 18, the same as the short set, from 2,454 to 6,445 tokens. The three leaf probes carry the app's instructions and the Ollama wire schema (about 600 tokens as JSON), and the schema is not in the prompt count at that size.
+- Both blank-line probes are 1 lower, so Ollama trims `\n\n` at a message edge as it trimmed the short whitespace probes. `long-markers` is 10 lower, as predicted.
+- No request was counted higher by Ollama than counter plus overhead. The overhead and every boundary and marker gap match what the short runs showed.
+- Still not compared: requests above 6,445 tokens (merges and the editorial reach about 20,000), back-to-back requests that share the leaf instructions as a prefix (the leaf probes were kept apart), the app's real schemas for the other stages, other Ollama versions or runners, `gemma4:31b-mlx` itself (same fingerprint, not run), thinking enabled, and anything near #120's 1,742 requests. The fingerprint was not added.
+
 ## Not covered
 
 - GGUF models whose tokenizer is not yet in `_VERIFIED_GGUF_TOKENIZERS`, such as `gemma4:e2b-it-qat` in #190. The script reads `tokenizer.json` layers only.
