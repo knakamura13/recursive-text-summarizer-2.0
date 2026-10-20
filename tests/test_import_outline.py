@@ -224,6 +224,112 @@ def test_a_repeated_title_lands_on_its_next_occurrence() -> None:
     ]
 
 
+def test_a_heading_line_whose_space_moved_or_was_added_is_placed_in_its_spelling() -> None:
+    text = "Bounds for p> 1\n\nBody.\n\nPart 1 1 Overview\n\nMore."
+    hints = [OutlineHint("Bounds for p >1", 1), OutlineHint("Part 11 Overview", 1)]
+
+    imported = assemble(Extraction("txt", text=text, outline_hints=hints))
+
+    assert imported.unplaced_headings == 0
+    assert [(entry.title, imported.text[entry.start : entry.end]) for entry in imported.outline] == [
+        ("Bounds for p> 1", "Bounds for p> 1\n\nBody.\n\n"),
+        ("Part 1 1 Overview", "Part 1 1 Overview\n\nMore."),
+    ]
+
+
+def test_a_heading_line_with_merged_words_and_a_ligature_is_placed_whichever_side_has_the_ligature() -> None:
+    text = "Staﬀ Ratesfor p> 1\n\nBody.\n\nStaff Ratesfor p> 1\n\nMore."
+    hints = [OutlineHint("Staff Rates for p >1", 1), OutlineHint("Staﬀ Rates for p >1", 1)]
+
+    imported = assemble(Extraction("txt", text=text, outline_hints=hints))
+
+    assert imported.unplaced_headings == 0
+    assert [imported.text[entry.start : entry.end] for entry in imported.outline] == [
+        "Staﬀ Ratesfor p> 1\n\nBody.\n\n",
+        "Staff Ratesfor p> 1\n\nMore.",
+    ]
+
+
+def test_title_words_run_together_inside_a_sentence_are_not_a_heading() -> None:
+    text = "Read the keypoints below.\n\nSee anotherTitle for more."
+    hints = [OutlineHint("Key Points", 1), OutlineHint("Another Title", 1)]
+
+    imported = assemble(Extraction("txt", text=text, outline_hints=hints))
+
+    assert (imported.outline, imported.unplaced_headings) == ((), 2)
+
+
+def test_a_line_that_only_begins_with_the_title_without_its_spaces_is_not_a_heading() -> None:
+    text = "Input Devices\n\nKeyPoints and Tips\n\nBody."
+    hints = [OutlineHint("In Put", 1), OutlineHint("Key Points", 1)]
+
+    imported = assemble(Extraction("txt", text=text, outline_hints=hints))
+
+    assert (imported.outline, imported.unplaced_headings) == ((), 2)
+
+
+def test_separate_lines_that_together_spell_the_title_are_not_a_heading() -> None:
+    text = "Overview\n\nKeyPo\nints\n\nBody."
+
+    imported = assemble(Extraction("txt", text=text, outline_hints=[OutlineHint("Key Points", 1)]))
+
+    assert (imported.outline, imported.unplaced_headings) == ((), 1)
+
+
+def test_the_title_as_written_wins_over_an_earlier_line_that_matches_without_its_spaces() -> None:
+    text = "KeyPoints\n\nBody that lists the key points below.\n\nKey Points\n\nMore."
+
+    imported = assemble(Extraction("txt", text=text, outline_hints=[OutlineHint("Key Points", 1)]))
+
+    [entry] = imported.outline
+    assert imported.text[entry.start :] == "Key Points\n\nMore."
+
+
+def test_a_title_as_written_on_the_page_wins_over_a_respaced_line_after_the_cursor() -> None:
+    pages = [PageText(1, "Intro."), PageText(2, "Key Points\n\nBody.\n\nOther\n\nKeyPoints")]
+    hints = [OutlineHint("Other", 1, page=2), OutlineHint("Key Points", 1, page=2)]
+
+    imported = assemble(Extraction("pdf", pages=pages, outline_hints=hints))
+
+    # Nothing after "Other" holds the title as written, but the page does, so the line
+    # that lost its space is not used.
+    assert [(entry.title, imported.text[entry.start : entry.end]) for entry in imported.outline] == [
+        ("Key Points", "Key Points\n\nBody.\n\n"),
+        ("Other", "Other\n\nKeyPoints"),
+    ]
+
+
+def test_a_repeated_respaced_title_lands_on_its_next_occurrence() -> None:
+    text = "KeyPoints\n\nFirst.\n\nKeyPoints\n\nSecond."
+    hints = [OutlineHint("Key Points", 1), OutlineHint("Key Points", 1)]
+
+    assert [section for _title, _level, section in outline(Extraction("txt", text=text, outline_hints=hints))] == [
+        "KeyPoints\n\nFirst.\n\n",
+        "KeyPoints\n\nSecond.",
+    ]
+
+
+def test_a_respaced_title_is_searched_on_its_page() -> None:
+    pages = [PageText(1, "Contents\n\nKeyPoints"), PageText(2, "KeyPoints\n\nBody.")]
+
+    imported = assemble(Extraction("pdf", pages=pages, outline_hints=[OutlineHint("Key Points", 1, page=2)]))
+
+    # The contents page also has the line; the page hint skips it.
+    [entry] = imported.outline
+    assert imported.text[entry.start :] == "KeyPoints\n\nBody."
+    assert (entry.page_start, entry.page_end) == (2, 2)
+
+
+def test_an_offset_hint_is_not_placed_on_a_line_that_lost_a_space() -> None:
+    text = "Intro.\n\nKeyPoints\n\nBody."
+
+    imported = assemble(
+        Extraction("md", text=text, outline_hints=[OutlineHint("Key Points", 1, offset=text.index("KeyPoints"))])
+    )
+
+    assert (imported.outline, imported.unplaced_headings) == ((), 1)
+
+
 def test_a_title_not_in_the_text_is_left_out_and_reported() -> None:
     extraction = Extraction(
         "txt", text=BOOK, outline_hints=[OutlineHint("Part One", 1), OutlineHint("Missing Chapter", 2)]

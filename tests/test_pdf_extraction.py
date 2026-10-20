@@ -137,6 +137,30 @@ def test_bookmarks_with_ligature_words_are_placed_under_the_text_layers_spelling
     ]
 
 
+def test_bookmark_is_placed_on_a_heading_line_with_a_ligature_and_merged_words(tmp_path: Path):
+    path, writer = _pdf_with_text(
+        tmp_path,
+        [
+            "Overview of the book. Words on the first page.",
+            r"Sta\257 Ratesfor p> 1",
+        ],
+    )
+    _map_ligature_glyphs(writer)
+    writer.add_outline_item("Overview", 0)
+    writer.add_outline_item("Staff Rates for p >1", 1)
+    extraction = extract_pdf(_save(path, writer), ignore_progress, None)
+
+    imported = assemble(extraction)
+
+    # The text layer spells the heading with a ligature and no space after "Rates".
+    assert "Staﬀ Ratesfor p> 1" in imported.text
+    assert imported.unplaced_headings == 0
+    assert [(e.title, e.page_start, e.page_end) for e in imported.outline] == [
+        ("Overview", 1, 1),
+        ("Staﬀ Ratesfor p> 1", 2, 2),
+    ]
+
+
 def test_pdf_without_bookmarks_has_no_hints(tmp_path: Path):
     path, writer = _pdf_with_text(tmp_path, _BODIES)
     extraction = extract_pdf(_save(path, writer), ignore_progress, None)
