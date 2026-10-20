@@ -179,6 +179,41 @@ def test_main_runs_default_pipeline_without_network(tmp_path: Path, monkeypatch:
     assert [call.operation_id for call in provider.calls] == ["D000001", "editorial-final"]
 
 
+def test_main_runs_reliable_mode_with_a_non_ollama_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "input.txt").write_text("Source.", encoding="utf-8")
+    provider = RecordingProvider("Concise summary.")
+
+    exit_code = main(
+        [
+            "--provider", "openai",
+            "--cache-dir", str(tmp_path / "cache"),
+            "--run-id", "r1",
+            "--audit", str(tmp_path / "audit.json"),
+            "--context-window", "100000",
+        ],
+        provider_factory=lambda _config: provider,
+        counter_factory=counter_factory,
+    )
+
+    assert capsys.readouterr().err == ""
+    assert exit_code == 0
+    assert (tmp_path / "output.txt").read_text(encoding="utf-8") == "Concise summary."
+    assert (tmp_path / "audit.json").exists()
+
+
+def test_parse_args_keeps_the_ollama_host_only_for_ollama() -> None:
+    assert parse_args(["--provider", "openai"]).app.ollama_host == ""
+    assert parse_args(["--provider", "openai", "--ollama-host", "http://gpu:1"]).app.ollama_host == ""
+    assert parse_args(["--provider", "ollama"]).app.ollama_host == "http://localhost:11434"
+    assert (
+        parse_args(["--provider", "ollama", "--ollama-host", "http://gpu:1"]).app.ollama_host
+        == "http://gpu:1"
+    )
+
+
 def test_main_uses_discovered_ollama_context_for_budget_and_requests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

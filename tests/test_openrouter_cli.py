@@ -147,7 +147,6 @@ def test_openrouter_is_a_provider_choice_and_carries_model_and_upstream() -> Non
 def test_an_openrouter_run_carries_no_ollama_host() -> None:
     # A default Ollama host here would make the cache identity reject the run.
     assert parse_args(["--provider", "openrouter", "--model", MODEL]).app.ollama_host == ""
-    assert parse_args([]).app.ollama_host == "http://localhost:11434"
     assert parse_args(["--provider", "ollama"]).app.ollama_host == "http://localhost:11434"
 
 

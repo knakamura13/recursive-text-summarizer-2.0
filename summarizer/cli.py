@@ -195,9 +195,7 @@ def parse_args(argv: list[str] | None = None) -> ParsedConfig:
             output_path=args.output,
             model=args.model,
             provider=args.provider,
-            # The Ollama default must not follow an OpenRouter run into the
-            # cache identity, which rejects a host for any other provider.
-            ollama_host="" if args.provider == "openrouter" else args.ollama_host,
+            ollama_host=args.ollama_host if args.provider == "ollama" else "",
             timeout_seconds=args.timeout,
             openrouter_upstream=args.openrouter_upstream,
         )
