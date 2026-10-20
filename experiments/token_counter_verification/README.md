@@ -1,6 +1,6 @@
 # Verifying a tokenizer.json counter against Ollama (#190)
 
-Ollama models pulled in the newer tensor layout (for example `gemma4:31b` and `gemma4:31b-mlx`) have no GGUF file, so the exact counter of #120 cannot read them. `TokenizerJsonCounter` reads the model's Hugging Face `tokenizer.json` layer instead, but it is refused until its counts have been checked against Ollama's `prompt_eval_count`. Until then the summarizer uses the byte counter and says so in preflight, in the Run and on the command line.
+Ollama models pulled in the newer tensor layout (for example `gemma4:31b` and `gemma4:31b-mlx`) have no GGUF file, so the exact counter of #120 cannot read them. `TokenizerJsonCounter` reads the model's Hugging Face `tokenizer.json` layer instead, but it is refused until its counts have been checked against Ollama's `prompt_eval_count`. Until a tokenizer has been checked the summarizer uses the byte counter and says so in preflight, in the Run and on the command line. One fingerprint, `gemma4:31b`'s, was checked and added on 2026-10-19 (see "Enabled fingerprints" below); every other `tokenizer.json` is still refused.
 
 `verify_ollama_token_counts.py` makes that check. **It runs real model inference**: one warm-up request and 19 fixed probes to an Ollama server on this machine, each limited to one generated token and sent in the summarizer's own request shape (`think: false`). Nothing in the repository runs it. Its tests use a scripted server and a synthetic tokenizer. Its runs against a real server are recorded at the end of this file.
 
@@ -111,6 +111,16 @@ One run, 9 requests (`/private/tmp/rts-token-verification/gemma4-31b-long.{json,
 - Both blank-line probes are 1 lower, so Ollama trims `\n\n` at a message edge as it trimmed the short whitespace probes. `long-markers` is 10 lower, as predicted.
 - No request was counted higher by Ollama than counter plus overhead. The overhead and every boundary and marker gap match what the short runs showed.
 - Still not compared: requests above 6,445 tokens (merges and the editorial reach about 20,000), back-to-back requests that share the leaf instructions as a prefix (the leaf probes were kept apart), the app's real schemas for the other stages, other Ollama versions or runners, `gemma4:31b-mlx` itself (same fingerprint, not run), thinking enabled, and anything near #120's 1,742 requests. The fingerprint was not added.
+
+## Enabled fingerprints
+
+**`gemma4:31b`** (`63e8558fe07c03e6c38b58646e1db85e6d5f72bcd551f0a1f1f28f7114ab6c2a`), added to `_VERIFIED_TOKENIZER_JSON_FINGERPRINTS` on 2026-10-19 after these comparisons, all on Ollama 0.40.6 with the MLX runner and `think: false`:
+
+- The short set (19 probes, second run): 11 clean probes exact at a template overhead of 18, 7 edge-whitespace probes exactly 1 lower, markers 7 lower.
+- The long set (9 requests): 5 clean probes from 2,454 to 6,445 tokens exact at 18, three of them the app's own leaf requests with the Ollama wire schema; both blank-line probes 1 lower; markers 10 lower.
+- No request was counted higher by Ollama than counter plus overhead, in either set.
+
+Not compared: other Ollama versions or runners, requests above about 6,500 tokens (merges and the editorial reach about 20,000), back-to-back requests that share a cached prefix, the other stages' real schemas, thinking enabled, and `gemma4:31b-mlx` by name, which lists the same fingerprint but was not run. A tokenizer that counts differently has another fingerprint and is refused until it is checked the same way.
 
 ## Not covered
 

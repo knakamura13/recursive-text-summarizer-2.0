@@ -372,14 +372,27 @@ _TOKENIZER_JSON_SECTIONS = frozenset(
 )
 
 # Counting fingerprints of tokenizer.json layers whose counts were checked
-# against Ollama's prompt_eval_count (see `_counting_fingerprint`). Empty: no
-# such check has been recorded, so a tokenizer.json is never used silently.
-# Add a fingerprint only with the comparison made by
-# experiments/token_counter_verification, on requests that cover long and
-# non-ASCII text, since the counter must never count fewer tokens than Ollama
-# processes (#120). A tokenizer that counts differently has another
-# fingerprint and stays refused.
-_VERIFIED_TOKENIZER_JSON_FINGERPRINTS: frozenset[str] = frozenset()
+# against Ollama's prompt_eval_count (see `_counting_fingerprint`). A tokenizer
+# that is not listed is never used silently: the byte counter is used and the
+# notice names its fingerprint. Add a fingerprint only with the comparison made
+# by experiments/token_counter_verification, since the counter must never count
+# fewer tokens than Ollama processes (#120). A tokenizer that counts differently
+# has another fingerprint and stays refused.
+_VERIFIED_TOKENIZER_JSON_FINGERPRINTS: frozenset[str] = frozenset(
+    {
+        # gemma4:31b, checked on 2026-10-19 against Ollama 0.40.6 on the MLX
+        # runner with think false (#190). Short set: 19 probes, 11 clean ones
+        # exact at a template overhead of 18, 7 edge-whitespace probes exactly
+        # 1 lower (Ollama trims message edges), markers 7 lower. Long set: 9
+        # requests, 5 clean ones from 2,454 to 6,445 tokens exact at 18 (three
+        # are the app's leaf requests with the Ollama wire schema), blank-line
+        # edges 1 lower, markers 10 lower. No request counted higher by Ollama
+        # than counter plus overhead. Not compared: other Ollama versions or
+        # runners, requests above about 6,500 tokens, thinking enabled, and
+        # gemma4:31b-mlx by name (same fingerprint, not run).
+        "63e8558fe07c03e6c38b58646e1db85e6d5f72bcd551f0a1f1f28f7114ab6c2a",
+    }
+)
 
 
 class _NoTokenizerLayerError(TokenAccountingError):

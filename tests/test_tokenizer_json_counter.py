@@ -152,10 +152,60 @@ def _verify(monkeypatch: pytest.MonkeyPatch, fingerprint: str) -> None:
     )
 
 
-def test_no_tokenizer_json_layer_is_verified_until_it_has_been_checked_against_ollama() -> None:
-    # An empty set is the contract: adding a digest is the act of verification,
-    # and it needs the recorded comparison described in the experiments README.
-    assert tokenization._VERIFIED_TOKENIZER_JSON_FINGERPRINTS == frozenset()
+# The counting fingerprint of gemma4:31b's tokenizer.json, as the verification
+# script printed it on 2026-10-19.
+GEMMA4_31B_FINGERPRINT = "63e8558fe07c03e6c38b58646e1db85e6d5f72bcd551f0a1f1f28f7114ab6c2a"
+
+
+def test_only_the_checked_gemma4_31b_tokenizer_is_verified() -> None:
+    # Adding a fingerprint is the act of verification and needs the recorded
+    # comparison described in the experiments README, so this pins the whole set.
+    assert tokenization._VERIFIED_TOKENIZER_JSON_FINGERPRINTS == frozenset({GEMMA4_31B_FINGERPRINT})
+
+
+def test_a_layer_with_the_verified_fingerprint_is_accepted_without_asking(
+    models_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A synthetic layer cannot hash to the real fingerprint, so its fingerprint is
+    # forced; the gate itself and the constant are the real ones.
+    _tensor_model(models_dir)
+    monkeypatch.setattr(tokenization, "_counting_fingerprint", lambda document: GEMMA4_31B_FINGERPRINT)
+
+    counter = TokenizerJsonCounter.for_ollama_model("big:31b")
+    resolved = resolve_token_counter(provider="ollama", model="big:31b", ollama_host=LOCAL)
+
+    assert counter.fingerprint == GEMMA4_31B_FINGERPRINT and counter.exact is True
+    assert isinstance(resolved, TokenizerJsonCounter) and estimate_notice(resolved) is None
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        GEMMA4_31B_FINGERPRINT[:-1] + "b",
+        "0" + GEMMA4_31B_FINGERPRINT[1:],
+        GEMMA4_31B_FINGERPRINT[:-1],
+        GEMMA4_31B_FINGERPRINT.upper(),
+        "",
+    ],
+)
+def test_a_fingerprint_that_differs_in_any_way_is_still_refused(
+    models_dir: Path, monkeypatch: pytest.MonkeyPatch, other: str
+) -> None:
+    _tensor_model(models_dir)
+    monkeypatch.setattr(tokenization, "_counting_fingerprint", lambda document: other)
+
+    with pytest.raises(TokenAccountingError, match="has not been checked against Ollama"):
+        TokenizerJsonCounter.for_ollama_model("big:31b")
+    resolved = resolve_token_counter(provider="ollama", model="big:31b", ollama_host=LOCAL)
+
+    assert isinstance(resolved, ConservativeUtf8TokenCounter) and "has not been checked" in resolved.reason
+
+
+def test_a_synthetic_tokenizer_is_not_verified_by_the_real_entry(models_dir: Path) -> None:
+    _tensor_model(models_dir)
+
+    with pytest.raises(TokenAccountingError, match="has not been checked against Ollama"):
+        TokenizerJsonCounter.for_ollama_model("big:31b")
 
 
 def test_the_tokenizer_layer_is_found_by_its_content_not_its_position_or_size(
