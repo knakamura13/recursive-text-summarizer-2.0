@@ -1059,3 +1059,13 @@ def test_an_explicit_window_between_the_smaller_and_larger_listed_length_is_allo
     assert provider.window_notice is not None and "8192" in provider.window_notice
     with pytest.raises(ProviderRequestError):
         provider.configure_context_window("x/y", 131_073, timeout_seconds=5)
+
+
+def test_a_boolean_in_body_error_code_is_not_an_http_status() -> None:
+    # `True == 1` in Python; it must not be read as a status code.
+    provider, _ = provider_for(
+        lambda request: httpx.Response(200, json={"error": {"code": True, "message": "x"}})
+    )
+
+    with pytest.raises(ProviderResponseError, match="error response"):
+        provider.generate(REQUEST)
