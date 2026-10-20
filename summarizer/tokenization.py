@@ -438,10 +438,13 @@ class TokenizerJsonCounter:
         except (OSError, ValueError, KeyError, TypeError) as error:
             raise _NoTokenizerLayerError(f"no local Ollama model file for {model!r}") from error
 
-        found: dict[str, Path] = {}
-        for digest in dict.fromkeys(digests):
+        # Check every digest before de-duplicating: a list or object cannot be hashed.
+        for digest in digests:
             if not isinstance(digest, str) or _OLLAMA_LAYER_DIGEST.fullmatch(digest) is None:
                 raise TokenAccountingError(f"malformed layer digest in the manifest of {model!r}")
+
+        found: dict[str, Path] = {}
+        for digest in dict.fromkeys(digests):
             path = root / "blobs" / digest.replace(":", "-")
             try:
                 fingerprint = _tokenizer_json_fingerprint(path)

@@ -361,7 +361,13 @@ def test_a_model_that_is_not_installed_or_not_named_validly_is_refused(
         TokenizerJsonCounter.for_ollama_model(model, allow_unverified=True)
 
 
-@pytest.mark.parametrize("digest", ["sha256:../../../etc/passwd", "sha256:ab", "md5:" + "ab" * 16, 7])
+UNHASHABLE_DIGESTS = [["sha256:" + "ab" * 32], {"sha256": "ab" * 32}, [], {}]
+
+
+@pytest.mark.parametrize(
+    "digest",
+    ["sha256:../../../etc/passwd", "sha256:ab", "md5:" + "ab" * 16, 7, None, True, *UNHASHABLE_DIGESTS],
+)
 def test_a_malformed_layer_digest_is_refused_before_any_path_is_built(
     models_dir: Path, digest: object
 ) -> None:
@@ -371,6 +377,43 @@ def test_a_malformed_layer_digest_is_refused_before_any_path_is_built(
 
     with pytest.raises(TokenAccountingError, match="malformed layer digest"):
         TokenizerJsonCounter.for_ollama_model("big:31b", allow_unverified=True)
+
+
+@pytest.mark.parametrize("digest", UNHASHABLE_DIGESTS)
+def test_a_digest_that_cannot_be_hashed_falls_back_to_bytes_with_the_reason_not_a_crash(
+    models_dir: Path, digest: object
+) -> None:
+    # A list or object digest used to reach dict.fromkeys and raise TypeError,
+    # which the resolver does not catch, so preflight and the CLI crashed.
+    good = hashlib.sha256(b"x").hexdigest()
+    manifest = models_dir / "manifests" / "registry.ollama.ai" / "library" / "big" / "31b"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "layers": [
+                    {"mediaType": JSON_LAYER, "digest": "sha256:" + good},
+                    {"mediaType": JSON_LAYER, "digest": digest},
+                ]
+            }
+        )
+    )
+
+    counter = resolve_token_counter(provider="ollama", model="big:31b", ollama_host=LOCAL)
+
+    assert isinstance(counter, ConservativeUtf8TokenCounter)
+    assert "malformed layer digest" in counter.reason
+    notice = estimate_notice(counter)
+    assert notice is not None and "malformed layer digest" in notice
+
+
+def test_a_valid_digest_listed_twice_is_still_one_layer_after_the_digests_are_checked(
+    models_dir: Path,
+) -> None:
+    tokenizer = _tokenizer_json()
+    _install_layers(models_dir, "big", "31b", [(JSON_LAYER, tokenizer), (JSON_LAYER, tokenizer)])
+
+    assert TokenizerJsonCounter.for_ollama_model("big:31b", allow_unverified=True).count("ab") == 1
 
 
 def test_an_unverified_tokenizer_is_refused_by_default(models_dir: Path) -> None:
