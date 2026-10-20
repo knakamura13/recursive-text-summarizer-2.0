@@ -31,6 +31,14 @@ the app's real leaf requests, built with ``build_leaf_request`` from passages of
 committed public-domain novels and sent with the Ollama wire schema, so the large
 schema is tested against the prompt count too. The same three kinds apply.
 
+The observed template overhead must also fit the smallest reserve the app applies
+to a request. No budget charges the chat template by name. Every budget charges
+the stage's schema as prompt tokens, which Ollama sends as a grammar and does not
+count, and every budget subtracts a safety margin, so the template is covered by
+the smallest schema term plus the default margin floor. Both numbers are derived
+from the app's own schemas and ``StrategyConfig`` and printed beside the observed
+overhead; the run fails when the overhead is larger.
+
 A pass prints the counting fingerprint to add to
 ``_VERIFIED_TOKENIZER_JSON_FINGERPRINTS`` in ``summarizer/tokenization.py``. The
 fixed set is a smoke check on a few dozen tokens each, so say in the commit that
@@ -59,9 +67,18 @@ import httpx
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT))
 
+from summarizer import verification  # noqa: E402
+from summarizer.compression import compression_draft_schema  # noqa: E402
+from summarizer.config import StrategyConfig  # noqa: E402
+from summarizer.editorial import final_draft_schema  # noqa: E402
 from summarizer.leaf import build_leaf_request  # noqa: E402
 from summarizer.providers.ollama import _local_response_schema  # noqa: E402
 from summarizer.segmentation import BoundaryKind, SourceSegment  # noqa: E402
+from summarizer.summaries import (  # noqa: E402
+    MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES,
+    MAX_QUOTE_CANDIDATE_JSON_BYTES,
+    leaf_summary_schema,
+)
 from summarizer.tokenization import (  # noqa: E402
     TokenAccountingError,
     TokenCounter,
@@ -253,6 +270,59 @@ class Verdict:
     notes: list[str]
 
 
+@dataclass(frozen=True)
+class Reserve:
+    """The smallest allowance the app makes, in every request, for what its counter does not see."""
+
+    tokens: int
+    schema_term: int
+    schema_stage: str
+    margin: int
+
+
+def schema_terms(counter: TokenCounter) -> dict[str, int]:
+    """The schema term each stage's request budget charges, counted as that budget counts it.
+
+    Ollama sends the schema as a grammar rather than prompt tokens, so the term
+    is slack the budget holds back, and the chat template fits inside it.
+    """
+
+    def compact(schema: object) -> int:
+        return counter.count(json.dumps(schema, separators=(",", ":")))
+
+    terms = {
+        # budget.measure_overhead: the compact schema, the quote candidates and the Ollama schema reserve.
+        "leaf and merge": counter.count(json.dumps(leaf_summary_schema(), separators=(",", ":"), sort_keys=True))
+        + MAX_QUOTE_CANDIDATE_JSON_BYTES
+        + MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES,
+        "editorial": compact(final_draft_schema()),
+        "compression": compact(compression_draft_schema()),
+    }
+    # The verification stage's response models are module-private; a stage that
+    # cannot be found is left out rather than guessed.
+    for stage, name in (
+        ("verification anchors", "_AnchorResponse"),
+        ("verification findings", "_FindingResponse"),
+        ("verification repairs", "_RepairResponse"),
+    ):
+        model = getattr(verification, name, None)
+        if model is not None:
+            terms[stage] = compact(model.model_json_schema())
+    return terms
+
+
+def app_reserve(counter: TokenCounter) -> Reserve:
+    """The smallest schema term plus the default safety margin.
+
+    The margin used is the fixed floor, because the margin is the larger of that
+    and a fraction of the window and so is never smaller.
+    """
+    terms = schema_terms(counter)
+    stage = min(terms, key=terms.__getitem__)
+    margin = StrategyConfig().safety_margin_tokens
+    return Reserve(tokens=terms[stage] + margin, schema_term=terms[stage], schema_stage=stage, margin=margin)
+
+
 def counted_tokens(counter: TokenCounter, probe: Probe) -> int:
     """What the counter says the prompt costs, before the chat template."""
     return counter.count(probe.system) + counter.count(probe.user)
@@ -283,11 +353,17 @@ def ask(client: httpx.Client, model: str, probe: Probe) -> int | None:
     return count if isinstance(count, int) and not isinstance(count, bool) else None
 
 
-def judge(measurements: Sequence[Measurement], *, reference_overhead: int = REFERENCE_OVERHEAD) -> Verdict:
+def judge(
+    measurements: Sequence[Measurement],
+    *,
+    reference_overhead: int = REFERENCE_OVERHEAD,
+    reserve: Reserve | None = None,
+) -> Verdict:
     """Decide whether the counter never counts fewer tokens than Ollama processed.
 
     Clean probes set the overhead and must agree exactly. Boundary and marker
-    probes only need ``reported <= counted + overhead``.
+    probes only need ``reported <= counted + overhead``. With a `reserve`, the
+    overhead must also not exceed it.
     """
     problems: list[str] = []
     notes: list[str] = []
@@ -318,8 +394,13 @@ def judge(measurements: Sequence[Measurement], *, reference_overhead: int = REFE
         if overhead != reference_overhead:
             notes.append(
                 f"observed template overhead is {overhead}, not the {reference_overhead} #120 measured for gemma4 "
-                "on Ollama 0.34.4; the counter's counts are unaffected. No summarizer budget charges the template "
-                "by name, so it matters only if it exceeds the slack in the schema term and the safety margin"
+                "on Ollama 0.34.4; the counter's counts are unaffected"
+            )
+        if reserve is not None and overhead > reserve.tokens:
+            problems.append(
+                f"the observed template overhead of {overhead} tokens exceeds the smallest reserve the app applies "
+                f"({reserve.tokens} = {reserve.schema_term} {reserve.schema_stage} schema term + {reserve.margin} "
+                "default safety margin), so a request budget could undercount the prompt"
             )
         for measurement in measurements:
             if measurement.kind == "clean" or measurement.reported is None:
@@ -428,8 +509,14 @@ def main(argv: Sequence[str] | None = None, *, client: httpx.Client | None = Non
         if owned:
             http.close()
 
-    verdict = judge(measurements)
+    reserve = app_reserve(counter)
+    verdict = judge(measurements, reserve=reserve)
     _print_table(measurements)
+    if verdict.overhead is not None:
+        print(
+            f"template overhead: observed {verdict.overhead} tokens; reserve {reserve.tokens} "
+            f"({reserve.schema_term} {reserve.schema_stage} schema term + {reserve.margin} default safety margin)"
+        )
     for note in verdict.notes:
         print(f"note: {note}")
     for problem in verdict.problems:
@@ -451,6 +538,7 @@ def main(argv: Sequence[str] | None = None, *, client: httpx.Client | None = Non
             "fingerprint": counter.fingerprint,
             "passed": verdict.passed,
             "overhead": verdict.overhead,
+            "reserve": asdict(reserve),
             "problems": verdict.problems,
             "notes": verdict.notes,
             "requests": [asdict(m) | {"overhead": m.overhead} for m in measurements],

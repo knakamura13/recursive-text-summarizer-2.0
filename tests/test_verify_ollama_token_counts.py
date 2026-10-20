@@ -15,6 +15,9 @@ from types import ModuleType
 import httpx
 import pytest
 
+from summarizer.compression import compression_draft_schema
+from summarizer.config import StrategyConfig
+from summarizer.editorial import final_draft_schema
 from summarizer.summaries import leaf_summary_schema
 from summarizer.tokenization import TokenizerJsonCounter
 from tests.test_tokenizer_json_counter import _tensor_model
@@ -641,3 +644,107 @@ def test_long_passages_end_at_a_sentence_and_start_at_a_paragraph(models_dir: Pa
         text = long[name].user.strip()
         assert text[-1] in ".!?\"”’)", (name, text[-40:])
         assert text[0].isupper() or text[0] in "\"“‘(", (name, text[:40])
+
+
+# --- the reserve ----------------------------------------------------------------
+
+
+def test_the_reserve_is_the_apps_smallest_schema_term_plus_its_default_safety_margin(
+    models_dir: Path,
+) -> None:
+    counter = _counter(models_dir)
+
+    reserve = verify.app_reserve(counter)
+    terms = verify.schema_terms(counter)
+
+    assert reserve.margin == StrategyConfig().safety_margin_tokens
+    assert reserve.schema_term == min(terms.values()) and terms[reserve.schema_stage] == reserve.schema_term
+    assert reserve.tokens == reserve.schema_term + reserve.margin
+    # Every stage whose request budget charges a schema is listed.
+    assert {"leaf and merge", "editorial", "compression"} <= set(terms)
+    assert all(term > 0 for term in terms.values())
+
+
+def test_the_schema_terms_are_counted_the_way_the_budgets_count_them(models_dir: Path) -> None:
+    counter = _counter(models_dir)
+    terms = verify.schema_terms(counter)
+
+    assert terms["editorial"] == counter.count(json.dumps(final_draft_schema(), separators=(",", ":")))
+    assert terms["compression"] == counter.count(json.dumps(compression_draft_schema(), separators=(",", ":")))
+    # The leaf and merge budget adds the quote-candidate bytes and the Ollama schema reserve.
+    assert terms["leaf and merge"] > counter.count(
+        json.dumps(leaf_summary_schema(), separators=(",", ":"), sort_keys=True)
+    )
+
+
+def _reserve(tokens: int = 289) -> object:
+    return verify.Reserve(tokens=tokens, schema_term=33, schema_stage="editorial", margin=tokens - 33)
+
+
+def _clean(overhead: int) -> list:
+    return [_m(name, "clean", 5 + i, 5 + i + overhead) for i, name in enumerate("abc")]
+
+
+def test_judge_passes_an_overhead_at_or_below_the_reserve() -> None:
+    for overhead in (18, 288, 289):
+        verdict = verify.judge(_clean(overhead), reserve=_reserve())
+
+        assert verdict.passed is True, overhead
+        assert verdict.overhead == overhead
+
+
+def test_judge_fails_an_overhead_above_the_reserve_and_prints_both_numbers() -> None:
+    verdict = verify.judge(_clean(290), reserve=_reserve())
+
+    assert verdict.passed is False
+    [problem] = verdict.problems
+    assert "290" in problem and "289" in problem
+    assert "33" in problem and "editorial" in problem and "256" in problem
+
+
+def test_judge_without_a_reserve_does_not_apply_the_check() -> None:
+    assert verify.judge(_clean(10_000)).passed is True
+
+
+def test_the_run_prints_the_observed_overhead_beside_the_reserve(
+    models_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    reserve = verify.app_reserve(_counter(models_dir))
+
+    code, _ = _run(models_dir)
+
+    out = capsys.readouterr().out
+    assert code == verify.EXIT_PASSED
+    assert f"observed {TEMPLATE} tokens" in out and f"reserve {reserve.tokens}" in out
+    assert f"{reserve.schema_term} {reserve.schema_stage} schema term" in out and f"{reserve.margin} default safety margin" in out
+
+
+def test_a_run_whose_overhead_equals_the_reserve_passes(models_dir: Path) -> None:
+    reserve = verify.app_reserve(_counter(models_dir))
+
+    code, _ = _run(models_dir, template=reserve.tokens)
+
+    assert code == verify.EXIT_PASSED
+
+
+def test_a_run_whose_overhead_is_one_above_the_reserve_fails(
+    models_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    reserve = verify.app_reserve(_counter(models_dir))
+
+    code, _ = _run(models_dir, template=reserve.tokens + 1)
+
+    out = capsys.readouterr().out
+    assert code == verify.EXIT_FAILED
+    assert f"exceeds the smallest reserve the app applies ({reserve.tokens}" in out
+    assert "FAILED" in out and "PASSED" not in out
+
+
+def test_a_dry_run_has_no_overhead_to_check(models_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"dry run sent {request.url}")
+
+    client = httpx.Client(base_url="http://localhost:11434", transport=httpx.MockTransport(refuse))
+    code = verify.main(["--model", "big:31b", "--models-dir", str(models_dir), "--dry-run"], client=client)
+
+    assert code == verify.EXIT_PASSED and "reserve" not in capsys.readouterr().out
