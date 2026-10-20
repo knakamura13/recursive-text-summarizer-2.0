@@ -233,7 +233,7 @@
 					<div>
 						<dt>Document</dt>
 						<dd>
-							about {formatCount(preflight.document_tokens)} tokens{#if preflight.token_counts_estimated}{' '}(estimated){/if}
+							about {formatCount(preflight.document_tokens)} tokens{#if preflight.token_counts_estimated}{' '}(upper bound){/if}
 						</dd>
 					</div>
 				{/if}

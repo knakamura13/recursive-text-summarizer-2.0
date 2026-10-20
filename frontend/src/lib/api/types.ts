@@ -195,7 +195,7 @@ export interface Preflight {
 	context_window_tokens: number | null;
 	context_window_source: 'configured' | 'model' | 'assumed' | null;
 	provider: ProviderName | null;
-	/** True when the token counts behind these estimates are not exact. */
+	/** True when the token counts are not exact; for OpenRouter they are a UTF-8 byte upper bound. */
 	token_counts_estimated: boolean | null;
 	usable_input_capacity: number | null;
 	document_tokens: number | null;

@@ -29,7 +29,7 @@ test('choosing OpenRouter swaps the model list for a typed name and an upstream 
 			model_installed: null,
 			errors: [],
 			warnings: [
-				{ code: 'token_counts_estimated', message: 'Token counts are estimates.', severity: 'warning' }
+				{ code: 'token_counts_estimated', message: 'Token counts are an upper bound.', severity: 'warning' }
 			]
 		}
 	}));
@@ -47,8 +47,8 @@ test('choosing OpenRouter swaps the model list for a typed name and an upstream 
 	await page.getByLabel('Upstream provider (optional)').fill('deepinfra');
 
 	await expect(page.getByText('listed by OpenRouter')).toBeVisible();
-	await expect(page.getByText('(estimated)')).toBeVisible();
-	await expect(page.getByText('Token counts are estimates.')).toBeVisible();
+	await expect(page.getByText('(upper bound)')).toBeVisible();
+	await expect(page.getByText('Token counts are an upper bound.')).toBeVisible();
 	await expect(page.getByRole('button', { name: 'Start Run' })).toBeEnabled();
 
 	await page.getByRole('button', { name: 'Start Run' }).click();
@@ -107,7 +107,7 @@ test('a server without a key blocks Start with a reason and no duplicate', async
 	await expect(page.locator('#start-reasons').getByText('OpenRouter needs an API key.')).toHaveCount(1);
 });
 
-test('the estimated label is separated from the token count', async ({ page }) => {
+test('the upper-bound label is separated from the token count', async ({ page }) => {
 	const mock = await MockApi.install(page, seed());
 	mock.on('POST', '/preflight', () => ({
 		json: {
@@ -131,7 +131,7 @@ test('the estimated label is separated from the token count', async ({ page }) =
 	await page.getByLabel('Provider', { exact: true }).selectOption('openrouter');
 	await page.getByLabel('Model', { exact: true }).fill(MODEL);
 
-	await expect(page.locator('.facts')).toContainText('about 600 tokens (estimated)');
+	await expect(page.locator('.facts')).toContainText('about 600 tokens (upper bound)');
 });
 
 test('Settings reports whether the server has a key and never asks for it', async ({ page }) => {

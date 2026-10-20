@@ -19,7 +19,7 @@ from summarizer.cli import build_provider, main, parse_args
 from summarizer.config import AppConfig
 from summarizer.providers.base import ModelProvider
 from summarizer.providers.openrouter import OpenRouterProvider
-from summarizer.tokenization import ScaledTiktokenCounter
+from summarizer.tokenization import ConservativeUtf8TokenCounter
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = Path(__file__).parent / "fixtures" / "openrouter"
@@ -31,20 +31,10 @@ SOURCE = (
 )
 
 
-class _FakeEncoding:
-    name = "o200k_base"
-
-    def encode_ordinary(self, text: str) -> list[int]:
-        return list(range((len(text) + 3) // 4))
-
-
 @pytest.fixture(autouse=True)
 def environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    import tiktoken
-
     monkeypatch.setenv("OPENROUTER_API_KEY", KEY)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setattr(tiktoken, "get_encoding", lambda name: _FakeEncoding())
     monkeypatch.chdir(tmp_path)
     (tmp_path / "input.txt").write_text(SOURCE, encoding="utf-8")
 
@@ -201,11 +191,12 @@ def test_build_provider_passes_the_pinned_upstream_and_builds_nothing_else() -> 
     assert constructions == [("openrouter", {"upstream": "deepinfra"})]
 
 
-def test_build_counter_gives_a_labeled_estimate_for_openrouter() -> None:
+def test_build_counter_gives_a_labeled_byte_upper_bound_for_openrouter() -> None:
     counter = cli.build_counter(AppConfig(provider="openrouter", model=MODEL))
 
-    assert isinstance(counter, ScaledTiktokenCounter)
+    assert isinstance(counter, ConservativeUtf8TokenCounter)
     assert counter.exact is False
+    assert counter.identity == "estimate:utf8-bytes-upper-bound"
 
 
 def test_help_documents_the_openrouter_flag_and_provider() -> None:
@@ -240,20 +231,39 @@ def test_dry_run_reports_provider_model_upstream_window_source_and_estimates(
     assert f"Model: {MODEL}" in captured.out
     assert "Upstream: deepinfra (pinned)" in captured.out
     assert "Context window source: explicit" in captured.out
-    assert "Token counts: estimate (estimate:o200k_base-x1.5)" in captured.out
-    assert "estimates" in captured.err
+    assert "Token counts: estimate (estimate:utf8-bytes-upper-bound)" in captured.out
+    assert "upper bound" in captured.err
     assert KEY not in captured.out + captured.err
 
 
 def test_dry_run_without_a_window_says_it_is_assumed_and_how_to_set_it(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    code = main(["--provider", "openrouter", "--model", MODEL, "--dry-run"])
+    code = main(
+        ["--provider", "openrouter", "--model", MODEL, "--max-output-tokens", "1024", "--dry-run"]
+    )
 
     out = capsys.readouterr().out
     assert code == 0
     assert "Upstream: not pinned" in out
     assert re.search(r"Context window source: assumed.*--context-window", out)
+
+
+def test_the_byte_upper_bound_cannot_hold_the_default_output_allowance_in_an_8k_window(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The trade-off of counting bytes: the schema and instructions cost about
+    # four times what a real tokenizer charges, so an 8k window has no room at
+    # the default 4096-token output allowance. The message says which limit it is.
+    argv = ["--provider", "openrouter", "--model", MODEL, "--context-window", "8192", "--dry-run"]
+
+    code = main(argv)
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "no_input_capacity" in captured.err
+    assert "limit of the request configuration" in captured.err
+    assert main([*argv, "--max-output-tokens", "1024"]) == 0
 
 
 def test_dry_run_output_for_existing_providers_is_unchanged(
@@ -318,7 +328,7 @@ def test_a_run_publishes_through_verification_and_audit_with_openrouter_identity
 
     # The window came from the listing, counts are labeled, requests are logged.
     assert "Context window: 131072 tokens (OpenRouter model listing)" in err
-    assert "Token counts are estimates" in err
+    assert "Token counts are an upper bound" in err
     assert f"OpenRouter chat requests: {len(wire.chat)}" in err
     assert built[0].request_count == len(wire.chat)
 

@@ -9,10 +9,10 @@ import pytest
 from summarizer.tokenization import (
     ConservativeUtf8TokenCounter,
     GgufTokenCounter,
-    ScaledTiktokenCounter,
     TiktokenCounter,
     TokenAccountingError,
     TokenCounter,
+    OPENROUTER_COUNTER_IDENTITY,
     estimate_notice,
     resolve_token_counter,
 )
@@ -375,69 +375,76 @@ def test_tiktoken_prefix_search_is_bounded_near_the_budget() -> None:
     assert encoding.total_characters < 100_000
 
 
-class _FakeEncoding:
-    """One token per four characters, rounded up, like a coarse BPE."""
-
-    name = "o200k_base"
-
-    def encode_ordinary(self, text: str) -> list[int]:
-        return list(range((len(text) + 3) // 4))
-
-
-def _patch_encoding(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+def _forbid_tiktoken(monkeypatch: pytest.MonkeyPatch) -> None:
     import tiktoken
 
-    requested: list[str] = []
+    def fail(*args: object, **kwargs: object) -> None:
+        raise AssertionError("OpenRouter counting must not load a tiktoken vocabulary")
 
-    def get_encoding(name: str) -> _FakeEncoding:
-        requested.append(name)
-        return _FakeEncoding()
-
-    def encoding_for_model(model: str) -> None:
-        raise AssertionError(f"model-name lookup must not be used for {model!r}")
-
-    monkeypatch.setattr(tiktoken, "get_encoding", get_encoding)
-    monkeypatch.setattr(tiktoken, "encoding_for_model", encoding_for_model)
-    return requested
+    monkeypatch.setattr(tiktoken, "get_encoding", fail)
+    monkeypatch.setattr(tiktoken, "encoding_for_model", fail)
 
 
-def test_openrouter_counts_are_a_labeled_estimate_scaled_above_the_base_encoding(
+def test_openrouter_counts_one_token_per_utf8_byte_and_labels_it_an_upper_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    requested = _patch_encoding(monkeypatch)
+    _forbid_tiktoken(monkeypatch)
 
     counter = resolve_token_counter(provider="openrouter", model="vendor/model-70b:free")
 
-    assert requested == ["o200k_base"]
-    assert isinstance(counter, ScaledTiktokenCounter)
+    assert isinstance(counter, ConservativeUtf8TokenCounter)
     assert counter.exact is False
-    assert counter.monotonic is False
-    assert counter.identity == "estimate:o200k_base-x1.5"
-    assert counter.count("x" * 40) == 15  # 10 base tokens, scaled and rounded up
-    assert counter.count("x" * 41) == 17  # 11 base tokens -> 16.5 -> 17
+    assert counter.monotonic is True
+    assert counter.identity == OPENROUTER_COUNTER_IDENTITY == "estimate:utf8-bytes-upper-bound"
     assert counter.count("") == 0
+    assert counter.count("plain") == 5
+    assert counter.count("café") == 5  # two bytes for é
+    assert counter.count("日本語") == 9
+    assert counter.count("🙂") == 4
 
 
-def test_the_estimate_never_counts_below_the_base_encoding(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch_encoding(monkeypatch)
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The committee met on Tuesday to review the harbor proposal. " * 40,
+        "日本語のテキストはトークンあたり複数バイトを使います。" * 30,
+        "def f(x):\n    return [i * 2 for i in range(x)]\n" * 40,
+        "🙂🙃😀 emoji and ünïcödé mixed with ASCII. " * 30,
+        "".join(chr(code) for code in range(0x20, 0x2FF)) * 3,
+    ],
+    ids=["english", "cjk", "code", "emoji", "latin-range"],
+)
+def test_the_byte_count_never_falls_below_a_real_tokenizers_count(text: str) -> None:
+    """Byte-level BPE emits at least one byte per token, so bytes bound tokens.
+
+    Checked against o200k_base as a sanity check of that reasoning; the counter
+    itself loads no vocabulary. The skip covers vocabulary availability alone.
+    """
+    import tiktoken
+
+    try:
+        encoding = tiktoken.get_encoding("o200k_base")
+    except Exception as error:  # noqa: BLE001 - any load failure means no vocabulary
+        pytest.skip(f"tiktoken vocabulary is unavailable offline: {error}")
     counter = resolve_token_counter(provider="openrouter", model="vendor/model")
-    base = _FakeEncoding()
 
-    for length in (0, 1, 2, 3, 4, 5, 97, 1000):
-        text = "y" * length
-        assert counter.count(text) >= len(base.encode_ordinary(text))
+    assert counter.count(text) >= len(encoding.encode_ordinary(text))
 
 
-def test_the_estimate_identity_is_acceptable_to_the_cache_and_audit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_the_openrouter_label_does_not_change_the_ollama_fallback_label() -> None:
+    ollama = resolve_token_counter(
+        provider="ollama", model="unlisted:model", ollama_host="http://gpu-box:11434"
+    )
+
+    assert ollama.identity == "estimate:utf8-bytes"
+    assert resolve_token_counter(provider="openrouter", model="v/m").identity != ollama.identity
+
+
+def test_the_openrouter_label_is_acceptable_to_the_cache_identity() -> None:
     import hashlib
 
     from summarizer.cache import CacheDescriptor
 
-    _patch_encoding(monkeypatch)
     counter = resolve_token_counter(provider="openrouter", model="vendor/model")
 
     descriptor = CacheDescriptor(
@@ -458,12 +465,9 @@ def test_the_estimate_identity_is_acceptable_to_the_cache_and_audit(
     assert descriptor.counter_exact is False
 
 
-def test_estimate_prefix_and_suffix_searches_return_verified_fitting_slices(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch_encoding(monkeypatch)
+def test_byte_prefix_and_suffix_searches_return_verified_fitting_slices() -> None:
     counter = resolve_token_counter(provider="openrouter", model="vendor/model")
-    text = "word " * 400
+    text = "word é " * 400
 
     end = counter.fitting_prefix(text, 0, len(text), 50)
     start = counter.fitting_suffix(text, 0, len(text), 50)
@@ -472,51 +476,41 @@ def test_estimate_prefix_and_suffix_searches_return_verified_fitting_slices(
     assert 0 < start < len(text) and counter.count(text[start:]) <= 50
 
 
-@pytest.mark.parametrize("failure", [OSError("offline"), ValueError("hash mismatch")])
-def test_an_unloadable_encoding_falls_back_to_bytes_and_still_says_estimate(
-    monkeypatch: pytest.MonkeyPatch, failure: Exception
-) -> None:
-    import tiktoken
-
-    def fail(name: str) -> None:
-        raise failure
-
-    monkeypatch.setattr(tiktoken, "get_encoding", fail)
-
-    counter = resolve_token_counter(provider="openrouter", model="vendor/model")
-
-    assert isinstance(counter, ConservativeUtf8TokenCounter)
-    assert counter.exact is False
-    notice = estimate_notice(counter)
-    assert notice is not None and counter.identity in notice
-
-
 def test_provider_name_matching_ignores_case_and_whitespace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_encoding(monkeypatch)
+    _forbid_tiktoken(monkeypatch)
 
     counter = resolve_token_counter(provider=" OpenRouter ", model="vendor/model")
 
-    assert isinstance(counter, ScaledTiktokenCounter)
+    assert counter.identity == OPENROUTER_COUNTER_IDENTITY
 
 
-def test_estimate_notice_is_silent_for_exact_counters_and_names_inexact_ones(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_estimate_notice_is_silent_for_exact_counters() -> None:
     assert estimate_notice(CharacterCounter()) is None
-    _patch_encoding(monkeypatch)
-    estimated = resolve_token_counter(provider="openrouter", model="vendor/model")
 
-    notice = estimate_notice(estimated)
+
+def test_the_openrouter_notice_says_upper_bound_and_why_budgets_shrink() -> None:
+    notice = estimate_notice(resolve_token_counter(provider="openrouter", model="vendor/model"))
 
     assert notice is not None
-    assert "estimate" in notice
-    assert estimated.identity in notice
-    assert "tokenizer" in notice
+    assert "upper bound" in notice
+    assert "UTF-8 byte" in notice
+    assert OPENROUTER_COUNTER_IDENTITY in notice
+    assert "smaller" in notice
 
 
-@pytest.mark.parametrize("factor", [0.99, 0.0, -1.0, float("nan"), float("inf")])
-def test_an_estimate_factor_below_one_or_not_finite_is_refused(factor: float) -> None:
-    with pytest.raises(TokenAccountingError, match="factor"):
-        ScaledTiktokenCounter(_FakeEncoding(), factor)
+def test_the_notice_for_any_other_inexact_counter_stays_generic() -> None:
+    @dataclass(frozen=True)
+    class Rough:
+        identity: str = "estimate:rough"
+        exact: bool = False
+        monotonic: bool = True
+
+        def count(self, text: str) -> int:
+            return len(text) // 3
+
+    notice = estimate_notice(Rough())
+
+    assert notice is not None and "estimates" in notice and "estimate:rough" in notice
+    assert "upper bound" not in notice

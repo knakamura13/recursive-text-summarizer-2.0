@@ -34,13 +34,6 @@ from tests.support.web_runs import seed_document as seed_run_document
 from tests.support.web_runs import seed_run
 from tests.support.web_views import csrf_headers, seed_document, web_client
 
-class _FakeEncoding:
-    name = "o200k_base"
-
-    def encode_ordinary(self, text: str) -> list[int]:
-        return list(range((len(text) + 3) // 4))
-
-
 KEY = "sk-or-v1-testsentinel0123456789abcdef0123456789abcdef"
 MODEL = "meta-llama/llama-3.3-70b-instruct"
 FIXTURES = Path(__file__).parent / "fixtures" / "openrouter"
@@ -49,10 +42,7 @@ SHORT_TEXT = "The bridge deck spans 200 feet across the river. Engineers inspect
 
 @pytest.fixture(autouse=True)
 def environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    import tiktoken
-
     monkeypatch.setenv("OPENROUTER_API_KEY", KEY)
-    monkeypatch.setattr(tiktoken, "get_encoding", lambda name: _FakeEncoding())
 
 
 @pytest.fixture()
@@ -210,7 +200,7 @@ def test_preflight_uses_the_listed_window_estimated_counts_and_never_touches_oll
     assert KEY not in json.dumps(result)
 
 
-def test_the_estimate_warning_states_the_counter(
+def test_the_estimate_warning_states_the_byte_upper_bound(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seed_document(text=SHORT_TEXT)
@@ -222,7 +212,8 @@ def test_the_estimate_warning_states_the_counter(
         if notice["code"] == "token_counts_estimated"
     )
 
-    assert "estimate:o200k_base-x1.5" in warning["message"]
+    assert "estimate:utf8-bytes-upper-bound" in warning["message"]
+    assert "upper bound" in warning["message"]
 
 
 def test_a_missing_key_is_a_coded_error_before_any_request(
@@ -455,7 +446,7 @@ def test_the_run_summary_view_shows_the_estimate_notice(
         notices = client.get(f"/api/v1/runs/{run_id}/summary").json()["notices"]
 
     estimate = [notice for notice in notices if notice["code"] == "token_counts_estimated"]
-    assert estimate and "estimate" in estimate[0]["message"]
+    assert estimate and "upper bound" in estimate[0]["message"]
 
 
 def test_an_ollama_run_adds_no_estimate_warning(
@@ -680,12 +671,11 @@ def test_the_failure_message_is_scrubbed_even_for_an_unclassified_error(
     assert "[REDACTED]" in failure["message"]
 
 
-def test_the_scaled_estimate_uses_its_factor_per_output_token_in_preflight() -> None:
-    from summarizer.tokenization import ScaledTiktokenCounter
+def test_preflight_charges_four_counter_units_per_output_token_for_the_byte_counter() -> None:
+    from summarizer.tokenization import resolve_token_counter
     from summarizer_web.services.preflight_service import _output_units_per_token
 
-    assert _output_units_per_token(ScaledTiktokenCounter(_FakeEncoding(), 1.5)) == 2
-    assert _output_units_per_token(ScaledTiktokenCounter(_FakeEncoding(), 1.0)) == 1
+    assert _output_units_per_token(resolve_token_counter(provider="openrouter", model="v/m")) == 4
 
 
 def test_an_estimate_counter_never_uses_the_ollama_schema_reserve(

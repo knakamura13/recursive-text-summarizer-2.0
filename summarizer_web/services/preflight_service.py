@@ -34,7 +34,6 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import replace
-from math import ceil
 from threading import Lock
 from typing import Any
 
@@ -59,12 +58,7 @@ from summarizer.providers.openrouter import ContextWindowTooLargeError
 from summarizer.providers.ollama import DEFAULT_OLLAMA_CONTEXT_WINDOW
 from summarizer.segmentation import SegmentationConfig, SegmentationError, segment_document
 from summarizer.summaries import MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
-from summarizer.tokenization import (
-    ScaledTiktokenCounter,
-    TokenCounter,
-    estimate_notice,
-    resolve_token_counter,
-)
+from summarizer.tokenization import TokenCounter, estimate_notice, resolve_token_counter
 from summarizer_web.errors import ApiError
 from summarizer_web.models.api import Notice, PreflightResponse, RunConfig
 from summarizer_web.services.documents_service import (
@@ -533,14 +527,10 @@ def _tree_estimate(
 def _output_units_per_token(counter: TokenCounter) -> int:
     """How many counter units one model output token can cost.
 
-    An exact counter charges one. The byte counter charges about four per
-    token. A scaled estimate charges its factor, rounded up.
+    An exact counter charges one. The byte counters charge about four per
+    token of English output.
     """
-    if counter.exact:
-        return 1
-    if isinstance(counter, ScaledTiktokenCounter):
-        return ceil(counter.factor)
-    return _BYTES_PER_OUTPUT_TOKEN
+    return 1 if counter.exact else _BYTES_PER_OUTPUT_TOKEN
 
 
 def _leaf_count(

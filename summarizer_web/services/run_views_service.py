@@ -96,8 +96,9 @@ _NOTICE_TEXT: dict[str, tuple[Literal["info", "warning", "error"], str]] = {
     ),
     "token_counts_estimated": (
         "info",
-        "Token counts for this Run are estimates, not the model's own tokenizer, so "
-        "segments may be smaller than the context window requires.",
+        "Token counts for this Run are an upper bound (one per UTF-8 byte), not the "
+        "model's own tokenizer, so segments can be several times smaller than the "
+        "context window allows.",
     ),
     "verified_sentence_subset": (
         "warning",
