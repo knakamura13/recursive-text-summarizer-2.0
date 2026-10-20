@@ -12,6 +12,14 @@ Warnings: ``ollama_unreachable`` (the installed models could not be fetched),
 ``context_window_assumed`` (the context lookup failed), ``merge_capacity`` (a merge request may not hold two leaf summaries), and
 ``budget`` when the only window known is the assumed one.
 
+For an OpenRouter Run the Ollama checks are skipped. Errors: ``openrouter_key_missing`` (the server's
+environment has no key), ``openrouter_key_rejected`` (the model listing refused it). Warnings:
+``token_counts_estimated`` (the counts behind every estimate are not exact), ``third_party_processing``
+(the document text leaves this machine and each request is billed), ``context_window_note`` (a
+caveat about the window: a pinned upstream may have a smaller one, or the model was matched through its base), and ``context_window_assumed``
+when the model listing was unusable. The window is the explicit value bounded by the listing, else
+the listing, else assumed, as the worker resolves it.
+
 The context window is resolved as the worker resolves it: a configured window
 is used as is, otherwise min(model maximum, DEFAULT_OLLAMA_CONTEXT_WINDOW)
 from ``/api/show``; an unknown model window blocks preflight unless configured.
@@ -45,10 +53,12 @@ from summarizer.hierarchy import plan_merge_request
 from summarizer.ingestion import SourceDocument
 from summarizer.merge import child_fence_tokens
 from summarizer.pipeline import leaf_segmentation, plan_run_requests
+from summarizer.providers.base import ProviderAuthenticationError, ProviderError
+from summarizer.providers.openrouter import ContextWindowTooLargeError
 from summarizer.providers.ollama import DEFAULT_OLLAMA_CONTEXT_WINDOW
 from summarizer.segmentation import SegmentationConfig, SegmentationError, segment_document
 from summarizer.summaries import MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
-from summarizer.tokenization import TokenCounter, resolve_token_counter
+from summarizer.tokenization import TokenCounter, estimate_notice, resolve_token_counter
 from summarizer_web.errors import ApiError
 from summarizer_web.models.api import Notice, PreflightResponse, RunConfig
 from summarizer_web.services.documents_service import (
@@ -63,6 +73,7 @@ from summarizer_web.services.ollama_service import (
     is_installed,
     model_context_length,
 )
+from summarizer_web.services import openrouter_service
 from summarizer_web.services.progress_service import (
     estimate_merge_calls,
     estimate_verification_calls,
@@ -78,7 +89,11 @@ _LEAF_COUNT_CACHE_SIZE = 64
 _leaf_counts: OrderedDict[tuple[str, str, int, int], int] = OrderedDict()
 _leaf_counts_lock = Lock()
 
+_OPENROUTER_LISTING_TIMEOUT_SECONDS = 15.0
+
 _FIELD_LABELS = {
+    "provider": "Provider",
+    "openrouter_upstream": "OpenRouter upstream",
     "model": "Model",
     "target_words": "Target words",
     "strategy": "Strategy",
@@ -112,6 +127,10 @@ def run_preflight(payload: dict[str, Any]) -> PreflightResponse:
     if not model:
         errors.append(_error("model_required", "Choose a model for this Run."))
     document = _ready_document(document_id, errors)
+
+    provider = config.provider if config is not None else _raw_provider(raw_config)
+    if provider == "openrouter":
+        return _preflight_openrouter(config, document, model, errors, warnings)
 
     host = get_settings().ollama_host
     model_installed: bool | None = None
@@ -149,7 +168,6 @@ def run_preflight(payload: dict[str, Any]) -> PreflightResponse:
     strategy = strategy_config(config)
     if source == "model":
         strategy = replace(strategy, context_window=window)
-    assumed = source == "assumed"
     counter = resolve_token_counter(provider="ollama", model=model, ollama_host=host)
     response = PreflightResponse(
         ok=False,
@@ -160,8 +178,36 @@ def run_preflight(payload: dict[str, Any]) -> PreflightResponse:
         model_installed=model_installed,
     )
     app = AppConfig(model=model, provider="ollama", ollama_host=host)
+    return _estimate(
+        document,
+        counter,
+        config,
+        strategy=strategy,
+        app=app,
+        assumed=source == "assumed",
+        response=response,
+        errors=errors,
+        warnings=warnings,
+    )
+
+
+def _estimate(
+    document: SourceDocument,
+    counter: TokenCounter,
+    config: RunConfig,
+    *,
+    strategy: StrategyConfig,
+    app: AppConfig,
+    assumed: bool,
+    response: PreflightResponse,
+    errors: list[Notice],
+    warnings: list[Notice],
+) -> PreflightResponse:
+    """The strategy, capacity and call estimates, shared by every provider."""
     try:
-        report = select_strategy(document, counter, provider="ollama", model=model, config=strategy)
+        report = select_strategy(
+            document, counter, provider=app.provider, model=app.model, config=strategy
+        )
         limits = plan_run_requests(
             report,
             counter,
@@ -198,6 +244,117 @@ def run_preflight(payload: dict[str, Any]) -> PreflightResponse:
     return _finish(response, errors, warnings)
 
 
+def _preflight_openrouter(
+    config: RunConfig | None,
+    document: SourceDocument | None,
+    model: str,
+    errors: list[Notice],
+    warnings: list[Notice],
+) -> PreflightResponse:
+    """Preflight for an OpenRouter Run: no Ollama, an estimated counter, a listed window."""
+    if config is None or document is None or not model:
+        return PreflightResponse(ok=False, provider="openrouter", errors=errors, warnings=warnings)
+    if not openrouter_service.key_is_set():
+        errors.append(_error("openrouter_key_missing", openrouter_service.key_problem_message()))
+        return PreflightResponse(ok=False, provider="openrouter", errors=errors, warnings=warnings)
+
+    window, source = _openrouter_window(config, model, errors, warnings)
+    if any(error.code == "openrouter_key_rejected" for error in errors):
+        return PreflightResponse(ok=False, provider="openrouter", errors=errors, warnings=warnings)
+    strategy = strategy_config(config)
+    if window is not None:
+        strategy = replace(strategy, context_window=window)
+    counter = resolve_token_counter(provider="openrouter", model=model)
+    app = AppConfig(
+        model=model, provider="openrouter", openrouter_upstream=config.openrouter_upstream
+    )
+    response = PreflightResponse(
+        ok=False,
+        provider="openrouter",
+        context_window_tokens=resolve_context_window(
+            provider="openrouter", model=model, explicit=strategy.context_window
+        ).tokens,
+        context_window_source=source,
+        token_counts_estimated=not counter.exact,
+    )
+    notice = estimate_notice(counter)
+    if notice is not None:
+        warnings.append(_warning("token_counts_estimated", notice))
+    warnings.append(
+        _warning(
+            "third_party_processing",
+            "This Run sends the Document's text to OpenRouter and its upstream providers, "
+            "and each request is billed. Use only a Document that may leave this machine, "
+            "and set a spend cap on the key.",
+        )
+    )
+    return _estimate(
+        document,
+        counter,
+        config,
+        strategy=strategy,
+        app=app,
+        assumed=source == "assumed",
+        response=response,
+        errors=errors,
+        warnings=warnings,
+    )
+
+
+def _openrouter_window(
+    config: RunConfig, model: str, errors: list[Notice], warnings: list[Notice]
+) -> tuple[int | None, str]:
+    """Return (window, source) the way the worker resolves an OpenRouter Run's window."""
+    provider = openrouter_service.create_provider(config.openrouter_upstream)
+    try:
+        window = provider.configure_context_window(
+            model, config.context_window, timeout_seconds=_OPENROUTER_LISTING_TIMEOUT_SECONDS
+        )
+    except ProviderAuthenticationError as error:
+        errors.append(
+            _error(
+                "openrouter_key_rejected",
+                f"{str(error).rstrip('.')}. Check OPENROUTER_API_KEY, then restart the server.",
+            )
+        )
+        return None, "assumed"
+    except ContextWindowTooLargeError as error:
+        errors.append(
+            _error(
+                "invalid_config",
+                f"Context window: {error.requested} tokens exceeds the maximum "
+                f"of {error.maximum} tokens for {model}.",
+            )
+        )
+        return config.context_window, "configured"
+    except ProviderError as error:
+        warnings.append(
+            _warning(
+                "context_window_assumed",
+                f"{error} The assumed context window of {ASSUMED_CONTEXT_WINDOW} tokens "
+                "is used for these estimates.",
+            )
+        )
+        return None, "assumed"
+    source = {
+        "explicit": "configured",
+        "model_listing": "model",
+        "assumed": "assumed",
+    }.get(provider.window_source or "assumed", "assumed")
+    if source == "assumed":
+        warnings.append(
+            _warning(
+                "context_window_assumed",
+                f"{provider.window_notice or 'OpenRouter did not list a context window for this model.'} "
+                f"The assumed context window of {ASSUMED_CONTEXT_WINDOW} tokens is used for these "
+                "estimates. Set Context window in Advanced.",
+            )
+        )
+    elif provider.window_notice is not None:
+        warnings.append(_warning("context_window_note", provider.window_notice))
+    return window, source
+
+
 def _finish(
     response: PreflightResponse, errors: list[Notice], warnings: list[Notice]
 ) -> PreflightResponse:
@@ -220,6 +377,11 @@ def _validated_config(raw: object, errors: list[Notice]) -> RunConfig | None:
                 _error("invalid_config", f"{label}: {message}." if label else f"{message}.")
             )
         return None
+
+
+def _raw_provider(raw: object) -> str:
+    provider = raw.get("provider") if isinstance(raw, dict) else None
+    return "openrouter" if provider == "openrouter" else "ollama"
 
 
 def _raw_model(raw: object) -> str:
@@ -333,11 +495,15 @@ def _tree_estimate(
     if leaf_count < 2:
         return leaf_count, 0
     budget = plan_merge_request(
-        limits, level=1, provider_schema_reserve=MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES
+        limits,
+        level=1,
+        provider_schema_reserve=(
+            MAX_PROVIDER_SUMMARY_SCHEMA_JSON_BYTES if app.provider == "ollama" else 0
+        ),
     )
     # Leaves are not generated yet, so each is sized at its full output
     # allowance; the run measures the real children with the same budget.
-    per_token = 1 if counter.exact else _BYTES_PER_OUTPUT_TOKEN
+    per_token = _output_units_per_token(counter)
     child_tokens = config.max_output_tokens * per_token + child_fence_tokens(counter)
     try:
         budget.require_merge_pair(child_tokens)
@@ -356,6 +522,15 @@ def _tree_estimate(
     if config.max_merge_children is not None:
         fanout = min(fanout, config.max_merge_children)
     return leaf_count, estimate_merge_calls(leaf_count, fanout)
+
+
+def _output_units_per_token(counter: TokenCounter) -> int:
+    """How many counter units one model output token can cost.
+
+    An exact counter charges one. The byte counters charge about four per
+    token of English output.
+    """
+    return 1 if counter.exact else _BYTES_PER_OUTPUT_TOKEN
 
 
 def _leaf_count(

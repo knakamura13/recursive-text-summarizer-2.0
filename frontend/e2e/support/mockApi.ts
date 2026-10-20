@@ -26,6 +26,7 @@ import type {
 	NodeDetail,
 	OllamaHealth,
 	OllamaModel,
+	OpenRouterStatus,
 	Preflight,
 	Run,
 	RunConfig,
@@ -84,6 +85,7 @@ export interface MockSeed {
 	settings?: Settings;
 	models?: OllamaModel[];
 	ollama?: OllamaHealth;
+	openrouter?: OpenRouterStatus;
 	runs?: Run[];
 	trees?: Record<string, TreeNode[]>;
 	/** Keyed `${runId}/${nodeId}`. */
@@ -101,7 +103,9 @@ const iso = (minutesAgo = 0) => new Date(Date.now() - minutesAgo * 60_000).toISO
 
 export function defaultRunConfig(overrides: Partial<RunConfig> = {}): RunConfig {
 	return {
+		provider: 'ollama',
 		model: 'llama3.1:8b',
+		openrouter_upstream: '',
 		target_words: 300,
 		strategy: 'auto',
 		verify: true,
@@ -420,6 +424,7 @@ export class MockApi {
 	settings: Settings;
 	models: OllamaModel[];
 	ollama: OllamaHealth;
+	openrouter: OpenRouterStatus;
 	runs: Run[];
 	trees: Record<string, TreeNode[]>;
 	nodes: Record<string, NodeDetail>;
@@ -450,6 +455,10 @@ export class MockApi {
 			host: this.settings.ollama_host,
 			version: '0.6.2'
 		};
+		this.openrouter = seed.openrouter ?? {
+			key_set: true,
+			message: 'An OpenRouter API key is set.'
+		};
 		this.runs = seed.runs ?? [];
 		this.trees = seed.trees ?? {};
 		this.nodes = seed.nodes ?? {};
@@ -460,6 +469,8 @@ export class MockApi {
 			selected_strategy: 'hierarchical',
 			context_window_tokens: 32_768,
 			context_window_source: 'model',
+			provider: 'ollama',
+			token_counts_estimated: false,
 			usable_input_capacity: 28_000,
 			document_tokens: 90_000,
 			estimated_leaf_count: 4,
@@ -649,6 +660,7 @@ export class MockApi {
 			],
 
 			['GET', '/ollama/health', () => ({ json: { ...this.ollama, host: this.settings.ollama_host } })],
+			['GET', '/openrouter/health', () => ({ json: this.openrouter })],
 			[
 				'GET',
 				'/ollama/models',

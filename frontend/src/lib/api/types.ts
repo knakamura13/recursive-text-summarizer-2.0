@@ -24,6 +24,12 @@ export interface OllamaHealth {
 	version: string | null;
 }
 
+export interface OpenRouterStatus {
+	/** Whether the server's environment has a key. The key itself is never reported. */
+	key_set: boolean;
+	message: string;
+}
+
 export interface OllamaModel {
 	name: string;
 	size_bytes: number | null;
@@ -35,11 +41,15 @@ export interface OllamaModel {
 
 // --- Run configuration and settings ---------------------------------------
 
+export type ProviderName = 'ollama' | 'openrouter';
 export type StrategyName = 'auto' | 'direct' | 'hierarchical';
 export type SelectedStrategy = 'direct' | 'hierarchical';
 
 export interface RunConfig {
+	provider: ProviderName;
 	model: string;
+	/** Pins every OpenRouter request to one upstream provider; empty for no pin. */
+	openrouter_upstream: string;
 	target_words: number;
 	strategy: StrategyName;
 	verify: boolean;
@@ -184,6 +194,9 @@ export interface Preflight {
 	selected_strategy: SelectedStrategy | null;
 	context_window_tokens: number | null;
 	context_window_source: 'configured' | 'model' | 'assumed' | null;
+	provider: ProviderName | null;
+	/** True when the token counts are not exact; for OpenRouter they are a UTF-8 byte upper bound. */
+	token_counts_estimated: boolean | null;
 	usable_input_capacity: number | null;
 	document_tokens: number | null;
 	estimated_leaf_count: number | null;

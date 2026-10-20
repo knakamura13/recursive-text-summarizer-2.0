@@ -34,12 +34,14 @@ from summarizer.ingestion import SourceDocument
 from summarizer.pipeline import PipelineConfig, PipelineResult, run_pipeline
 from summarizer.providers.base import (
     ContextWindowProvider,
+    ProviderAuthenticationError,
     ProviderConnectionError,
     ProviderError,
     ProviderRetriesExhaustedError,
     ProviderTimeoutError,
     RetryErrorCategory,
 )
+from summarizer.providers.openrouter import redact_api_key
 from summarizer.providers.retrying import RetryingProvider
 from summarizer.runtime.observers import (
     ItemEvent,
@@ -52,6 +54,7 @@ from summarizer.runtime.observers import (
 )
 from summarizer.sections import SectionOutline
 from summarizer.segmentation import SegmentationConfig, SegmentationError
+from summarizer.tokenization import estimate_notice
 from summarizer.verification import VerificationCapacityError, VerificationConfig
 from summarizer_web.config import load_paths
 from summarizer_web.db.connection import get_database, init_database
@@ -126,12 +129,17 @@ def _truncate_utf8(text: str, limit: int) -> str:
     return encoded[: limit - 3].decode("utf-8", errors="ignore") + "..."
 
 
+def _print_traceback() -> None:
+    """Print the current exception's traceback with the OpenRouter key removed."""
+    print(redact_api_key(traceback.format_exc()), file=sys.stderr, end="")
+
+
 def error_detail(error: BaseException) -> str:
     """The error and its causes, one per line, bounded to 4 KB."""
     lines = [
         "".join(traceback.format_exception_only(type(item), item)).strip() for item in _chain(error)
     ]
-    return _truncate_utf8("\nCaused by: ".join(lines), MAX_FAILURE_DETAIL_BYTES)
+    return _truncate_utf8(redact_api_key("\nCaused by: ".join(lines)), MAX_FAILURE_DETAIL_BYTES)
 
 
 def _last_retry_category(error: BaseException) -> RetryErrorCategory | None:
@@ -169,8 +177,14 @@ def classify_failure(
     timeout_seconds: float,
     stage: str | None,
     item: str | None,
+    provider: str = "ollama",
 ) -> RunFailure:
-    """Map an Attempt's exception to a RunFailure the UI can explain (contract 6b)."""
+    """Map an Attempt's exception to a RunFailure the UI can explain (contract 6b).
+
+    `provider` selects the wording for failures that name the service: an
+    unreachable host and a missing model are Ollama's, a rejected key and an
+    unreachable network are OpenRouter's.
+    """
     detail = error_detail(error)
     if isinstance(error, ItemFailedError):
         label = item or error.work_id
@@ -189,13 +203,27 @@ def classify_failure(
             code=code, message=message, stage=stage, item=item, detail=detail, hint=hint
         )
 
-    if any(_is_unreachable(cause) for cause in chain):
+    if provider == "openrouter":
+        if any(isinstance(cause, ProviderAuthenticationError) for cause in chain):
+            return failure(
+                "openrouter_key_invalid",
+                "OpenRouter did not accept the API key.",
+                "Check OPENROUTER_API_KEY in the server's environment, restart the "
+                "server, then Resume.",
+            )
+        if any(_is_unreachable(cause) for cause in chain):
+            return failure(
+                "openrouter_unreachable",
+                "OpenRouter is not reachable.",
+                "Check the network connection, then Resume.",
+            )
+    elif any(_is_unreachable(cause) for cause in chain):
         return failure(
             "ollama_unreachable",
             f"Ollama is not reachable at {host}.",
             "Start Ollama with `ollama serve` or fix the host in Settings, then Resume.",
         )
-    if any(_is_model_missing(cause) for cause in chain):
+    if provider != "openrouter" and any(_is_model_missing(cause) for cause in chain):
         return failure(
             "model_not_found",
             f"Model {model} is not installed.",
@@ -250,6 +278,9 @@ class _Page:
 # revision's outline is empty, or was never extracted (NULL, imported before
 # import/4), so importing the Document again may find headings.
 NO_OUTLINE_WARNING = "sections_no_outline"
+# Audit warning code (see `run_views_service._NOTICE_TEXT`) for a Run whose
+# token counts are estimates, so the Run shows it as the preflight did.
+ESTIMATED_COUNTS_WARNING = "token_counts_estimated"
 OUTLINE_NOT_EXTRACTED_WARNING = "sections_outline_not_extracted"
 
 
@@ -349,7 +380,7 @@ class RunRecorder:
             with self._lock:
                 record(argument)
         except Exception:
-            traceback.print_exc(file=sys.stderr)
+            _print_traceback()
 
     def _record_stage(self, event: StageEvent) -> None:
         changed = self.tracker.on_stage(event)
@@ -417,7 +448,7 @@ class RunRecorder:
                 with get_database().transaction() as connection:
                     self._progress(connection, self._cursor, force=True)
         except Exception:
-            traceback.print_exc(file=sys.stderr)
+            _print_traceback()
 
     def start_flusher(self) -> threading.Thread:
         def flush_until_stopped() -> None:
@@ -508,14 +539,18 @@ def _execute(
 ) -> PipelineResult:
     text = Path(revision["canonical_path"]).read_text(encoding="utf-8")
     document = SourceDocument(text=text, source_id=revision["source_sha256"])
+    openrouter = getattr(config, "provider", "ollama") == "openrouter"
     app = AppConfig(
         input_path=run_dir / "source.txt",
         output_path=run_dir / "summary.txt",
         model=config.model,
-        provider="ollama",
-        ollama_host=host,
+        provider="openrouter" if openrouter else "ollama",
+        # The cache identity rejects a host for any provider but Ollama.
+        ollama_host="" if openrouter else host,
         timeout_seconds=config.timeout_seconds,
+        openrouter_upstream=getattr(config, "openrouter_upstream", "") if openrouter else "",
     )
+    counter = build_counter(app)
     strategy = strategy_config(config)
     raw_provider = build_provider(app)
     if isinstance(raw_provider, ContextWindowProvider):
@@ -536,6 +571,8 @@ def _execute(
             if revision["outline_json"] is None
             else NO_OUTLINE_WARNING,
         )
+    if openrouter and estimate_notice(counter) is not None:
+        audit_warnings = (*audit_warnings, ESTIMATED_COUNTS_WARNING)
     pipeline_config = PipelineConfig(
         target_words=config.target_words,
         segmentation=segmentation_config(config),
@@ -562,7 +599,7 @@ def _execute(
     return run_pipeline(
         document,
         provider,
-        build_counter(app),
+        counter,
         app=app,
         strategy=strategy,
         config=pipeline_config,
@@ -628,7 +665,7 @@ def run_job(run_id: str) -> str | None:
             # A Stop can surface as an error from an abandoned call.
             recorder.finish("stopped")
             return "stopped"
-        traceback.print_exc(file=sys.stderr)
+        _print_traceback()
         item = recorder.item_label(error) if isinstance(error, ItemFailedError) else tracker.current_label()
         failure = classify_failure(
             error,
@@ -637,7 +674,9 @@ def run_job(run_id: str) -> str | None:
             timeout_seconds=config.timeout_seconds,
             stage=tracker.stage,
             item=item,
+            provider=getattr(config, "provider", "ollama"),
         )
+        failure = failure.model_copy(update={"message": redact_api_key(failure.message)})
         _write_failure_file(run_id, failure)
         recorder.finish("failed", failure)
         return "failed"
@@ -690,7 +729,7 @@ def worker_main(run_id: str, parent_pid: int) -> None:
         hold_worker_lock(run_id)
         code = 1 if run_job(run_id) == "failed" else 0
     except BaseException:
-        traceback.print_exc(file=sys.stderr)
+        _print_traceback()
     finally:
         sys.stdout.flush()
         sys.stderr.flush()

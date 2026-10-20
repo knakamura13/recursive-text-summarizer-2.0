@@ -462,3 +462,99 @@ def test_audit_accepts_openai_completed_finish_status() -> None:
             "provider": "openai",
         }
     ]
+
+
+def _openrouter_audit(model: str, configuration: dict, *, generation_model: str | None = None):
+    document, segment, node, citations = fixture()
+    return build_audit_artifact(
+        source_id=document.source_id,
+        strategy="direct",
+        model=model,
+        configuration=configuration,
+        segments=(segment,),
+        nodes=(node,),
+        root_node_id=node.node_id,
+        citations=citations,
+        generations=(
+            GenerationResult(
+                "ok",
+                "openrouter",
+                generation_model or model,
+                input_tokens=412,
+                output_tokens=87,
+                finish_status="stop",
+            ),
+        ),
+    )
+
+
+def test_audit_records_an_openrouter_run_with_its_pinned_upstream() -> None:
+    model = "meta-llama/llama-3.3-70b-instruct:free"
+    artifact = _openrouter_audit(
+        model,
+        {
+            "app": {
+                "provider": "openrouter",
+                "model": model,
+                "timeout_seconds": 30,
+                "openrouter_upstream": "deepinfra/turbo",
+                "openrouter_api_key": "must-not-be-kept",
+                "ollama_host": "http://not-an-audit-field",
+            },
+            "budget": {"counter_exact": False, "context_window_assumed": False},
+        },
+    )
+
+    body = json.loads(serialize_audit(artifact))
+
+    assert body["configuration"] == {
+        "app": {
+            "model": model,
+            "openrouter_upstream": "deepinfra/turbo",
+            "provider": "openrouter",
+            "timeout_seconds": 30,
+        },
+        "budget": {"context_window_assumed": False, "counter_exact": False},
+    }
+    assert body["usage"][0]["provider"] == "openrouter"
+    assert body["usage"][0]["model"] == model
+    assert b"must-not-be-kept" not in serialize_audit(artifact)
+
+
+@pytest.mark.parametrize("model", ["~openai/some-latest", "vendor/model-v2.5:nitro"])
+def test_audit_accepts_vendor_qualified_model_names(model: str) -> None:
+    artifact = _openrouter_audit(
+        model, {"app": {"provider": "openrouter", "model": model}}
+    )
+
+    assert json.loads(serialize_audit(artifact))["usage"][0]["model"] == model
+
+
+@pytest.mark.parametrize(
+    "upstream", ["two words", "a/b/c", "x" * 65, "", "sk-or-v1-0123456789abcdef0123", 7]
+)
+def test_audit_rejects_an_unsafe_pinned_upstream(upstream: object) -> None:
+    with pytest.raises(ValueError, match="openrouter_upstream"):
+        _openrouter_audit(
+            "vendor/model",
+            {"app": {"provider": "openrouter", "openrouter_upstream": upstream}},
+        )
+
+
+@pytest.mark.parametrize(
+    "model", ["vendor/model with space", "vendor//", "/vendor/model", "vendor/m\nodel"]
+)
+def test_audit_still_rejects_malformed_model_identities(model: str) -> None:
+    with pytest.raises(ValueError):
+        _openrouter_audit(
+            "vendor/model", {"app": {"provider": "openrouter"}}, generation_model=model
+        )
+
+
+@pytest.mark.parametrize("model", ["a/b/c/d", "a:b:c", "a/" + "b" * 129])
+def test_audit_and_config_agree_on_which_model_names_are_recordable(model: str) -> None:
+    from summarizer.config import is_model_identity
+
+    assert is_model_identity(model) is False
+    with pytest.raises(ValueError):
+        _openrouter_audit("vendor/model", {"app": {"provider": "openrouter"}}, generation_model=model)

@@ -9,6 +9,7 @@
 	import { formatBytes, formatRelativeTime } from '$lib/format';
 	import { fieldErrorsFrom, runConfigPatch, validateRunConfig } from '$lib/runConfig';
 	import { canSummarize, models } from '$lib/stores/models.svelte';
+	import { openrouter } from '$lib/stores/openrouter.svelte';
 	import { settings } from '$lib/stores/settings.svelte';
 	import { toasts } from '$lib/stores/toasts.svelte';
 
@@ -47,6 +48,7 @@
 		}
 		void checkHealth();
 		void models.refresh();
+		void openrouter.refresh();
 	}
 
 	onMount(() => {
@@ -108,8 +110,13 @@
 	async function makeDefault(name: string) {
 		savingModel = name;
 		try {
-			await settings.save({ defaults: { model: name } });
-			if (draft) draft.model = name;
+			// A model tag belongs to Ollama, so making it the default selects Ollama too.
+			await settings.save({ defaults: { provider: 'ollama', model: name } });
+			if (draft) {
+				draft.provider = 'ollama';
+				draft.model = name;
+				draft.openrouter_upstream = '';
+			}
 			toasts.success(`${name} is now the default model.`);
 		} catch (error) {
 			toasts.error(`Could not change the default model: ${errorMessage(error)}`);
@@ -248,7 +255,7 @@
 										.join(' · ')}
 								</span>
 							</div>
-							{#if saved?.defaults.model === model.name}
+							{#if saved?.defaults.provider === 'ollama' && saved.defaults.model === model.name}
 								<span class="default-tag">Default</span>
 							{:else if !canSummarize(model)}
 								<span class="model-note">Embedding model</span>
@@ -270,6 +277,29 @@
 			{/if}
 		</section>
 
+		<section aria-labelledby="openrouter-heading">
+			<div class="section-head">
+				<h2 id="openrouter-heading">OpenRouter</h2>
+				<button type="button" class="button small" onclick={() => openrouter.refresh()}>
+					Check again
+				</button>
+			</div>
+			<div class="health" aria-live="polite">
+				{#if openrouter.error}
+					<ErrorBanner error={openrouter.error} onretry={() => openrouter.refresh()} />
+				{:else if openrouter.status}
+					<p class={openrouter.status.key_set ? 'ok' : 'bad'}>{openrouter.status.message}</p>
+				{:else}
+					<p class="muted">Checking for an API key…</p>
+				{/if}
+			</div>
+			<p class="muted">
+				The key is read from the server’s environment only; it is never saved in these settings or
+				in a Run. OpenRouter sends the Document’s text to a third party and bills each request, so
+				give the key a spend cap.
+			</p>
+		</section>
+
 		<section aria-labelledby="defaults-heading">
 			<h2 id="defaults-heading">Run defaults</h2>
 			<p class="muted">New Runs start with these settings; each Run can change them.</p>
@@ -279,6 +309,7 @@
 					models={models.list}
 					{errors}
 					disabled={saving}
+					openrouterKeySet={openrouter.keySet}
 					idPrefix="defaults"
 				/>
 				{#if saveError}

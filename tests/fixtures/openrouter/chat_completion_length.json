@@ -1,0 +1,22 @@
+{
+  "id": "gen-1760000002-LengthCutOff",
+  "object": "chat.completion",
+  "created": 1760000002,
+  "model": "meta-llama/llama-3.3-70b-instruct",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "length",
+      "native_finish_reason": "length",
+      "message": {
+        "role": "assistant",
+        "content": "{\"summary\":\"cut off mid"
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 900,
+    "completion_tokens": 4096,
+    "total_tokens": 4996
+  }
+}

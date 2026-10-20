@@ -185,6 +185,45 @@ def _search_suffix(
     return best
 
 
+# OpenRouter serves many model families and none of their tokenizers is
+# available locally, so its requests are counted with the byte counter below.
+# A tokenizer that works on bytes (byte-level BPE, or any with byte fallback)
+# emits at least one byte per token, so the UTF-8 byte count is an upper bound
+# on the model's own count, whichever model OpenRouter routes to. A scaled count
+# from another vocabulary has no such guarantee, and an undercount sends a
+# request the upstream rejects or truncates after earlier billed calls. The
+# price is that budgets shrink: English text runs 4 to 5 characters per token,
+# so segments come out about four times smaller than the window allows, which
+# matters most for models with small windows. Per-request template tokens are
+# not counted here and fall to the safety margin, as for every provider.
+# `usage.prompt_tokens`, which OpenRouter reports and the provider records, is
+# the way to measure the slack. Whether that figure is the model's native count
+# or normalized to one tokenizer was not established (the documentation read
+# says native; some accounts say otherwise).
+OPENROUTER_COUNTER_IDENTITY = "estimate:utf8-bytes-upper-bound"
+
+
+def estimate_notice(counter: TokenCounter) -> str | None:
+    """Return a user-facing notice when a counter's numbers are estimates.
+
+    Budgets, strategy choice and segment sizes all follow these counts, so a
+    run that depends on an estimate should say so wherever it reports them.
+    """
+    if counter.exact:
+        return None
+    if isinstance(counter, ConservativeUtf8TokenCounter):
+        return (
+            f"Token counts are an upper bound ({counter.identity}): one token per UTF-8 "
+            "byte, not the model's own tokenizer. Budgets are conservative, so segments "
+            "can be several times smaller than the context window allows."
+        )
+    return (
+        f"Token counts are estimates ({counter.identity}), not the model's own "
+        "tokenizer. Budgets are conservative, so segments may be smaller than "
+        "the context window requires."
+    )
+
+
 # GGUF tokenizers whose counts were checked against Ollama's prompt_eval_count:
 # (tokenizer.ggml.model, tokenizer.ggml.pre). gemma4 matched every one of 1,742
 # recorded requests at system + user tokens + a fixed chat template.
@@ -389,6 +428,8 @@ def resolve_token_counter(
     """Resolve a counter without constructing or calling a model provider.
 
     Constructing a tiktoken counter may download an uncached vocabulary.
+    OpenRouter routes to models whose tokenizers are unknown, so it gets the
+    byte counter under its own label, an upper bound rather than an exact count.
     For an Ollama host on this machine, the model's own tokenizer is read from
     its local model file when that tokenizer has been checked against Ollama.
     Any other Ollama model or host falls back to the conservative byte count.
@@ -398,6 +439,10 @@ def resolve_token_counter(
         return TiktokenCounter.for_encoding(encoding_name)
     if provider.strip().lower() == "openai":
         return TiktokenCounter.for_model(model)
+    if provider.strip().lower() == "openrouter":
+        # Names such as `vendor/model` have no tiktoken mapping and the routed
+        # model's tokenizer is unknown, so count bytes: a proven upper bound.
+        return ConservativeUtf8TokenCounter(identity=OPENROUTER_COUNTER_IDENTITY)
     if provider.strip().lower() == "ollama" and ollama_host and _is_loopback(ollama_host):
         try:
             return GgufTokenCounter.for_ollama_model(model)

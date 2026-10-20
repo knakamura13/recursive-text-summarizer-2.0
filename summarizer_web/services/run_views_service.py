@@ -94,6 +94,12 @@ _NOTICE_TEXT: dict[str, tuple[Literal["info", "warning", "error"], str]] = {
         "This document has no headings, so it was summarized without preserving sections. "
         "It was imported before headings were recorded; importing it again may find them.",
     ),
+    "token_counts_estimated": (
+        "info",
+        "Token counts for this Run are an upper bound (one per UTF-8 byte), not the "
+        "model's own tokenizer, so segments can be several times smaller than the "
+        "context window allows.",
+    ),
     "verified_sentence_subset": (
         "warning",
         "Some sentences of the written draft could not be verified and were removed; "

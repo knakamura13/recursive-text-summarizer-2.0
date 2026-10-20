@@ -12,7 +12,7 @@ Source text is treated as untrusted data. Instructions inside the source cannot 
 
 ## Installation and provider configuration
 
-Requirements are Python 3.10 or newer and either an OpenAI API key or a running Ollama service.
+Requirements are Python 3.10 or newer and one of an OpenAI API key, an OpenRouter API key, or a running Ollama service.
 
 ```sh
 python -m venv .venv
@@ -37,6 +37,14 @@ ollama pull gemma3:4b
 
 The default Ollama endpoint is `http://localhost:11434`. Use `--ollama-host` for another endpoint. The application does not pull models automatically. A missing model and an unavailable service produce actionable provider errors.
 
+For OpenRouter, export its key before a run. The key is read from `OPENROUTER_API_KEY` only, when the provider is first used:
+
+```sh
+export OPENROUTER_API_KEY="your-api-key"
+```
+
+OpenRouter sends document text to a third party and bills per request, so use only documents that may leave the machine and give the key a spend cap. The provider uses OpenRouter's chat-completions endpoint with strict JSON-schema output and `require_parameters`, so a request never routes to an endpoint that ignores the schema. It does not use the OpenAI client, so `OPENAI_BASE_URL` and the other `OPENAI_*` variables have no effect on it.
+
 ## Basic usage
 
 With no arguments, the CLI reads `input.txt` and writes `output.txt` in the current directory:
@@ -58,6 +66,15 @@ python main.py --provider ollama --model gemma3:4b
 python main.py --provider ollama --model qwen3.8 --ollama-host http://localhost:11434
 ```
 
+Use OpenRouter with a vendor-qualified model name. `--model` is required, because the default name belongs to OpenAI:
+
+```sh
+python main.py --provider openrouter --model meta-llama/llama-3.3-70b-instruct
+python main.py --provider openrouter --model meta-llama/llama-3.3-70b-instruct --openrouter-upstream deepinfra
+```
+
+An OpenRouter run differs from a local one by design. Hosted adapters do not enforce the quote-candidate and segment-identifier constraints that the Ollama path sends to its decoder, so results from the two are not directly comparable. Token counts are an upper bound, one token per UTF-8 byte, because OpenRouter routes to models whose tokenizers are not available locally and a byte-level tokenizer never emits fewer than one byte per token. The run says so on stderr and the audit records `counter_exact: false`. The price is smaller budgets: English text runs 4 to 5 characters per token, so segments come out about four times smaller than the window allows, which matters most for small windows (at the default 4096-token output allowance an 8k window has no room; lower `--max-output-tokens` or use a larger window). The context window is read from OpenRouter's model listing, bounded by an explicit `--context-window`; a model with no listed length falls back to the assumed window. The run logs its chat request count when it ends.
+
 A successful run publishes one final editorial summary only after all required stages succeed. Provider failures, invalid configuration, missing input, and exhausted retries return a nonzero exit status and do not replace the final output with an error message.
 
 ### Dry run
@@ -67,6 +84,8 @@ A successful run publishes one final editorial summary only after all required s
 ```sh
 python main.py --dry-run
 ```
+
+For `--provider openrouter` the dry run also prints the provider, model, pinned upstream, where the context window came from, and whether token counts are estimates. It stays offline, so the window is the explicit `--context-window` or an assumed value; only a real run reads OpenRouter's model listing.
 
 An explicit-source example is:
 
@@ -86,7 +105,7 @@ The strategy decision measures the real request overhead, reserved output, and s
 
 Every model request is budgeted against the context window before it is sent, and carries the output allowance it was budgeted with (Ollama `num_predict`, OpenAI `max_output_tokens`). Direct, leaf, and merge summaries use `--max-output-tokens`. The editorial request uses `3 × --target-words + 1024` tokens, or `--max-output-tokens` if that is larger. A compression chunk uses its own size plus a small envelope, and verification requests use the verifier's output reserve. Each re-askable request also reserves room for one correction note. A request that cannot be budgeted fails with the full subtraction and a classification: `output_exceeds_context` (the output allowance alone fills the usable context), `no_input_capacity`, `input_exceeds_capacity`, or `merge_pair_exceeds_capacity`. The editorial budget is checked before any model call, and the first merge budget before any leaf call. Each classification describes the request configuration, not the requested target, and no allowance is lowered to make a request fit.
 
-A model whose context window is not known uses an assumed window for reporting; `auto` does not gamble on a direct request in that case. `--context-window` supplies an explicit window. OpenAI models with a registered `tiktoken` encoding use exact counts; Ollama and non-OpenAI providers use a conservative UTF-8-byte estimator by default. Library callers can supply `encoding_name` to `resolve_token_counter` to select an exact `tiktoken` counter for any provider. An unknown OpenAI model reports an actionable token-accounting error rather than silently falling back. Constructing a `tiktoken` counter may download an uncached vocabulary; counting afterwards is local.
+A model whose context window is not known uses an assumed window for reporting; `auto` does not gamble on a direct request in that case. `--context-window` supplies an explicit window. OpenAI models with a registered `tiktoken` encoding use exact counts; Ollama and non-OpenAI providers, including OpenRouter, use a conservative UTF-8-byte estimator by default (OpenRouter's carries its own label, `estimate:utf8-bytes-upper-bound`). Library callers can supply `encoding_name` to `resolve_token_counter` to select an exact `tiktoken` counter for any provider. An unknown OpenAI model reports an actionable token-accounting error rather than silently falling back. Constructing a `tiktoken` counter may download an uncached vocabulary; counting afterwards is local.
 
 Segmentation prefers headings, paragraphs/lists, and sentences, then uses a token-safe character fallback for an oversized unit. A segment has a stable identifier (`S000001`, etc.), a disjoint core range, and optional overlap context. Overlap provides context only; it does not duplicate evidence ownership or move core boundaries. By default, source-segment cores are capped at one quarter of the safely measured leaf input capacity so adaptive merge planning retains a viable two-child grounding fallback; an explicit `--chunk-tokens` value remains authoritative. Merge fan-out is measured from the complete request, and the default hierarchy narrows child groups when selected source passages need more room. An explicit internal `GroundingPolicy` can instead provide a fixed source-token reserve. `--max-merge-children` can impose a smaller ceiling to force a deeper hierarchy. In the offline evaluator's expanded hierarchy case, that ceiling is fixed at 2 to force a two-child merge ceiling and produce more than one merge level; a default run leaves it unset and derives fan-out from the measured request capacity.
 
@@ -98,9 +117,10 @@ Run `python main.py --help` for parser-generated help. The complete options are:
 | --------------------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
 | `--input PATH`                          | `input.txt`              | UTF-8 source text or Markdown file.                                                                                                    |
 | `--output PATH`                         | `output.txt`             | Final plain-text summary path.                                                                                                         |
-| `--provider {openai,ollama}`            | `openai`                 | Provider adapter.                                                                                                                      |
-| `--model MODEL`                         | `gpt-4o-mini`            | Provider model identifier.                                                                                                             |
+| `--provider {openai,ollama,openrouter}` | `openai`                 | Provider adapter.                                                                                                                      |
+| `--model MODEL`                         | `gpt-4o-mini`            | Provider model identifier; required for `openrouter`.                                                                                  |
 | `--ollama-host URL`                     | `http://localhost:11434` | Ollama service endpoint.                                                                                                               |
+| `--openrouter-upstream NAME`            | unset                    | Pin every OpenRouter request to one upstream provider, with fallbacks off.                                                             |
 | `--timeout SECONDS`                     | `180`                    | Per-provider request timeout.                                                                                                          |
 | `--max-retries N`                       | `5`                      | Maximum attempts for retryable provider failures.                                                                                      |
 | `--strategy {auto,direct,hierarchical}` | `auto`                   | Execution strategy.                                                                                                                    |

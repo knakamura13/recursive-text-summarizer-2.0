@@ -17,6 +17,7 @@ import secrets
 import stat
 from typing import TypeVar
 
+from summarizer.config import normalize_openrouter_upstream
 from summarizer.safety import redact_text
 
 
@@ -38,10 +39,10 @@ _STAGES = frozenset(
         "verification",
     }
 )
-_PROVIDERS = frozenset({"openai", "ollama"})
+_PROVIDERS = frozenset({"openai", "ollama", "openrouter"})
 _VERSION = re.compile(r"^[a-z][a-z0-9-]*/[1-9][0-9]*$")
 _MODEL = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._/-]*)?$"
+    r"^~?[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._/-]*)?$"
 )
 _HOST_PORT = re.compile(r"^[A-Za-z0-9.-]+:[0-9]{2,5}$")
 _HOST_URL = re.compile(r"^[a-z][a-z0-9+.-]*://[A-Za-z0-9.-]+(:[0-9]{2,5})?$")
@@ -270,6 +271,10 @@ class CacheDescriptor:
     counter_exact: bool
     context_window_tokens: int
     behavior: Mapping[str, object]
+    # The upstream an OpenRouter run is pinned to, which changes what answers.
+    # Left out of the canonical value when empty so keys for runs without it
+    # stay what they were before this field existed.
+    openrouter_upstream: str = ""
     _behavior_bytes: bytes = field(init=False, repr=False, compare=False)
     def __post_init__(self) -> None:
         if self.stage not in _STAGES:
@@ -293,6 +298,14 @@ class CacheDescriptor:
         else:
             if self.ollama_host:
                 raise ValueError("ollama_host must be empty for non-ollama providers")
+        try:
+            normalized_upstream = normalize_openrouter_upstream(self.openrouter_upstream)
+        except ValueError as error:
+            raise ValueError("unsafe descriptor openrouter_upstream") from error
+        if normalized_upstream != self.openrouter_upstream:
+            raise ValueError("unsafe descriptor openrouter_upstream")
+        if self.openrouter_upstream and self.provider != "openrouter":
+            raise ValueError("openrouter_upstream must be empty for non-openrouter providers")
         if not _is_safe_model(self.model):
             raise ValueError("unsafe descriptor model")
         if _COUNTER.fullmatch(self.counter_identity) is None:
@@ -312,7 +325,7 @@ class CacheDescriptor:
         object.__setattr__(self, "_behavior_bytes", _canonical_json(self.behavior))
 
     def canonical_value(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "behavior": json.loads(self._behavior_bytes),
             "context_window_tokens": self.context_window_tokens,
             "counter_exact": self.counter_exact,
@@ -327,6 +340,9 @@ class CacheDescriptor:
             "stage": self.stage,
             "work_id": self.work_id,
         }
+        if self.openrouter_upstream:
+            value["openrouter_upstream"] = self.openrouter_upstream
+        return value
 
     def canonical_bytes(self) -> bytes:
         return _canonical_json(self.canonical_value())
@@ -346,10 +362,16 @@ def _descriptor_invalidation_reasons(
         reasons.append("prompt_changed")
     if previous.schema_version != current.schema_version:
         reasons.append("schema_changed")
-    if (previous.provider, previous.model, previous.ollama_host) != (
+    if (
+        previous.provider,
+        previous.model,
+        previous.ollama_host,
+        previous.openrouter_upstream,
+    ) != (
         current.provider,
         current.model,
         current.ollama_host,
+        current.openrouter_upstream,
     ):
         reasons.append("model_changed")
     behavior_changed = (
