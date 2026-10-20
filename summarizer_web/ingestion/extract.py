@@ -18,6 +18,7 @@ import bisect
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 from summarizer.ingestion import ingest_text
@@ -34,6 +35,7 @@ from summarizer_web.ingestion.common import (
     plural,
 )
 from summarizer_web.ingestion.encoding import DecodedText, decode_text
+from summarizer_web.ingestion.folding import FoldedText, compat_fold
 from summarizer_web.ingestion.markup import declared_charset, html_to_text_and_outline
 from summarizer_web.ingestion.ocr import Tesseract, extract_image
 from summarizer_web.ingestion.packages import extract_docx, extract_epub, extract_odt
@@ -118,14 +120,22 @@ class ImportedText:
     unplaced_headings: int = 0
 
 
-def _title_patterns(title: str) -> tuple[re.Pattern[str], ...] | None:
-    """Patterns for a title with any whitespace between its words, ignoring
-    case, from most to least likely a heading: the title as a whole line,
-    then at the start of a line, then anywhere. Each needs whole words, so
-    "Intro" does not match inside "Introduction"."""
-    words = clean_text(title).split()
-    if not words:
-        return None
+_TitlePattern = tuple[re.Pattern[str], re.Pattern[str]]
+
+
+class _Haystack:
+    """The text a title is searched in. Its folded view is built the first time a title
+    is not found as written, so a text whose titles all match as written is never folded."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    @cached_property
+    def folded(self) -> FoldedText:
+        return FoldedText.of(self.text)
+
+
+def _tier_patterns(words: list[str]) -> tuple[re.Pattern[str], ...]:
     body = r"(?<!\w)" + r"\s+".join(re.escape(word) for word in words) + r"(?!\w)"
     return (
         re.compile(rf"^[ \t]*({body})[ \t]*$", re.IGNORECASE | re.MULTILINE),
@@ -134,15 +144,91 @@ def _title_patterns(title: str) -> tuple[re.Pattern[str], ...] | None:
     )
 
 
-def _find_title(
-    patterns: tuple[re.Pattern[str], ...], text: str, start: int, end: int
+@dataclass(frozen=True)
+class _TitlePatterns:
+    """How to find one title, ignoring case.
+
+    `tiers` hold the title with any whitespace between its words, from most to least likely a
+    heading: the title as a whole line, then at the start of a line, then anywhere. Each needs
+    whole words, so "Intro" does not match inside "Introduction". Each comes as a pair: the title
+    as written, for the text as written, and the title folded (`compat_fold`), for the text's
+    folded view. A title that folding leaves alone has the same pattern object in both places.
+
+    `respaced` is for a title that no tier finds. A PDF text layer decides spaces from glyph
+    positions, so it can drop or move one where the font changes, as around inline math. It
+    matches one line that is the title alone with its spaces and tabs ignored, on the folded view,
+    so a title's words run together inside a sentence, a line that only begins with the title,
+    and separate lines that together spell it never match. It is compiled the first time a title
+    needs it.
+    """
+
+    tiers: tuple[_TitlePattern, ...]
+    folded_letters: str
+
+    @cached_property
+    def respaced(self) -> re.Pattern[str]:
+        letters = r"[ \t]*".join(re.escape(char) for char in self.folded_letters)
+        return re.compile(rf"^[ \t]*({letters})[ \t]*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _title_patterns(title: str) -> _TitlePatterns | None:
+    words = clean_text(title).split()
+    if not words:
+        return None
+    as_written = _tier_patterns(words)
+    folded_words = compat_fold(" ".join(words)).split()
+    folded = as_written if folded_words == words else _tier_patterns(folded_words)
+    return _TitlePatterns(tuple(zip(as_written, folded, strict=True)), "".join(folded_words))
+
+
+def _folds(pattern: _TitlePattern, haystack: _Haystack) -> bool:
+    """Whether the folded view can match what the title as written did not: not when
+    neither the title nor an ASCII text has anything to fold."""
+    as_written, folded = pattern
+    return folded is not as_written or not haystack.text.isascii()
+
+
+def _find_spelled(
+    patterns: _TitlePatterns, haystack: _Haystack, start: int, end: int
 ) -> tuple[int, int] | None:
-    """The title's first occurrence in `text[start:end]` under the most likely pattern."""
-    for pattern in patterns:
-        match = pattern.search(text, start, end)
+    """The title's first occurrence in `haystack.text[start:end]`, as source offsets. Each tier,
+    from most to least likely a heading, is tried on the text as written and then on its folded
+    view, so folding only adds matches: a title that matched as written is placed as before."""
+    for pattern in patterns.tiers:
+        match = pattern[0].search(haystack.text, start, end)
         if match is not None:
             return match.span(1)
+        if _folds(pattern, haystack):
+            found = haystack.folded.search(pattern[1], start, end)
+            if found is not None:
+                return found
     return None
+
+
+def _find_title(
+    patterns: _TitlePatterns, haystack: _Haystack, windows: Sequence[tuple[int, int]]
+) -> tuple[int, int] | None:
+    """The title's first occurrence within the first of `windows` that holds it, as source
+    offsets. A line that is the title with its spaces lost or moved is only tried once no
+    window holds the title as written, so a title found as written is placed where it was."""
+    for start, end in windows:
+        if (found := _find_spelled(patterns, haystack, start, end)) is not None:
+            return found
+    for start, end in windows:
+        if (found := haystack.folded.search(patterns.respaced, start, end)) is not None:
+            return found
+    return None
+
+
+def _title_at(
+    patterns: _TitlePatterns, haystack: _Haystack, offset: int
+) -> tuple[int, int] | None:
+    """The title at exactly `offset` under the loosest tier, as source offsets."""
+    pattern = patterns.tiers[-1]
+    match = pattern[0].match(haystack.text, offset)
+    if match is not None:
+        return match.span(1)
+    return haystack.folded.match(pattern[1], offset) if _folds(pattern, haystack) else None
 
 
 def anchor_outline(
@@ -154,9 +240,14 @@ def anchor_outline(
     repeated title lands on its next occurrence. A hint with a page is
     searched within that page, after the previous title when that is on the
     page. Two hints found at one place keep the first. A hint with an
-    offset is placed exactly there, or counted as not found.
+    offset is placed exactly there, or counted as not found. A title not
+    found as written may still match a line that is the title alone with
+    its spaces lost or moved (`_TitlePatterns.respaced`).
     """
+    if not hints:
+        return (), 0
     by_page = {span.page: span for span in pages or () if not span.blank}
+    haystack = _Haystack(text)
     placed: dict[int, tuple[str, int]] = {}
     cursor = 0
     unplaced = 0
@@ -166,14 +257,12 @@ def anchor_outline(
         if patterns is not None:
             if hint.offset is not None:
                 # The extractor knows where the title is: place it there, never earlier.
-                match = patterns[-1].match(text, hint.offset)
-                found = match.span(1) if match is not None else None
+                found = _title_at(patterns, haystack, hint.offset)
             elif hint.page is None:
-                found = _find_title(patterns, text, cursor, len(text))
+                found = _find_title(patterns, haystack, [(cursor, len(text))])
             elif (span := by_page.get(hint.page)) is not None:
-                found = _find_title(
-                    patterns, text, max(cursor, span.start), span.end
-                ) or _find_title(patterns, text, span.start, span.end)
+                windows = [(max(cursor, span.start), span.end), (span.start, span.end)]
+                found = _find_title(patterns, haystack, windows)
         if found is None or found[0] in placed:
             unplaced += 1
             continue

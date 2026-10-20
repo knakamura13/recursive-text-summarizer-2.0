@@ -38,13 +38,38 @@ const CLEARABLE: readonly RunConfigField[] = [
 	'max_merge_children'
 ] satisfies ClearableConfigField[];
 
+// Mirrors `normalize_openrouter_upstream` in summarizer/config.py.
+const UPSTREAM_SLUG = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:\/[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$/;
+
+// Mirrors `MODEL_IDENTITY` in summarizer/config.py: a name the audit and the
+// cache can both record.
+const MODEL_IDENTITY =
+	/^~?[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}){0,2}(?::[A-Za-z0-9][A-Za-z0-9._-]{0,127})?$/;
+
 /** Messages keyed by field for every value the server would reject. */
 export function validateRunConfig(
 	config: RunConfig,
 	options: { requireModel?: boolean } = {}
 ): RunConfigErrors {
 	const errors: RunConfigErrors = {};
-	if (options.requireModel && !config.model.trim()) errors.model = 'Choose a model.';
+	if (options.requireModel && !config.model.trim()) {
+		errors.model =
+			config.provider === 'openrouter' ? 'Enter a model name such as vendor/model.' : 'Choose a model.';
+	}
+	if (
+		config.provider === 'openrouter' &&
+		config.model.trim() &&
+		!MODEL_IDENTITY.test(config.model.trim())
+	) {
+		errors.model = 'Use a model ID such as vendor/model, with at most one :variant tag.';
+	}
+	if (config.openrouter_upstream.trim()) {
+		if (config.provider !== 'openrouter') {
+			errors.openrouter_upstream = 'Only OpenRouter Runs can pin an upstream provider.';
+		} else if (!UPSTREAM_SLUG.test(config.openrouter_upstream.trim())) {
+			errors.openrouter_upstream = 'Use a provider name such as deepinfra or deepinfra/turbo.';
+		}
+	}
 	for (const [field, limit] of Object.entries(RUN_CONFIG_LIMITS) as [
 		NumericRunConfigField,
 		NumberLimit

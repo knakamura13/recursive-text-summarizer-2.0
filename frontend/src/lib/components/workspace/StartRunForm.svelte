@@ -9,6 +9,7 @@
 	import { fieldErrorsFrom, validateRunConfig, type RunConfigErrors } from '$lib/runConfig';
 	import { activity } from '$lib/stores/activity.svelte';
 	import { canSummarize, models } from '$lib/stores/models.svelte';
+	import { openrouter } from '$lib/stores/openrouter.svelte';
 	import { settings } from '$lib/stores/settings.svelte';
 
 	interface Props {
@@ -50,11 +51,13 @@
 	onMount(() => {
 		if (config === null) loadSettings();
 		if (models.list.length === 0) void models.refresh();
+		void openrouter.refresh();
 	});
 
 	// Preselect the only sensible choice when the settings name no model.
+	// An OpenRouter model name is typed, so nothing is preselected for it.
 	$effect(() => {
-		if (config && !config.model) {
+		if (config && config.provider === 'ollama' && !config.model) {
 			const first = models.list.find(canSummarize);
 			if (first) config.model = first.name;
 		}
@@ -107,7 +110,9 @@
 		if (doc.import_state === 'importing') list.push({ text: 'The Document is still importing.' });
 		if (doc.import_state === 'failed') list.push({ text: 'The Import failed, so there is no text to summarize.' });
 		if (config === null) return [...list, { text: 'Loading the default settings…', pending: true }];
-		if (!config.model) {
+		if (!config.model && config.provider === 'openrouter') {
+			list.push({ text: 'Enter an OpenRouter model name such as vendor/model.' });
+		} else if (!config.model) {
 			list.push({
 				text:
 					models.list.length > 0
@@ -120,6 +125,9 @@
 				pending: models.loading
 			});
 		}
+		if (config.provider === 'openrouter' && openrouter.keySet === false) {
+			list.push({ text: openrouter.status?.message ?? 'The server has no OpenRouter API key.' });
+		}
 		if (activeRun) list.push({ run: activeRun });
 		if (Object.keys(localErrors).some((field) => field !== 'model')) list.push({ text: 'Fix the settings marked below.' });
 		if (ready && valid && !activeRun) {
@@ -128,7 +136,11 @@
 				list.push({ text: 'The configuration check failed: ' + errorMessage(preflightError) });
 			}
 			else if (preflight && !preflight.ok) {
-				for (const error of preflight.errors) list.push({ text: error.message });
+				for (const error of preflight.errors) {
+					// The missing key is already listed above, from the status check.
+					if (error.code === 'openrouter_key_missing' && openrouter.keySet === false) continue;
+					list.push({ text: error.message });
+				}
 				if (preflight.errors.length === 0) list.push({ text: 'The configuration check did not pass.' });
 			}
 		}
@@ -169,12 +181,27 @@
 	{#if settingsError}
 		<ErrorBanner error={settingsError} title="Could not load the default settings" onretry={loadSettings} />
 	{/if}
-	{#if models.error}
+	{#if models.error && config?.provider !== 'openrouter'}
 		<ErrorBanner error={models.error} title="Could not list the installed models" onretry={() => models.refresh()} />
 	{/if}
 
+	{#if openrouter.error && config?.provider === 'openrouter'}
+		<ErrorBanner
+			error={openrouter.error}
+			title="Could not check for an OpenRouter key"
+			onretry={() => openrouter.refresh()}
+		/>
+	{/if}
+
 	{#if config}
-		<RunConfigFields bind:config models={models.list} errors={fieldErrors} disabled={submitting} idPrefix="start" />
+		<RunConfigFields
+			bind:config
+			models={models.list}
+			errors={fieldErrors}
+			disabled={submitting}
+			openrouterKeySet={openrouter.keySet}
+			idPrefix="start"
+		/>
 	{/if}
 
 	<section class="preflight" aria-live="polite" aria-label="Configuration check">
@@ -196,12 +223,19 @@
 						<dt>Context window</dt>
 						<dd>
 							{formatCount(preflight.context_window_tokens)} tokens{#if preflight.context_window_source},
-								{WINDOW_SOURCE[preflight.context_window_source]}{/if}
+								{preflight.provider === 'openrouter' && preflight.context_window_source === 'model'
+									? 'listed by OpenRouter'
+									: WINDOW_SOURCE[preflight.context_window_source]}{/if}
 						</dd>
 					</div>
 				{/if}
 				{#if preflight.document_tokens !== null}
-					<div><dt>Document</dt><dd>about {formatCount(preflight.document_tokens)} tokens</dd></div>
+					<div>
+						<dt>Document</dt>
+						<dd>
+							about {formatCount(preflight.document_tokens)} tokens{#if preflight.token_counts_estimated}{' '}(upper bound){/if}
+						</dd>
+					</div>
 				{/if}
 				{#if preflight.estimated_leaf_count !== null}
 					<div><dt>Segments</dt><dd>about {formatCount(preflight.estimated_leaf_count)}</dd></div>

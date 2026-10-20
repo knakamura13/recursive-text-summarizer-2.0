@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": 402,
+    "message": "In-flight budget exceeded",
+    "metadata": {
+      "limit_source": "openrouter_in_flight_budget"
+    }
+  }
+}

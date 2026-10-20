@@ -458,3 +458,71 @@ def test_store_flushes_and_syncs_file_and_parent_before_returning(
     store.store(_descriptor(), {"summary": "ok"}, _validate_payload)
 
     assert len(calls) >= 2
+
+
+def test_descriptor_keys_for_existing_providers_are_unchanged() -> None:
+    # Pinned before OpenRouter support was added: a new identity field must not
+    # invalidate every cache an OpenAI or Ollama user already has.
+    assert _descriptor().key == (
+        "edad94a532cd64cac050fc8ca6cae26876344d721b31e5762e4dbb997a80ce83"
+    )
+    assert _descriptor(
+        provider="ollama", ollama_host="http://localhost:11434", model="llama3.2:3b"
+    ).key == "bdd58b57fbdea0057ea219cf4d0818203c37aeee2347f6af7546cc0e9b603433"
+
+
+def test_descriptor_accepts_an_openrouter_model_and_keys_on_the_pinned_upstream() -> None:
+    unpinned = _descriptor(provider="openrouter", model="meta-llama/llama-3.3-70b-instruct:free")
+    pinned = _descriptor(
+        provider="openrouter",
+        model="meta-llama/llama-3.3-70b-instruct:free",
+        openrouter_upstream="deepinfra/turbo",
+    )
+    other = _descriptor(
+        provider="openrouter",
+        model="meta-llama/llama-3.3-70b-instruct:free",
+        openrouter_upstream="together",
+    )
+
+    assert len({unpinned.key, pinned.key, other.key}) == 3
+    assert unpinned.key != _descriptor().key
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"provider": "openai", "openrouter_upstream": "deepinfra"},
+        {"provider": "openrouter", "openrouter_upstream": "bad slug"},
+        {"provider": "openrouter", "ollama_host": "http://localhost:11434"},
+    ],
+)
+def test_descriptor_rejects_inconsistent_openrouter_identity(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        _descriptor(**overrides)
+
+
+def test_a_pinned_upstream_change_is_reported_as_a_model_change() -> None:
+    previous = _descriptor(provider="openrouter", openrouter_upstream="deepinfra")
+    current = _descriptor(provider="openrouter", openrouter_upstream="together")
+
+    from summarizer.cache import _descriptor_invalidation_reasons
+
+    assert "model_changed" in _descriptor_invalidation_reasons(previous, current)
+
+
+def test_an_upstream_change_in_either_direction_invalidates_as_a_model_change() -> None:
+    from summarizer.cache import _descriptor_invalidation_reasons
+
+    pinned = _descriptor(provider="openrouter", openrouter_upstream="deepinfra")
+    unpinned = _descriptor(provider="openrouter")
+
+    assert "model_changed" in _descriptor_invalidation_reasons(unpinned, pinned)
+    assert "model_changed" in _descriptor_invalidation_reasons(pinned, unpinned)
+    assert "model_changed" not in _descriptor_invalidation_reasons(pinned, pinned)
+
+
+@pytest.mark.parametrize("model", ["~vendor/model", "vendor/model:free"])
+def test_descriptor_accepts_alias_and_variant_openrouter_model_names(model: str) -> None:
+    assert _descriptor(provider="openrouter", model=model).model == model

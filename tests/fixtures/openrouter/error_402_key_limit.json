@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": 402,
+    "message": "Key limit exceeded",
+    "metadata": {
+      "limit_source": "openrouter_key_limit"
+    }
+  }
+}

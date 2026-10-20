@@ -43,6 +43,7 @@ from summarizer_web.services.events_service import (
     record_run_state,
     run_directory,
 )
+from summarizer_web.services import openrouter_service
 from summarizer_web.services.progress_service import ACTIVE_RUN_STATES, now_iso, read_progress
 from summarizer_web.worker.projections import tree_items
 from summarizer_web.worker.supervisor import get_supervisor
@@ -308,6 +309,8 @@ def get_activity() -> ActivityResponse:
 def _validate_config(config: RunConfig) -> None:
     if not config.model.strip():
         raise ApiError(400, "model_required", "Choose a model before starting a Run.")
+    if config.provider == "openrouter" and not openrouter_service.key_is_set():
+        raise ApiError(409, "openrouter_key_missing", openrouter_service.key_problem_message())
     window = config.context_window
     if window is not None and config.max_output_tokens >= window:
         raise ApiError(

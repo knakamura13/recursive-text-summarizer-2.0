@@ -1,15 +1,16 @@
 <script lang="ts">
-	import type { OllamaModel, RunConfig } from '$lib/api/types';
+	import type { OllamaModel, ProviderName, RunConfig } from '$lib/api/types';
 	import type { NumericRunConfigField, RunConfigErrors } from '$lib/runConfig';
 	import { canSummarize } from '$lib/stores/models.svelte';
 
-	// Edits a RunConfig in place: model, target words, strategy, verification,
-	// and an Advanced section. Empty "automatic" fields hold null.
+	// Edits a RunConfig in place: provider, model, target words, strategy,
+	// verification, and an Advanced section. Empty "automatic" fields hold null.
 	let {
 		config = $bindable(),
 		models = [],
 		errors = {},
 		disabled = false,
+		openrouterKeySet = null,
 		idPrefix
 	}: {
 		config: RunConfig;
@@ -17,8 +18,28 @@
 		models?: OllamaModel[];
 		errors?: RunConfigErrors;
 		disabled?: boolean;
+		/** Whether the server has an OpenRouter key; null while unknown, so nothing is warned early. */
+		openrouterKeySet?: boolean | null;
 		idPrefix: string;
 	} = $props();
+
+	const openrouter = $derived(config.provider === 'openrouter');
+
+	// A model name belongs to one provider, and an upstream pin only to
+	// OpenRouter, so changing the provider swaps both for what was last entered
+	// for the other provider (empty at first) instead of carrying them across.
+	const remembered: Record<ProviderName, { model: string; upstream: string }> = {
+		ollama: { model: '', upstream: '' },
+		openrouter: { model: '', upstream: '' }
+	};
+
+	function setProvider(provider: ProviderName) {
+		if (config.provider === provider) return;
+		remembered[config.provider] = { model: config.model, upstream: config.openrouter_upstream };
+		config.provider = provider;
+		config.model = remembered[provider].model;
+		config.openrouter_upstream = provider === 'openrouter' ? remembered[provider].upstream : '';
+	}
 
 	interface AdvancedField {
 		field: NumericRunConfigField;
@@ -75,13 +96,25 @@
 		}
 	];
 
+	function hintFor(item: AdvancedField): string {
+		if (!openrouter) return item.hint;
+		if (item.field === 'context_window') {
+			return 'Empty: use the window OpenRouter lists for the model.';
+		}
+		if (item.field === 'max_concurrency') return 'Calls sent to OpenRouter at the same time.';
+		return item.hint;
+	}
+
 	const installed = $derived(models.some((model) => model.name === config.model));
 	const advancedInvalid = $derived(ADVANCED.some(({ field }) => errors[field]));
+
+	const keyMissing = $derived(openrouter && openrouterKeySet === false);
 
 	function describedBy(field: keyof RunConfigErrors, hasHint: boolean): string | undefined {
 		const ids: string[] = [];
 		if (hasHint) ids.push(`${idPrefix}-${field}-hint`);
 		if (errors[field]) ids.push(`${idPrefix}-${field}-error`);
+		if (field === 'model' && keyMissing) ids.push(`${idPrefix}-openrouter-key`);
 		return ids.length > 0 ? ids.join(' ') : undefined;
 	}
 </script>
@@ -95,26 +128,89 @@
 <div class="run-config">
 	<div class="basic">
 		<div class="field">
-			<label for="{idPrefix}-model">Model</label>
+			<label for="{idPrefix}-provider">Provider</label>
 			<select
-				id="{idPrefix}-model"
-				bind:value={config.model}
+				id="{idPrefix}-provider"
+				value={config.provider}
+				onchange={(event) => setProvider(event.currentTarget.value as ProviderName)}
 				{disabled}
-				aria-invalid={errors.model ? 'true' : undefined}
-				aria-describedby={describedBy('model', false)}
+				aria-describedby="{idPrefix}-provider-hint"
 			>
-				<option value="">Choose a model</option>
-				{#if config.model && !installed}
-					<option value={config.model}>{config.model} (not installed)</option>
-				{/if}
-				{#each models.filter(canSummarize) as model (model.name)}
-					<option value={model.name}>
-						{model.name}{model.parameter_size ? ` · ${model.parameter_size}` : ''}
-					</option>
-				{/each}
+				<option value="ollama">Ollama</option>
+				<option value="openrouter">OpenRouter (hosted)</option>
 			</select>
+			<p class="field-hint" id="{idPrefix}-provider-hint">
+				{openrouter
+					? 'The Document’s text is sent to OpenRouter, which bills each request.'
+					: 'Runs on the Ollama host set in Settings.'}
+			</p>
+			{#if keyMissing}
+				<p class="field-error" id="{idPrefix}-openrouter-key" role="alert">
+					The server has no OpenRouter API key. Set OPENROUTER_API_KEY in the environment it runs
+					in, then restart it.
+				</p>
+			{/if}
+		</div>
+
+		<div class="field" class:span={openrouter}>
+			<label for="{idPrefix}-model">Model</label>
+			{#if openrouter}
+				<input
+					id="{idPrefix}-model"
+					type="text"
+					autocomplete="off"
+					spellcheck="false"
+					placeholder="vendor/model"
+					bind:value={config.model}
+					{disabled}
+					aria-invalid={errors.model ? 'true' : undefined}
+					aria-describedby={describedBy('model', true)}
+				/>
+				<p class="field-hint" id="{idPrefix}-model-hint">
+					An OpenRouter model ID, for example meta-llama/llama-3.3-70b-instruct.
+				</p>
+			{:else}
+				<select
+					id="{idPrefix}-model"
+					bind:value={config.model}
+					{disabled}
+					aria-invalid={errors.model ? 'true' : undefined}
+					aria-describedby={describedBy('model', false)}
+				>
+					<option value="">Choose a model</option>
+					{#if config.model && !installed}
+						<option value={config.model}>{config.model} (not installed)</option>
+					{/if}
+					{#each models.filter(canSummarize) as model (model.name)}
+						<option value={model.name}>
+							{model.name}{model.parameter_size ? ` · ${model.parameter_size}` : ''}
+						</option>
+					{/each}
+				</select>
+			{/if}
 			{@render error('model')}
 		</div>
+
+		{#if openrouter}
+			<div class="field">
+				<label for="{idPrefix}-openrouter_upstream">Upstream provider (optional)</label>
+				<input
+					id="{idPrefix}-openrouter_upstream"
+					type="text"
+					autocomplete="off"
+					spellcheck="false"
+					placeholder="Any"
+					bind:value={config.openrouter_upstream}
+					{disabled}
+					aria-invalid={errors.openrouter_upstream ? 'true' : undefined}
+					aria-describedby={describedBy('openrouter_upstream', true)}
+				/>
+				<p class="field-hint" id="{idPrefix}-openrouter_upstream-hint">
+					Send every request only to this provider, for example deepinfra, and never fall back.
+				</p>
+				{@render error('openrouter_upstream')}
+			</div>
+		{/if}
 
 		<div class="field">
 			<label for="{idPrefix}-target_words">Target length (words)</label>
@@ -150,7 +246,7 @@
 			</p>
 		</div>
 
-		<label class="checkbox-field">
+		<label class="checkbox-field span">
 			<input type="checkbox" bind:checked={config.verify} {disabled} />
 			<span>Verify every summary sentence against the source</span>
 		</label>
@@ -188,7 +284,7 @@
 						aria-invalid={errors[item.field] ? 'true' : undefined}
 						aria-describedby={describedBy(item.field, true)}
 					/>
-					<p class="field-hint" id="{idPrefix}-{item.field}-hint">{item.hint}</p>
+					<p class="field-hint" id="{idPrefix}-{item.field}-hint">{hintFor(item)}</p>
 					{@render error(item.field)}
 				</div>
 			{/each}
@@ -210,7 +306,8 @@
 		align-items: start;
 	}
 
-	.checkbox-field.span {
+	.checkbox-field.span,
+	.field.span {
 		grid-column: 1 / -1;
 	}
 

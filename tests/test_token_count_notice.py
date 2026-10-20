@@ -76,7 +76,7 @@ def test_preflight_warns_when_the_byte_counter_is_used(
     [notice] = _notices(result)
     assert result["ok"] is True
     assert "estimate:utf8-bytes" in notice["message"]
-    assert "segments may be smaller than the context window requires" in notice["message"]
+    assert "several times smaller than the context window allows" in notice["message"]
     # No model file on this machine for the reason to name.
     assert "no local Ollama model file" in notice["message"]
     # The estimate still comes back; the warning does not replace it.
@@ -176,8 +176,8 @@ def test_a_run_on_the_byte_counter_records_and_shows_the_notice(
     summary = client.get(f"/api/v1/runs/{run_id}/summary").json()
     [notice] = [item for item in summary["notices"] if item["code"] == CODE]
     assert notice["severity"] == "info"
-    assert "estimates" in notice["message"]
-    assert "segments may be smaller than the context window requires" in notice["message"]
+    assert "upper bound" in notice["message"]
+    assert "several times smaller than the context window allows" in notice["message"]
 
 
 def test_a_run_on_an_exact_counter_carries_no_notice(
@@ -224,7 +224,7 @@ def test_a_real_run_prints_the_notice_once(
     )
 
     assert exit_code == 0
-    assert capsys.readouterr().err.count("Token counts are estimates") == 1
+    assert capsys.readouterr().err.count("Token counts are an upper bound") == 1
 
 
 def test_an_exact_counter_prints_nothing(

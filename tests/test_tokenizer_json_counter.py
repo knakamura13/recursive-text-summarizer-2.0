@@ -641,7 +641,7 @@ def test_the_notice_names_the_counter_and_what_the_estimate_costs() -> None:
     assert notice is not None
     assert "estimate:utf8-bytes" in notice
     assert "not the model's own tokenizer" in notice
-    assert "segments may be smaller than the context window requires" in notice
+    assert "several times smaller than the context window allows" in notice
 
 
 def test_a_notice_with_a_reason_ends_with_it() -> None:

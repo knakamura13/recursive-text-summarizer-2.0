@@ -21,6 +21,7 @@ import type {
 	NodeDetail,
 	OllamaHealth,
 	OllamaModel,
+	OpenRouterStatus,
 	Preflight,
 	Run,
 	RunConfig,
@@ -304,6 +305,8 @@ export const api = {
 	async ollamaModels(): Promise<OllamaModel[]> {
 		return (await request<{ models: OllamaModel[] }>('/ollama/models')).models;
 	},
+	openrouterStatus: (): Promise<OpenRouterStatus> =>
+		request<OpenRouterStatus>('/openrouter/health'),
 
 	async listDocuments(search?: string, signal?: AbortSignal): Promise<DocumentSummary[]> {
 		const query = search?.trim() ? `?search=${encodeURIComponent(search.trim())}` : '';

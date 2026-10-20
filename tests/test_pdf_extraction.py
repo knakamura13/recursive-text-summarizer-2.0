@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+from pypdf.generic import (
+    ArrayObject,
+    DecodedStreamObject,
+    DictionaryObject,
+    NameObject,
+    NumberObject,
+)
 
 from summarizer_web.ingestion.common import ImportFailure, clean_text, ignore_progress
 from summarizer_web.ingestion.extract import assemble
@@ -83,6 +89,75 @@ def test_bookmarks_become_nested_hints_with_pages_and_anchor(tmp_path: Path):
         ("Chapter Alpha", 1, "Chapter Alpha", 2, 3),
         ("Section Beta", 2, "Section Beta", 3, 3),
         ("Chapter Gamma", 1, "Chapter Gamma", 4, 4),
+    ]
+
+
+def _map_ligature_glyphs(writer: PdfWriter) -> None:
+    """Make codes 174 and 175 draw the "fi" and "ff" glyphs, so the text layer holds U+FB01 and U+FB00."""
+    font = writer.pages[0]["/Resources"]["/Font"]["/F1"].get_object()
+    font[NameObject("/Encoding")] = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Encoding"),
+            NameObject("/BaseEncoding"): NameObject("/WinAnsiEncoding"),
+            NameObject("/Differences"): ArrayObject(
+                [NumberObject(174), NameObject("/fi"), NameObject("/ff")]
+            ),
+        }
+    )
+
+
+def test_bookmarks_with_ligature_words_are_placed_under_the_text_layers_spelling(tmp_path: Path):
+    path, writer = _pdf_with_text(
+        tmp_path,
+        [
+            "Overview of the book. Words on the first page.",
+            r"Re\256ning the Estimate. Body on page two.",
+            r"E\257ort and E\257ect. Body on page three.",
+        ],
+    )
+    _map_ligature_glyphs(writer)
+    writer.add_outline_item("Overview", 0)
+    writer.add_outline_item("Refining the Estimate", 1)
+    writer.add_outline_item("Effort and Effect", 2)
+    extraction = extract_pdf(_save(path, writer), ignore_progress, None)
+
+    imported = assemble(extraction)
+
+    # The text layer really spells the words with ligature characters, and the text keeps them.
+    assert "Reﬁning the Estimate" in imported.text
+    assert "Eﬀort and Eﬀect" in imported.text
+    assert imported.unplaced_headings == 0
+    assert [
+        (e.title, e.level, imported.text[e.start : e.end].split(".")[0], e.page_start, e.page_end)
+        for e in imported.outline
+    ] == [
+        ("Overview", 1, "Overview of the book", 1, 1),
+        ("Reﬁning the Estimate", 1, "Reﬁning the Estimate", 2, 2),
+        ("Eﬀort and Eﬀect", 1, "Eﬀort and Eﬀect", 3, 3),
+    ]
+
+
+def test_bookmark_is_placed_on_a_heading_line_with_a_ligature_and_merged_words(tmp_path: Path):
+    path, writer = _pdf_with_text(
+        tmp_path,
+        [
+            "Overview of the book. Words on the first page.",
+            r"Sta\257 Ratesfor p> 1",
+        ],
+    )
+    _map_ligature_glyphs(writer)
+    writer.add_outline_item("Overview", 0)
+    writer.add_outline_item("Staff Rates for p >1", 1)
+    extraction = extract_pdf(_save(path, writer), ignore_progress, None)
+
+    imported = assemble(extraction)
+
+    # The text layer spells the heading with a ligature and no space after "Rates".
+    assert "Staﬀ Ratesfor p> 1" in imported.text
+    assert imported.unplaced_headings == 0
+    assert [(e.title, e.page_start, e.page_end) for e in imported.outline] == [
+        ("Overview", 1, 1),
+        ("Staﬀ Ratesfor p> 1", 2, 2),
     ]
 
 

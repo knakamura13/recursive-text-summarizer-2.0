@@ -112,6 +112,28 @@ def test_local_classification_schema_bounds_finding_count_and_ids() -> None:
     assert request.response_schema["$defs"]["_FindingEvidence"]["properties"]["segment_id"]["enum"] == ["S000001"]
 
 
+def test_openrouter_classification_schema_is_not_narrowed_like_a_local_decoder() -> None:
+    claim = Claim("V01C000001", "V01S000001", 1, "measured value", False)
+    bundle = EvidenceBundle(
+        EvidenceSelection(claim.claim_id, ("S000001",), ("S000001",), (), 1, "lexical-overlap/1", True),
+        (SourcePassage("S000001", "The measured value is 42."),),
+    )
+
+    def schema_for(identity: str) -> object:
+        return build_classification_request(
+            (claim,),
+            evidence={claim.claim_id: bundle},
+            spans={claim.span_id: "The measured value is 42."},
+            source_id="a" * 64,
+            runtime=replace(runtime(), provider_identity=identity),
+        ).response_schema
+
+    # A hosted endpoint is not guaranteed to honor the enum and bound
+    # constraints the local path adds, so OpenRouter gets the shared schema.
+    assert schema_for("openrouter") == schema_for("openai")
+    assert schema_for("openrouter") != schema_for("ollama")
+
+
 def test_classification_request_includes_trusted_enclosing_span_context() -> None:
     claim = Claim("V01C000001", "V01S000001", 1, "bought", False)
     bundle = EvidenceBundle(
