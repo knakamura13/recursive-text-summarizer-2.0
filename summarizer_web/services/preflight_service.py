@@ -169,6 +169,9 @@ def run_preflight(payload: dict[str, Any]) -> PreflightResponse:
     if source == "model":
         strategy = replace(strategy, context_window=window)
     counter = resolve_token_counter(provider="ollama", model=model, ollama_host=host)
+    notice = estimate_notice(counter)
+    if notice is not None:
+        warnings.append(_warning("token_counts_estimated", notice))
     response = PreflightResponse(
         ok=False,
         context_window_tokens=resolve_context_window(

@@ -449,14 +449,15 @@ def test_the_run_summary_view_shows_the_estimate_notice(
     assert estimate and "upper bound" in estimate[0]["message"]
 
 
-def test_an_ollama_run_adds_no_estimate_warning(
+def test_an_ollama_run_records_no_openrouter_upstream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_id, _ = _worker_run(tmp_path, monkeypatch, {"model": "llama3.2:3b"})
 
     audit = json.loads((load_paths().runs / run_id / "audit.json").read_text(encoding="utf-8"))
 
-    assert "token_counts_estimated" not in audit["warnings"]
+    # Whether an Ollama run warns about estimated counts depends on its counter
+    # (tests/test_token_count_notice.py), not on the provider.
     assert "openrouter_upstream" not in audit["configuration"]["app"]
 
 

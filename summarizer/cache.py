@@ -53,7 +53,7 @@ _CREDENTIAL_TOKEN = re.compile(
     r"glpat-[A-Za-z0-9_-]{20,}|hf_[A-Za-z0-9]{20,})$"
 )
 _COUNTER = re.compile(
-    r"^(?:(?:tiktoken|estimate|test|gguf):[a-z0-9][a-z0-9._-]*|utf8-conservative)$"
+    r"^(?:(?:tiktoken|estimate|test|gguf|tokenizer-json):[a-z0-9][a-z0-9._-]*|utf8-conservative)$"
 )
 _WORK_ID = re.compile(
     r"^(?:[DSLVMQ][A-Za-z0-9:_-]*|editorial-final|segmentation|C\d{2}K\d{6})$"

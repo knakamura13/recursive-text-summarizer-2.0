@@ -282,6 +282,9 @@ NO_OUTLINE_WARNING = "sections_no_outline"
 # token counts are estimates, so the Run shows it as the preflight did.
 ESTIMATED_COUNTS_WARNING = "token_counts_estimated"
 OUTLINE_NOT_EXTRACTED_WARNING = "sections_outline_not_extracted"
+# Audit warning code for a Run whose token counts are estimates, so the Run
+# shows what preflight showed.
+ESTIMATED_COUNTS_WARNING = "token_counts_estimated"
 
 
 def _json_list(value: str | None) -> list[object]:
@@ -571,7 +574,7 @@ def _execute(
             if revision["outline_json"] is None
             else NO_OUTLINE_WARNING,
         )
-    if openrouter and estimate_notice(counter) is not None:
+    if estimate_notice(counter) is not None:
         audit_warnings = (*audit_warnings, ESTIMATED_COUNTS_WARNING)
     pipeline_config = PipelineConfig(
         target_words=config.target_words,

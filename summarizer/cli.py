@@ -362,6 +362,9 @@ def main(
     try:
         document = read_source(config.app.input_path)
         counter = counter_factory(config.app)
+        notice = estimate_notice(counter)
+        if notice is not None:
+            print(notice, file=sys.stderr)
         pipeline_config = config.pipeline
         outline: SectionOutline | None = None
         if config.preserve_sections:
