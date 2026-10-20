@@ -168,7 +168,7 @@ def parse_args(argv: list[str] | None = None) -> ParsedConfig:
             output_path=args.output,
             model=args.model,
             provider=args.provider,
-            ollama_host=args.ollama_host,
+            ollama_host=args.ollama_host if args.provider == "ollama" else "",
             timeout_seconds=args.timeout,
         )
         retry = RetryPolicy(max_attempts=args.max_retries)
